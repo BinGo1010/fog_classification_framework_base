@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fog-classification-framework"
+version = "0.1.0"
+description = "Configurable time-series classification framework for Parkinson's FOG recognition"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.22",
+    "pandas>=1.5",
+    "scikit-learn>=1.2",
+    "PyYAML>=6.0",
+    "tqdm>=4.64",
+    "matplotlib>=3.6"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["data_provider*", "exp*", "layers*", "losses*", "models*", "utils*"]
