@@ -73,6 +73,9 @@ class _ProjectionAdapter(torch.nn.Module):
 class SupConExperiment(BaseExperiment):
     """Supervised contrastive pretraining followed by classifier fine-tuning."""
 
+    def _show_progress(self):
+        return bool(self.cfg.get("train", {}).get("show_progress", True))
+
     def _augmenter(self):
         acfg = self.cfg.get("augmentations", {})
         return IMUTimeSeriesAugmenter(
@@ -152,7 +155,12 @@ class SupConExperiment(BaseExperiment):
                 sampler.set_epoch(epoch)
             total_loss, n = 0.0, 0
             t0 = time.time()
-            for batch in tqdm(loader, desc=f"supcon-pretrain-{epoch}", leave=False, disable=not self.is_main):
+            for batch in tqdm(
+                loader,
+                desc=f"supcon-pretrain-{epoch}",
+                leave=False,
+                disable=(not self.is_main or not self._show_progress()),
+            ):
                 x = batch["x"].to(self.device, non_blocking=True)
                 y = batch["y"].to(self.device, non_blocking=True)
                 x1 = augmenter(x)
@@ -197,7 +205,12 @@ class SupConExperiment(BaseExperiment):
         run_model.train(train)
         y_true, y_prob, indices = [], [], []
         total_loss, n = 0.0, 0
-        for batch in tqdm(loader, desc="finetune-train" if train else "finetune-val", leave=False, disable=not self.is_main):
+        for batch in tqdm(
+            loader,
+            desc="finetune-train" if train else "finetune-val",
+            leave=False,
+            disable=(not self.is_main or not self._show_progress()),
+        ):
             x = batch["x"].to(self.device, non_blocking=True)
             y = batch["y"].to(self.device, non_blocking=True)
             with torch.set_grad_enabled(train):

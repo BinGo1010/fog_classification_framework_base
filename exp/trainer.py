@@ -153,6 +153,7 @@ class Trainer:
         self.criterion = build_criterion(cfg, loaders["train_set"], self.device)
         self.out_dir = Path(cfg["project"]["output_dir"])
         self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.show_progress = bool(cfg.get("train", {}).get("show_progress", True))
         device_name = torch.cuda.get_device_name(self.device) if self.device.type == "cuda" else "CPU"
         if self.is_main:
             dist_text = f", DDP world_size={cfg.get('runtime', {}).get('world_size', 1)}" if self.distributed else ""
@@ -165,7 +166,7 @@ class Trainer:
         loader = self.loaders[split]
         y_true, y_prob, indices = [], [], []
         total_loss, n = 0.0, 0
-        iterator = tqdm(loader, desc=split, leave=False, disable=not self.is_main)
+        iterator = tqdm(loader, desc=split, leave=False, disable=(not self.is_main or not self.show_progress))
         for batch in iterator:
             x = batch["x"].to(self.device, non_blocking=True)
             y = batch["y"].to(self.device, non_blocking=True)

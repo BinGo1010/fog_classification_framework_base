@@ -7,8 +7,7 @@ from tqdm import tqdm
 
 from data_provider.fog_transform import IMUTimeSeriesAugmenter
 from losses.nt_xent_loss import NTXentLoss
-from exp.exp_supcon import SupConExperiment
-from exp.trainer import _save_checkpoint_compat
+from exp.exp_supcon import SupConExperiment, _save_checkpoint_compat
 from utils.distributed import barrier
 
 
@@ -51,7 +50,12 @@ class SimCLRExperiment(SupConExperiment):
                 sampler.set_epoch(epoch)
             total_loss, n = 0.0, 0
             t0 = time.time()
-            for batch in tqdm(loader, desc=f"simclr-pretrain-{epoch}", leave=False, disable=not self.is_main):
+            for batch in tqdm(
+                loader,
+                desc=f"simclr-pretrain-{epoch}",
+                leave=False,
+                disable=(not self.is_main or not self._show_progress()),
+            ):
                 x = batch["x"].to(self.device, non_blocking=True)
                 x1 = augmenter(x)
                 x2 = augmenter(x)

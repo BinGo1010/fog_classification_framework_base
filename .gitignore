@@ -1,8 +1,32 @@
+# Python
 __pycache__/
 *.py[cod]
+*.pyo
+.pytest_cache/
+.pytest-tmp/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
 .venv/
 venv/
+env/
+ENV/
 
+# Local/editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Large local data and experiment artifacts
+dataset/
+outputs/
+checkpoints/
+runs/
+logs/
 data/
 dataset/
 outputs/
@@ -10,6 +34,7 @@ checkpoints/
 runs/
 logs/
 
+# Model/data artifacts
 *.pt
 *.pth
 *.ckpt
@@ -19,6 +44,8 @@ logs/
 *.csv
 *.log
 
-.vscode/
-.idea/
-.DS_Store
+# Temporary files
+tmp/
+temp/
+*.tmp
+

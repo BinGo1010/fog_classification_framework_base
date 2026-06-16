@@ -18,7 +18,8 @@ def evaluate_model(cfg, model, loader, split="test", out_dir=None, device=None, 
     total_loss, n = 0.0, 0
     criterion = torch.nn.CrossEntropyLoss()
     start = time.perf_counter()
-    for batch in tqdm(loader, desc=f"eval-{split}", leave=False):
+    show_progress = bool(cfg.get("train", {}).get("show_progress", True))
+    for batch in tqdm(loader, desc=f"eval-{split}", leave=False, disable=not show_progress):
         x = batch["x"].to(device, non_blocking=True)
         y = batch["y"].to(device, non_blocking=True)
         logits = model(x)

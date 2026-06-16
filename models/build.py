@@ -1,10 +1,12 @@
 from . import (  # noqa: F401
     bigru,
     cnn1d,
+    conformer_adapters,
     ds_cnn1d,
     forecasting_adapters,
     imu_transformer,
     lightweight_imu_tcn,
+    lightweight_ts_adapters,
     lstm,
     mobileone1d_tiny,
     modern_tcn1d_tiny,

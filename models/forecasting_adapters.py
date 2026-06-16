@@ -201,13 +201,19 @@ class ForecastingContrastiveAdapter(nn.Module):
     def forward(self, x):
         return self.classify_features(self.encode(x))
 
+    def encoder_feature_parameters(self):
+        for name, param in self.encoder.named_parameters():
+            if name.startswith("backbone.projection."):
+                continue
+            yield param
+
     def contrastive_parameters(self):
-        yield from self.encoder.parameters()
+        yield from self.encoder_feature_parameters()
         yield from self.projection_head.parameters()
 
     def classifier_parameters(self, train_encoder=True):
         if train_encoder:
-            yield from self.encoder.parameters()
+            yield from self.encoder_feature_parameters()
         yield from self.classification_head.parameters()
 
 
