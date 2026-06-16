@@ -1,0 +1,9 @@
+# Core dependencies for the YAML/DDP FOG training framework.
+# Install PyTorch separately when you need a specific CUDA build on the server.
+numpy>=1.22
+pandas>=1.5
+scikit-learn>=1.2
+PyYAML>=6.0
+tqdm>=4.64
+matplotlib>=3.6
+
