@@ -21,6 +21,14 @@ CLINICAL_NUMERIC_COLUMNS = [
     "fes-i",
     "pdq8",
 ]
+LABEL_NORMAL = 0
+LABEL_PRE_FOG = 1
+LABEL_FOG_BINARY = 1
+LABEL_FOG_THREE = 2
+CLASS_NAMES_BY_MODE = {
+    "binary": np.array(["NORMAL", "FOG"]),
+    "three-class": np.array(["NORMAL", "PRE_FOG", "FOG"]),
+}
 
 
 def _mode_int(values, default=0):
@@ -29,6 +37,57 @@ def _mode_int(values, default=0):
         return int(default)
     values = values.astype(np.int64)
     return int(np.bincount(values).argmax())
+
+
+def _fog_intervals(fog):
+    fog = np.asarray(fog).astype(bool)
+    if fog.size == 0 or not fog.any():
+        return []
+    padded = np.r_[False, fog, False]
+    changes = np.flatnonzero(padded[1:] != padded[:-1])
+    return [(int(start), int(end)) for start, end in zip(changes[0::2], changes[1::2])]
+
+
+def _sample_state(fog, label_mode, sampling_rate_hz, pre_fog_seconds):
+    fog = np.asarray(fog).astype(bool)
+    state = np.zeros(fog.shape[0], dtype=np.int64)
+    if label_mode == "binary":
+        state[fog] = LABEL_FOG_BINARY
+        return state
+
+    pre_samples = int(round(max(0.0, float(pre_fog_seconds)) * float(sampling_rate_hz)))
+    prev_fog_end = 0
+    for start, end in _fog_intervals(fog):
+        if pre_samples > 0:
+            pre_start = max(prev_fog_end, start - pre_samples)
+            state[pre_start:start] = LABEL_PRE_FOG
+        state[start:end] = LABEL_FOG_THREE
+        prev_fog_end = end
+    return state
+
+
+def _window_label(values, label_mode, label_rule, fog_threshold):
+    values = np.asarray(values).astype(np.int64)
+    if label_rule == "center":
+        return int(values[len(values) // 2])
+
+    num_classes = len(CLASS_NAMES_BY_MODE[label_mode])
+    if label_rule == "majority":
+        return int(np.bincount(values, minlength=num_classes).argmax())
+
+    if label_mode == "binary" and label_rule == "threshold":
+        return int(float(np.mean(values == LABEL_FOG_BINARY)) >= float(fog_threshold))
+
+    if label_rule in {"priority", "threshold"}:
+        if label_mode == "binary":
+            return LABEL_FOG_BINARY if np.any(values == LABEL_FOG_BINARY) else LABEL_NORMAL
+        if np.any(values == LABEL_FOG_THREE):
+            return LABEL_FOG_THREE
+        if np.any(values == LABEL_PRE_FOG):
+            return LABEL_PRE_FOG
+        return LABEL_NORMAL
+
+    raise ValueError("label_rule must be threshold, priority, center, or majority.")
 
 
 def _split_subjects(subject_ids, subject_has_fog, val_size, test_size, seed):
@@ -109,7 +168,29 @@ def _split_loso(subject_ids, test_subject, subject_pos_fraction, val_subject=Non
     }
 
 
-def build_windows(sensor_df, clinical_df, window_size, stride, fog_threshold, keep_activity_zero=False):
+def build_windows(
+    sensor_df,
+    clinical_df,
+    window_size,
+    stride,
+    fog_threshold,
+    keep_activity_zero=False,
+    label_mode="binary",
+    pre_fog_seconds=3.0,
+    label_rule=None,
+    sampling_rate_hz=60,
+):
+    label_mode = str(label_mode).lower()
+    if label_mode not in CLASS_NAMES_BY_MODE:
+        raise ValueError("label_mode must be binary or three-class.")
+    if label_rule is None:
+        label_rule = "priority" if label_mode == "three-class" else "threshold"
+    label_rule = str(label_rule).lower()
+    if label_rule not in {"threshold", "priority", "center", "majority"}:
+        raise ValueError("label_rule must be threshold, priority, center, or majority.")
+    if label_mode == "three-class" and label_rule == "threshold":
+        label_rule = "priority"
+
     if not keep_activity_zero and "activity" in sensor_df.columns:
         sensor_df = sensor_df[sensor_df["activity"] > 0].copy()
 
@@ -150,6 +231,7 @@ def build_windows(sensor_df, clinical_df, window_size, stride, fog_threshold, ke
             continue
         signals = group[sensor_cols].to_numpy(dtype=np.float32)
         fog = group["fog"].to_numpy(dtype=np.int64)
+        state = _sample_state(fog, label_mode, sampling_rate_hz, pre_fog_seconds)
         activity = group["activity"].to_numpy(dtype=np.int64)
         severity = group["fog_severity"].to_numpy(dtype=np.int64)
         timestamps = group["timestamp"].to_numpy(dtype=np.float32)
@@ -160,7 +242,7 @@ def build_windows(sensor_df, clinical_df, window_size, stride, fog_threshold, ke
             end = start + window_size
             fog_window = fog[start:end]
             fog_fraction = float(fog_window.mean())
-            label = int(fog_fraction >= fog_threshold)
+            label = _window_label(state[start:end], label_mode, label_rule, fog_threshold)
 
             X.append(signals[start:end].T)
             y.append(label)
@@ -168,7 +250,8 @@ def build_windows(sensor_df, clinical_df, window_size, stride, fog_threshold, ke
             meta["sessionID"].append(int(ids["sessionID"]))
             meta["taskID"].append(int(ids["taskID"]))
             meta["activity"].append(_mode_int(activity[start:end]))
-            if label:
+            fog_label = LABEL_FOG_BINARY if label_mode == "binary" else LABEL_FOG_THREE
+            if label == fog_label and np.any(fog_window == 1):
                 meta["fog_severity"].append(_mode_int(severity[start:end][fog_window == 1]))
             else:
                 meta["fog_severity"].append(0)
@@ -185,6 +268,7 @@ def build_windows(sensor_df, clinical_df, window_size, stride, fog_threshold, ke
         "y": np.asarray(y, dtype=np.int64),
         "sensor_columns": np.asarray(sensor_cols),
         "clinical_feature_names": np.asarray(clinical_feature_cols),
+        "class_names": CLASS_NAMES_BY_MODE[label_mode],
     }
     for key, values in meta.items():
         if key == "clinical":
@@ -217,10 +301,17 @@ def _save_index_split(out_dir, split, arrays, indices):
     np.savez(out_dir / f"{split}.npz", **payload)
 
 
+def _class_count_summary(y, class_names):
+    y = np.asarray(y, dtype=np.int64)
+    counts = np.bincount(y, minlength=len(class_names))
+    return {str(name).lower(): int(counts[idx]) for idx, name in enumerate(class_names)}
+
+
 def _save_subject_splits(out_dir, arrays, splits, base_summary):
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = dict(base_summary)
     summary["splits"] = {}
+    class_names = np.asarray(arrays.get("class_names", CLASS_NAMES_BY_MODE["binary"])).astype(str)
     for split, subjects in splits.items():
         mask = np.isin(arrays["subjectID"], list(subjects))
         _save_mask_split(out_dir, split, arrays, mask)
@@ -228,8 +319,9 @@ def _save_subject_splits(out_dir, arrays, splits, base_summary):
         summary["splits"][split] = {
             "subjects": sorted(subjects),
             "num_windows": int(mask.sum()),
-            "num_positive": int(y_split.sum()),
-            "positive_fraction": float(y_split.mean()) if len(y_split) else 0.0,
+            "class_counts": _class_count_summary(y_split, class_names),
+            "num_positive": int(np.sum(y_split > 0)),
+            "positive_fraction": float(np.mean(y_split > 0)) if len(y_split) else 0.0,
         }
     _save_summary(out_dir, summary)
     return summary
@@ -238,10 +330,12 @@ def _save_subject_splits(out_dir, arrays, splits, base_summary):
 def _random_split_summary(arrays, indices):
     y = arrays["y"][indices]
     subjects = arrays["subjectID"][indices]
+    class_names = np.asarray(arrays.get("class_names", CLASS_NAMES_BY_MODE["binary"])).astype(str)
     return {
         "num_windows": int(len(indices)),
-        "num_positive": int(y.sum()),
-        "positive_fraction": float(y.mean()) if len(y) else 0.0,
+        "class_counts": _class_count_summary(y, class_names),
+        "num_positive": int(np.sum(y > 0)),
+        "positive_fraction": float(np.mean(y > 0)) if len(y) else 0.0,
         "subjects": sorted(map(int, np.unique(subjects))),
         "num_subjects": int(len(np.unique(subjects))),
     }
@@ -299,6 +393,10 @@ def _prepare_arrays(wcfg):
         int(wcfg.get("stride", 60)),
         float(wcfg.get("fog_threshold", 0.25)),
         keep_activity_zero=bool(wcfg.get("keep_activity_zero", False)),
+        label_mode=wcfg.get("label_mode", "binary"),
+        pre_fog_seconds=float(wcfg.get("pre_fog_seconds", 3.0)),
+        label_rule=wcfg.get("label_rule"),
+        sampling_rate_hz=float(wcfg.get("sampling_rate_hz", 60)),
     )
 
 
@@ -319,6 +417,13 @@ def prepare_window_dataset(cfg):
     stride = int(wcfg.get("stride", max(1, window_size // 2)))
     fog_threshold = float(wcfg.get("fog_threshold", 0.25))
     keep_activity_zero = bool(wcfg.get("keep_activity_zero", False))
+    label_mode = str(wcfg.get("label_mode", "binary")).lower()
+    if label_mode not in CLASS_NAMES_BY_MODE:
+        raise ValueError("data.windowing.label_mode must be binary or three-class.")
+    label_rule = str(wcfg.get("label_rule", "priority" if label_mode == "three-class" else "threshold")).lower()
+    if label_mode == "three-class" and label_rule == "threshold":
+        label_rule = "priority"
+    pre_fog_seconds = float(wcfg.get("pre_fog_seconds", 3.0))
     seed = int(wcfg.get("seed", cfg.get("project", {}).get("seed", 42)))
     out_dir = _cache_dir(wcfg, split_strategy, window_size, stride, fog_threshold, keep_activity_zero, seed)
     expected = {
@@ -328,14 +433,36 @@ def prepare_window_dataset(cfg):
         "fog_threshold": fog_threshold,
         "keep_activity_zero": keep_activity_zero,
         "sampling_rate_hz": int(wcfg.get("sampling_rate_hz", 60)),
+        "label_mode": label_mode,
+        "label_rule": label_rule,
     }
+    if label_mode == "three-class":
+        expected["pre_fog_seconds"] = pre_fog_seconds
     if split_strategy in {"subject", "random_window"}:
         expected["seed"] = seed
+    if split_strategy == "loso":
+        loso_subjects = wcfg.get("loso_subjects")
+        if loso_subjects is None:
+            expected["loso_subjects"] = "all"
+        else:
+            subjects = loso_subjects if isinstance(loso_subjects, (list, tuple)) else [loso_subjects]
+            expected["loso_subjects"] = [int(subject) for subject in subjects]
+        expected["val_subject"] = wcfg.get("val_subject")
 
     force = bool(wcfg.get("force", False))
     if force or not _summary_matches(out_dir, expected, split_strategy):
         print(f"Preparing window dataset: {out_dir}")
-        arrays = _prepare_arrays({**wcfg, "window_size": window_size, "stride": stride, "fog_threshold": fog_threshold})
+        arrays = _prepare_arrays(
+            {
+                **wcfg,
+                "window_size": window_size,
+                "stride": stride,
+                "fog_threshold": fog_threshold,
+                "label_mode": label_mode,
+                "label_rule": label_rule,
+                "pre_fog_seconds": pre_fog_seconds,
+            }
+        )
         base_summary = dict(expected)
         base_summary["source"] = {
             "sensor_csv": str(wcfg.get("sensor_csv", "data/sensor_data.csv")),
@@ -343,8 +470,9 @@ def prepare_window_dataset(cfg):
         }
 
         if split_strategy == "subject":
+            fog_label = LABEL_FOG_BINARY if label_mode == "binary" else LABEL_FOG_THREE
             subject_has_fog = {
-                int(subject): int(arrays["y"][arrays["subjectID"] == subject].sum() > 0)
+                int(subject): int(np.any(arrays["y"][arrays["subjectID"] == subject] == fog_label))
                 for subject in np.unique(arrays["subjectID"])
             }
             splits = _split_subjects(
@@ -374,8 +502,9 @@ def prepare_window_dataset(cfg):
             _save_summary(out_dir, summary)
         else:
             subjects = sorted(map(int, np.unique(arrays["subjectID"])))
+            fog_label = LABEL_FOG_BINARY if label_mode == "binary" else LABEL_FOG_THREE
             subject_pos_fraction = {
-                int(subject): float(arrays["y"][arrays["subjectID"] == subject].mean())
+                int(subject): float(np.mean(arrays["y"][arrays["subjectID"] == subject] == fog_label))
                 for subject in np.unique(arrays["subjectID"])
             }
             loso_subjects = wcfg.get("loso_subjects") or subjects

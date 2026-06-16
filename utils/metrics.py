@@ -89,15 +89,24 @@ def confusion_and_per_class(y_true, y_prob, num_classes: int):
     return cm, pd.DataFrame(rows)
 
 
-def save_metric_artifacts(out_dir, split, y_true, y_prob, indices, num_classes, metrics):
+def save_metric_artifacts(out_dir, split, y_true, y_prob, indices, num_classes, metrics, options=None):
+    options = options or {}
+    save_predictions = bool(options.get("save_predictions", True))
+    save_confusion_matrix = bool(options.get("save_confusion_matrix", True))
+    save_per_class = bool(options.get("save_per_class", True))
+
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     y_pred = np.argmax(y_prob, axis=1)
     pd.DataFrame(metrics.items(), columns=["metric", "value"]).to_csv(out_dir / f"metrics_{split}.csv", index=False)
-    cm, per_class = confusion_and_per_class(y_true, y_prob, num_classes)
-    pd.DataFrame(cm).to_csv(out_dir / f"confusion_matrix_{split}.csv", index=True)
-    per_class.to_csv(out_dir / f"per_class_metrics_{split}.csv", index=False)
-    pred_df = pd.DataFrame({"index": indices, "y_true": y_true, "y_pred": y_pred})
-    for c in range(num_classes):
-        pred_df[f"prob_class_{c}"] = y_prob[:, c]
-    pred_df.to_csv(out_dir / f"predictions_{split}.csv", index=False)
+    if save_confusion_matrix or save_per_class:
+        cm, per_class = confusion_and_per_class(y_true, y_prob, num_classes)
+        if save_confusion_matrix:
+            pd.DataFrame(cm).to_csv(out_dir / f"confusion_matrix_{split}.csv", index=True)
+        if save_per_class:
+            per_class.to_csv(out_dir / f"per_class_metrics_{split}.csv", index=False)
+    if save_predictions:
+        pred_df = pd.DataFrame({"index": indices, "y_true": y_true, "y_pred": y_pred})
+        for c in range(num_classes):
+            pred_df[f"prob_class_{c}"] = y_prob[:, c]
+        pred_df.to_csv(out_dir / f"predictions_{split}.csv", index=False)

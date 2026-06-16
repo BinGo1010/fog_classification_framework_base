@@ -8,6 +8,7 @@ from . import (  # noqa: F401
     lightweight_imu_tcn,
     lightweight_ts_adapters,
     lstm,
+    mlp,
     mobileone1d_tiny,
     modern_tcn1d_tiny,
     sequence_contrastive,

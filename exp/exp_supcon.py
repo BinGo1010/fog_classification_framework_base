@@ -298,7 +298,16 @@ class SupConExperiment(BaseExperiment):
                             self.cfg,
                             **self._checkpoint_options(),
                         )
-                    save_metric_artifacts(self.out_dir, "val_best", y_true, y_prob, idx, self.cfg["model"]["num_classes"], val_metrics)
+                    save_metric_artifacts(
+                        self.out_dir,
+                        "val_best",
+                        y_true,
+                        y_prob,
+                        idx,
+                        self.cfg["model"]["num_classes"],
+                        val_metrics,
+                        self.cfg.get("metrics", {}),
+                    )
                 else:
                     bad_epochs += 1
                 if save_last:

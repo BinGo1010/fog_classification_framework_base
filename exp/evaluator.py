@@ -42,6 +42,15 @@ def evaluate_model(cfg, model, loader, split="test", out_dir=None, device=None, 
         metrics["throughput_samples_per_sec"] = float(n / max(elapsed, 1e-12))
     if out_dir is not None:
         out_dir = Path(out_dir)
-        save_metric_artifacts(out_dir, split, y_true, y_prob, indices, cfg["model"]["num_classes"], metrics)
+        save_metric_artifacts(
+            out_dir,
+            split,
+            y_true,
+            y_prob,
+            indices,
+            cfg["model"]["num_classes"],
+            metrics,
+            cfg.get("metrics", {}),
+        )
         save_json(metrics, out_dir / f"metrics_{split}.json")
     return metrics
