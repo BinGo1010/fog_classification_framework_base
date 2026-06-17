@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import yaml
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,10 +54,13 @@ def maybe_read_json(path: Path) -> dict[str, Any]:
 def find_aggregate_paths(output_dirs: list[Path], recursive: bool) -> list[Path]:
     paths: list[Path] = []
     seen: set[Path] = set()
+    names = {"aggregate.json", "loso_summary.json"}
     for root in output_dirs:
         root = root.resolve()
-        candidates = root.rglob("aggregate.json") if recursive else root.glob("aggregate.json")
+        candidates = root.rglob("*.json") if recursive else root.glob("*.json")
         for path in candidates:
+            if path.name not in names:
+                continue
             path = path.resolve()
             if path not in seen:
                 paths.append(path)
@@ -130,6 +134,9 @@ def input_channels_from_config(training_config: dict[str, Any], window_config: d
 
 
 def infer_trainer(experiment: str, variant: str, training_config: dict[str, Any]) -> str:
+    model_name = str(training_config.get("model_name", ""))
+    if model_name:
+        return model_name
     text = f"{experiment} {variant}".lower()
     if "sleepyco" in text or variant in {"seq2one_gru", "seq2seq_gru", "seq2seq_tcn"}:
         return "sleepyco"
@@ -138,7 +145,87 @@ def infer_trainer(experiment: str, variant: str, training_config: dict[str, Any]
     return "unknown"
 
 
+def maybe_read_yaml(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def yaml_loso_config(experiment_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    configs = sorted(experiment_dir.glob("loso_subject_*/config_resolved.yaml"))
+    if not configs:
+        return {}, {}
+    cfg = maybe_read_yaml(configs[0])
+    model = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+    data = cfg.get("data") if isinstance(cfg.get("data"), dict) else {}
+    windowing = data.get("windowing") if isinstance(data.get("windowing"), dict) else {}
+    train = cfg.get("train") if isinstance(cfg.get("train"), dict) else {}
+    return {
+        "model_name": model.get("name"),
+        "class_names": None,
+        "input_channels": model.get("in_channels"),
+        "epochs": train.get("epochs"),
+        "batch_size": data.get("batch_size"),
+        "lr": train.get("lr"),
+        "loss": train.get("loss"),
+    }, {
+        "window_seconds": (
+            float(windowing["window_size"]) / float(windowing.get("sampling_rate_hz", 1))
+            if windowing.get("window_size") is not None
+            else None
+        ),
+        "stride_seconds": (
+            float(windowing["stride"]) / float(windowing.get("sampling_rate_hz", 1))
+            if windowing.get("stride") is not None
+            else None
+        ),
+        "target_hz": windowing.get("sampling_rate_hz"),
+        "target_len": windowing.get("window_size"),
+        "label_mode": windowing.get("label_mode"),
+        "pre_fog_seconds": windowing.get("pre_fog_seconds"),
+    }
+
+
+def collect_loso_summary(summary_path: Path) -> dict[str, Any]:
+    payload = read_json(summary_path)
+    aggregate, fold_count, elapsed_sec = parse_aggregate_payload(payload)
+    experiment_dir = summary_path.parent
+    training_config, window_config = yaml_loso_config(experiment_dir)
+    row: dict[str, Any] = {
+        "experiment": experiment_dir.name,
+        "variant": "loso",
+        "trainer": infer_trainer(experiment_dir.name, "loso", training_config),
+        "output_dir": str(experiment_dir),
+        "aggregate_path": str(summary_path),
+        "summary_path": str(experiment_dir / "loso_summary.csv")
+        if (experiment_dir / "loso_summary.csv").exists()
+        else "",
+        "fold_count": fold_count,
+        "elapsed_sec": elapsed_sec,
+        "data_dir": "",
+        "class_names": "",
+        "num_classes": None,
+        "input_channels": input_channels_from_config(training_config, window_config),
+        "window_seconds": window_config.get("window_seconds"),
+        "stride_seconds": window_config.get("stride_seconds"),
+        "target_hz": window_config.get("target_hz"),
+        "target_len": window_config.get("target_len"),
+        "label_mode": window_config.get("label_mode"),
+        "pre_fog_seconds": window_config.get("pre_fog_seconds"),
+        "epochs": training_config.get("epochs"),
+        "batch_size": training_config.get("batch_size"),
+        "lr": training_config.get("lr"),
+        "loss": training_config.get("loss"),
+    }
+    row.update(metric_columns(aggregate))
+    return row
+
+
 def collect_one(aggregate_path: Path) -> dict[str, Any]:
+    if aggregate_path.name == "loso_summary.json":
+        return collect_loso_summary(aggregate_path)
+
     payload = read_json(aggregate_path)
     aggregate, fold_count_from_payload, elapsed_sec = parse_aggregate_payload(payload)
     experiment_dir, variant, summary_path = infer_experiment_dirs(aggregate_path)
@@ -186,6 +273,41 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def format_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    return str(value)
+
+
+def print_table(rows: list[dict[str, Any]]) -> None:
+    preferred = [
+        "experiment",
+        "variant",
+        "trainer",
+        "fold_count",
+        "test_f1_macro_mean",
+        "test_balanced_accuracy_mean",
+        "test_accuracy_mean",
+        "best_val_f1_macro_mean",
+        "window_seconds",
+        "pre_fog_seconds",
+        "epochs",
+        "batch_size",
+    ]
+    columns = [column for column in preferred if any(column in row for row in rows)]
+    widths = {
+        column: max(len(column), *(len(format_cell(row.get(column))) for row in rows))
+        for column in columns
+    }
+    header = "  ".join(column.ljust(widths[column]) for column in columns)
+    print(header)
+    print("  ".join("-" * widths[column] for column in columns))
+    for row in rows:
+        print("  ".join(format_cell(row.get(column)).ljust(widths[column]) for column in columns))
+
+
 def main() -> None:
     args = parse_args()
     aggregate_paths = find_aggregate_paths(args.output_dirs, args.recursive)
@@ -197,6 +319,7 @@ def main() -> None:
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    print_table(rows)
     print(
         json.dumps(
             {

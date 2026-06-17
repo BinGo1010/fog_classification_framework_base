@@ -1,21 +1,20 @@
 project:
   task_name: fog_classification
   is_training: 1
-  model_id: fogstar_mlp_loso_win2s_prefog2_ddp_smoke
-  name: fogstar_mlp_loso_win2s_prefog2_ddp_smoke
-  output_dir: outputs/fogstar_mlp_loso_win2s_prefog2_ddp_smoke
+  model_id: fogstar_mlp_loso_win2s_prefog2
+  name: fogstar_mlp_loso_win2s_prefog2
+  output_dir: outputs/fogstar_mlp_loso_win2s_prefog2
   seed: 42
   device: auto
 
 experiment:
   mode: loso
-  loso_root: data/fogstar_loso_win2s_prefog2_ddp_smoke
-  folds: [1]
+  loso_root: data/fogstar_loso_win2s_prefog2
 
 data:
   name: ChannelSubsetNPZDataset
   data: FOG
-  root: data/fogstar_loso_win2s_prefog2_ddp_smoke
+  root: data/fogstar_loso_win2s_prefog2
   data_path: train.npz
   train_file: train.npz
   val_file: val.npz
@@ -25,7 +24,7 @@ data:
   input_format: NCT
   normalize: zscore
   features: M
-  batch_size: 512
+  batch_size: 256
   num_workers: 0
   pin_memory: true
   imu_positions: [ankleL, ankleR, back, wrist]
@@ -34,16 +33,15 @@ data:
     enabled: true
     sensor_csv: dataset/6.FoG-STAR/sensor_data.csv
     clinical_csv: dataset/6.FoG-STAR/clinical_data.csv
-    out_dir: data/fogstar_loso_win2s_prefog2_ddp_smoke
+    out_dir: data/fogstar_loso_win2s_prefog2
     split_strategy: loso
-    loso_subjects: [1]
     window_size: 120
     stride: 60
     sampling_rate_hz: 60
     fog_threshold: 0.25
     keep_activity_zero: false
     label_mode: three-class
-    pre_fog_seconds: 2.0
+    pre_fog_seconds: 1.0
     label_rule: priority
     sync_model_seq_len: true
     force: false
@@ -61,7 +59,7 @@ model:
   dropout: 0.2
 
 train:
-  epochs: 1
+  epochs: 20
   optimizer: AdamW
   optimizer_foreach: false
   lr: 0.001
@@ -74,7 +72,7 @@ train:
   distributed: auto
   distributed_backend:
   ddp_find_unused_parameters: auto
-  early_stopping_patience: 1
+  early_stopping_patience: 5
   monitor: val_f1_macro
   monitor_mode: max
   save_best_checkpoint: true
@@ -86,6 +84,6 @@ train:
 metrics:
   top_k: [1, 2]
   save_predictions: false
-  save_confusion_matrix: false
-  save_per_class: false
+  save_confusion_matrix: true
+  save_per_class: true
 
