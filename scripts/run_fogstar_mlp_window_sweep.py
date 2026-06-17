@@ -16,6 +16,8 @@ from typing import Any
 
 import yaml
 
+from fog_results_overview import update_overview
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIGS = [
@@ -41,6 +43,13 @@ def parse_args() -> argparse.Namespace:
         help="Extra run.py override applied to every config, for example train.epochs=1.",
     )
     parser.add_argument("--no-collect", action="store_true")
+    parser.add_argument(
+        "--overview-csv",
+        type=Path,
+        default=Path("outputs/fog_results_overview.csv"),
+        help="Shared CSV updated after each completed experiment.",
+    )
+    parser.add_argument("--no-overview", action="store_true")
     parser.add_argument(
         "--summary-csv",
         type=Path,
@@ -210,6 +219,9 @@ def main() -> None:
         rows.append(row)
         write_csv(args.summary_csv, rows)
         write_json(args.summary_json, rows)
+        if not args.dry_run and not args.no_overview:
+            overview_path = update_overview(args.overview_csv, row, sweep="window")
+            print(f"[OVERVIEW] updated {overview_path}", flush=True)
         if returncode != 0 and not args.continue_on_error:
             print_summary(rows)
             raise SystemExit(returncode)

@@ -1,9 +1,5 @@
 #!/usr/bin/env python
-"""Run FoG-STAR MLP long-short window configs sequentially.
-
-The script materializes one generated YAML per long-short combination, then
-launches the normal framework entrypoint. Training still goes through run.py.
-"""
+"""Run FoG-STAR raw long-short DualWindowCNN configs sequentially."""
 
 from __future__ import annotations
 
@@ -25,7 +21,7 @@ from fog_results_overview import update_overview
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-BASE_CONFIG = REPO_ROOT / "configs" / "fogstar_mlp_loso_win1p5s_long4s_prefog0p5.yaml"
+BASE_CONFIG = REPO_ROOT / "configs" / "fogstar_dualcnn_raw_loso_win1p5s_long4s_prefog0p5.yaml"
 
 FOCUSED_COMBOS = [
     (0.5, 3.0),
@@ -60,29 +56,62 @@ PRESETS = {
     "custom": [],
 }
 
+MODEL_SPECS = {
+    "cnn": {
+        "name": "DualWindowCNN",
+        "slug": "dualcnn",
+        "sweep": "dualcnn_raw_long_short",
+    },
+    "cnn_gru": {
+        "name": "DualWindowCNNGRU",
+        "slug": "dualcnn_gru",
+        "sweep": "dualcnn_gru_raw_long_short",
+    },
+    "cnn_transformer": {
+        "name": "DualWindowCNNTransformer",
+        "slug": "dualcnn_transformer",
+        "sweep": "dualcnn_transformer_raw_long_short",
+    },
+}
+
+MODEL_SUITES = {
+    "all": ["cnn", "cnn_gru", "cnn_transformer"],
+    "cnn": ["cnn"],
+    "cnn_gru": ["cnn_gru"],
+    "cnn_transformer": ["cnn_transformer"],
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run FoG-STAR MLP LOSO long-short window sweep.",
+        description="Run FoG-STAR DualWindowCNN raw long-short LOSO sweep.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--preset", choices=sorted(PRESETS), default="full")
     parser.add_argument(
-        "--preset",
-        choices=sorted(PRESETS),
-        default="focused",
-        help="Combination set to run. Use custom with --combo to run only manually listed pairs.",
+        "--model-suite",
+        choices=sorted(MODEL_SUITES),
+        default="all",
+        help="Model family to run for every window combination.",
+    )
+    parser.add_argument(
+        "--model",
+        action="append",
+        choices=sorted(MODEL_SPECS),
+        default=[],
+        help="Add one model family explicitly. Overrides --model-suite when present.",
     )
     parser.add_argument(
         "--combo",
         action="append",
         default=[],
-        help="Add a short,long pair in seconds, for example --combo 1.5,4.0. Can be repeated.",
+        help="Add a short,long pair in seconds, for example --combo 1.5,4.0.",
     )
     parser.add_argument("--base-config", type=Path, default=BASE_CONFIG)
     parser.add_argument(
         "--generated-config-dir",
         type=Path,
-        default=Path("outputs/generated_configs/fogstar_mlp_long_short_sweep"),
+        default=Path("outputs/generated_configs/fogstar_dualcnn_raw_long_short_sweep"),
     )
     parser.add_argument("--nproc-per-node", type=int, default=2)
     parser.add_argument("--python", default=sys.executable)
@@ -106,12 +135,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--summary-csv",
         type=Path,
-        default=Path("outputs/fogstar_mlp_long_short_sweep_summary.csv"),
+        default=Path("outputs/fogstar_dualwindow_raw_long_short_sweep_summary.csv"),
     )
     parser.add_argument(
         "--summary-json",
         type=Path,
-        default=Path("outputs/fogstar_mlp_long_short_sweep_summary.json"),
+        default=Path("outputs/fogstar_dualwindow_raw_long_short_sweep_summary.json"),
     )
     parser.add_argument("--rank-by", default="test_f1_macro_mean")
     parser.add_argument("--top-k", type=int, default=10)
@@ -163,6 +192,11 @@ def selected_combos(args: argparse.Namespace) -> list[tuple[float, float]]:
     return combos
 
 
+def selected_models(args: argparse.Namespace) -> list[dict[str, str]]:
+    keys = args.model if args.model else MODEL_SUITES[args.model_suite]
+    return [MODEL_SPECS[key] for key in keys]
+
+
 def seconds_slug(value: float) -> str:
     if float(value).is_integer():
         return str(int(value))
@@ -173,35 +207,25 @@ def samples(seconds: float, sampling_rate_hz: float) -> int:
     return max(1, int(round(float(seconds) * float(sampling_rate_hz))))
 
 
-def input_channels_for(cfg: dict[str, Any], trend_features: list[str], mode: str) -> int:
-    model_cfg = cfg.get("model", {})
-    windowing = cfg.get("data", {}).get("windowing", {})
-    base_multi = windowing.get("multi_window") or {}
-    base_features = base_multi.get("trend_features") or trend_features
-    base_mode = base_multi.get("mode", mode)
-    base_channels = int(model_cfg.get("in_channels", 120))
-    divisor = len(base_features) + (1 if base_mode == "short_plus_long_trend" else 0)
-    raw_channels = max(1, base_channels // max(1, divisor))
-    return raw_channels * (len(trend_features) + (1 if mode == "short_plus_long_trend" else 0))
-
-
 def materialize_config(
     base_cfg: dict[str, Any],
     short_seconds: float,
     long_seconds: float,
+    model_spec: dict[str, str],
     generated_config_dir: Path,
 ) -> Path:
     cfg = copy.deepcopy(base_cfg)
     wcfg = cfg.setdefault("data", {}).setdefault("windowing", {})
     multi_window = wcfg.setdefault("multi_window", {})
+    model = cfg.setdefault("model", {})
     sampling_rate_hz = float(wcfg.get("sampling_rate_hz", 60))
     short_samples = samples(short_seconds, sampling_rate_hz)
     long_samples = samples(long_seconds, sampling_rate_hz)
     stride_samples = max(1, int(round(short_samples * 0.5)))
     short_slug = seconds_slug(short_seconds)
     long_slug = seconds_slug(long_seconds)
-    run_name = f"fogstar_mlp_loso_win{short_slug}s_long{long_slug}s_prefog0p5"
-    data_dir = f"data/{run_name.replace('fogstar_mlp_loso_', 'fogstar_loso_')}"
+    run_name = f"fogstar_{model_spec['slug']}_raw_loso_win{short_slug}s_long{long_slug}s_prefog0p5"
+    data_dir = f"data/{run_name}"
 
     cfg.setdefault("project", {})["model_id"] = run_name
     cfg["project"]["name"] = run_name
@@ -212,18 +236,19 @@ def materialize_config(
     wcfg["window_size"] = short_samples
     wcfg["stride"] = stride_samples
     multi_window["enabled"] = True
-    multi_window["mode"] = str(multi_window.get("mode", "short_plus_long_trend"))
+    multi_window["mode"] = "short_plus_long_raw"
     multi_window["long_window_size"] = long_samples
-    multi_window.setdefault("trend_features", ["mean", "std", "delta", "slope"])
+    multi_window.pop("trend_features", None)
     multi_window.setdefault("pad", "edge")
 
-    cfg.setdefault("model", {})["seq_len"] = short_samples
-    cfg["model"]["in_channels"] = input_channels_for(
-        cfg,
-        list(multi_window.get("trend_features") or []),
-        str(multi_window.get("mode", "short_plus_long_trend")),
-    )
-    cfg["model"]["dec_in"] = cfg["model"]["in_channels"]
+    raw_channels = int(model.get("raw_in_channels") or int(model.get("in_channels", 48)) // 2)
+    model["name"] = model_spec["name"]
+    model["raw_in_channels"] = raw_channels
+    model["in_channels"] = raw_channels * 2
+    model["dec_in"] = raw_channels * 2
+    model["seq_len"] = long_samples
+    model["short_seq_len"] = short_samples
+    model["long_seq_len"] = long_samples
 
     generated_config_dir = resolve_repo_path(generated_config_dir)
     generated_config_dir.mkdir(parents=True, exist_ok=True)
@@ -291,14 +316,17 @@ def collect_result(config_path: Path, returncode: int, elapsed_sec: float) -> di
     row: dict[str, Any] = {
         "config": str(config_path.relative_to(REPO_ROOT)),
         "experiment": project.get("name"),
+        "model_name": model.get("name"),
         "output_dir": str(output_dir.relative_to(REPO_ROOT)),
         "window_seconds": float(window_size) / sampling_rate_hz if window_size is not None else None,
         "long_window_seconds": float(long_window_size) / sampling_rate_hz if long_window_size is not None else None,
         "stride_seconds": float(stride) / sampling_rate_hz if stride is not None else None,
         "pre_fog_seconds": windowing.get("pre_fog_seconds"),
         "multi_window_mode": multi_window.get("mode"),
-        "trend_features": ",".join(multi_window.get("trend_features") or []),
+        "short_kernel_size": model.get("short_kernel_size"),
+        "long_kernel_size": model.get("long_kernel_size"),
         "input_channels": model.get("in_channels"),
+        "raw_in_channels": model.get("raw_in_channels"),
         "window_size": window_size,
         "long_window_size": long_window_size,
         "stride": stride,
@@ -349,6 +377,7 @@ def write_json(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def print_summary(rows: list[dict[str, Any]]) -> None:
     columns = [
+        "model_name",
         "window_seconds",
         "long_window_seconds",
         "pre_fog_seconds",
@@ -379,7 +408,7 @@ def print_ranked(rows: list[dict[str, Any]], rank_by: str, top_k: int) -> None:
         return
     ranked.sort(key=lambda row: row[rank_by], reverse=True)
     ranked = ranked[:max(1, int(top_k))]
-    columns = ["window_seconds", "long_window_seconds", rank_by, "test_balanced_accuracy_mean", "test_accuracy_mean"]
+    columns = ["model_name", "window_seconds", "long_window_seconds", rank_by, "test_balanced_accuracy_mean", "test_accuracy_mean"]
     widths = {
         column: max(len(column), *(len("" if row.get(column) is None else str(row.get(column))) for row in ranked))
         for column in columns
@@ -400,44 +429,51 @@ def main() -> None:
     args = parse_args()
     base_cfg = load_yaml(resolve_repo_path(args.base_config))
     combos = selected_combos(args)
-    print(f"[INFO] preset={args.preset} combinations={len(combos)}", flush=True)
+    models = selected_models(args)
+    print(
+        f"[INFO] preset={args.preset} combinations={len(combos)} "
+        f"models={','.join(model['name'] for model in models)} total_runs={len(combos) * len(models)}",
+        flush=True,
+    )
 
     rows: list[dict[str, Any]] = []
-    for short_seconds, long_seconds in combos:
-        config_path = materialize_config(
-            base_cfg,
-            short_seconds,
-            long_seconds,
-            args.generated_config_dir,
-        )
-        cfg = load_yaml(config_path)
-        print(f"\n===== {cfg.get('project', {}).get('name', config_path.stem)} =====", flush=True)
-        existing_summary = summary_path_for(config_path)
-        if args.skip_existing and existing_summary.exists() and not args.dry_run:
-            print(f"[SKIP] existing summary: {existing_summary}", flush=True)
-            row = collect_result(config_path, 0, 0.0)
+    for model_spec in models:
+        for short_seconds, long_seconds in combos:
+            config_path = materialize_config(
+                base_cfg,
+                short_seconds,
+                long_seconds,
+                model_spec,
+                args.generated_config_dir,
+            )
+            cfg = load_yaml(config_path)
+            print(f"\n===== {cfg.get('project', {}).get('name', config_path.stem)} =====", flush=True)
+            existing_summary = summary_path_for(config_path)
+            if args.skip_existing and existing_summary.exists() and not args.dry_run:
+                print(f"[SKIP] existing summary: {existing_summary}", flush=True)
+                row = collect_result(config_path, 0, 0.0)
+                rows.append(row)
+                write_csv(args.summary_csv, rows)
+                write_json(args.summary_json, rows)
+                if not args.no_overview:
+                    overview_path = update_overview(args.overview_csv, row, sweep=model_spec["sweep"])
+                    print(f"[OVERVIEW] updated {overview_path}", flush=True)
+                continue
+
+            command = build_command(args, config_path)
+            start = time.perf_counter()
+            returncode = run_command(command, args.dry_run)
+            elapsed = time.perf_counter() - start
+            row = collect_result(config_path, returncode, elapsed)
             rows.append(row)
             write_csv(args.summary_csv, rows)
             write_json(args.summary_json, rows)
-            if not args.no_overview:
-                overview_path = update_overview(args.overview_csv, row, sweep="long_short")
+            if not args.dry_run and not args.no_overview:
+                overview_path = update_overview(args.overview_csv, row, sweep=model_spec["sweep"])
                 print(f"[OVERVIEW] updated {overview_path}", flush=True)
-            continue
-
-        command = build_command(args, config_path)
-        start = time.perf_counter()
-        returncode = run_command(command, args.dry_run)
-        elapsed = time.perf_counter() - start
-        row = collect_result(config_path, returncode, elapsed)
-        rows.append(row)
-        write_csv(args.summary_csv, rows)
-        write_json(args.summary_json, rows)
-        if not args.dry_run and not args.no_overview:
-            overview_path = update_overview(args.overview_csv, row, sweep="long_short")
-            print(f"[OVERVIEW] updated {overview_path}", flush=True)
-        if returncode != 0 and not args.continue_on_error:
-            print_summary(rows)
-            raise SystemExit(returncode)
+            if returncode != 0 and not args.continue_on_error:
+                print_summary(rows)
+                raise SystemExit(returncode)
 
     if not args.no_collect:
         print("\n===== Sweep summary =====")

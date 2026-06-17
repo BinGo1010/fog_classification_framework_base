@@ -1,0 +1,98 @@
+project:
+  task_name: fog_classification
+  is_training: 1
+  model_id: fogstar_dualcnn_raw_loso_win1p5s_long4s_prefog0p5
+  name: fogstar_dualcnn_raw_loso_win1p5s_long4s_prefog0p5
+  output_dir: outputs/fogstar_dualcnn_raw_loso_win1p5s_long4s_prefog0p5
+  seed: 42
+  device: auto
+
+experiment:
+  mode: loso
+  loso_root: data/fogstar_dualcnn_raw_loso_win1p5s_long4s_prefog0p5
+
+data:
+  name: ChannelSubsetNPZDataset
+  data: FOG
+  root: data/fogstar_dualcnn_raw_loso_win1p5s_long4s_prefog0p5
+  data_path: train.npz
+  train_file: train.npz
+  val_file: val.npz
+  test_file: test.npz
+  x_key: X
+  y_key: y
+  input_format: NCT
+  normalize: zscore
+  features: M
+  batch_size: 256
+  num_workers: 0
+  pin_memory: true
+  imu_positions: [ankleL, ankleR, back, wrist]
+  metadata_keys: [subjectID, sessionID, taskID, activity, fog_severity, fog_fraction, clinical]
+  windowing:
+    enabled: true
+    sensor_csv: dataset/6.FoG-STAR/sensor_data.csv
+    clinical_csv: dataset/6.FoG-STAR/clinical_data.csv
+    out_dir: data/fogstar_dualcnn_raw_loso_win1p5s_long4s_prefog0p5
+    split_strategy: loso
+    window_size: 90
+    stride: 45
+    sampling_rate_hz: 60
+    fog_threshold: 0.25
+    keep_activity_zero: false
+    label_mode: three-class
+    pre_fog_seconds: 0.5
+    label_rule: priority
+    sync_model_seq_len: true
+    force: false
+    multi_window:
+      enabled: true
+      mode: short_plus_long_raw
+      long_window_size: 240
+      pad: edge
+
+model:
+  name: DualWindowCNN
+  in_channels: 48
+  raw_in_channels: 24
+  dec_in: 48
+  c_out: 3
+  num_classes: 3
+  seq_len: 240
+  short_seq_len: 90
+  long_seq_len: 240
+  pred_len: 0
+  hidden_dim: 128
+  branch_dim: 64
+  short_kernel_size: 5
+  long_kernel_size: 31
+  dropout: 0.2
+
+train:
+  epochs: 20
+  optimizer: AdamW
+  optimizer_foreach: false
+  lr: 0.001
+  weight_decay: 0.0001
+  scheduler: cosine
+  class_weight: auto
+  loss: weighted_ce
+  grad_clip: 1.0
+  amp: true
+  distributed: auto
+  distributed_backend:
+  ddp_find_unused_parameters: auto
+  early_stopping_patience: 5
+  monitor: val_f1_macro
+  monitor_mode: max
+  save_best_checkpoint: true
+  save_last_checkpoint: false
+  checkpoint_include_optimizer: false
+  checkpoint_include_scheduler: false
+  show_progress: false
+
+metrics:
+  top_k: [1, 2]
+  save_predictions: false
+  save_confusion_matrix: true
+  save_per_class: true

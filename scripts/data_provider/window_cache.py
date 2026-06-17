@@ -30,6 +30,9 @@ CLASS_NAMES_BY_MODE = {
     "three-class": np.array(["NORMAL", "PRE_FOG", "FOG"]),
 }
 LONG_TREND_FEATURES = ("mean", "std", "delta", "slope")
+TREND_MULTI_WINDOW_MODES = {"short_plus_long_trend", "long_trend"}
+RAW_MULTI_WINDOW_MODES = {"short_plus_long_raw"}
+MULTI_WINDOW_MODES = TREND_MULTI_WINDOW_MODES | RAW_MULTI_WINDOW_MODES
 
 
 def _mode_int(values, default=0):
@@ -104,18 +107,21 @@ def _normalize_multi_window_config(value):
         return {"enabled": False}
 
     mode = str(value.get("mode", "short_plus_long_trend")).lower()
-    if mode not in {"short_plus_long_trend", "long_trend"}:
-        raise ValueError("data.windowing.multi_window.mode must be short_plus_long_trend or long_trend.")
+    if mode not in MULTI_WINDOW_MODES:
+        available = ", ".join(sorted(MULTI_WINDOW_MODES))
+        raise ValueError(f"data.windowing.multi_window.mode must be one of: {available}.")
 
-    trend_features = value.get("trend_features", list(LONG_TREND_FEATURES))
-    if isinstance(trend_features, str):
-        trend_features = [part.strip() for part in trend_features.split(",") if part.strip()]
-    trend_features = [str(feature).lower() for feature in trend_features]
-    unknown = [feature for feature in trend_features if feature not in LONG_TREND_FEATURES]
-    if unknown:
-        raise ValueError(f"Unknown long-window trend feature(s): {unknown}. Available: {LONG_TREND_FEATURES}")
-    if not trend_features:
-        raise ValueError("data.windowing.multi_window.trend_features cannot be empty.")
+    trend_features = []
+    if mode in TREND_MULTI_WINDOW_MODES:
+        trend_features = value.get("trend_features", list(LONG_TREND_FEATURES))
+        if isinstance(trend_features, str):
+            trend_features = [part.strip() for part in trend_features.split(",") if part.strip()]
+        trend_features = [str(feature).lower() for feature in trend_features]
+        unknown = [feature for feature in trend_features if feature not in LONG_TREND_FEATURES]
+        if unknown:
+            raise ValueError(f"Unknown long-window trend feature(s): {unknown}. Available: {LONG_TREND_FEATURES}")
+        if not trend_features:
+            raise ValueError("data.windowing.multi_window.trend_features cannot be empty.")
 
     pad = str(value.get("pad", "edge")).lower()
     if pad not in {"edge", "zero"}:
@@ -191,6 +197,54 @@ def _combine_short_long_window(short_signals, long_signals, sensor_cols, trend_f
         blocks.append(np.repeat(feature_values[:, None], short_size, axis=1).astype(np.float32))
         columns.extend([f"{column}_long_{feature}" for column in sensor_cols])
     return np.concatenate(blocks, axis=0), columns
+
+
+def _align_short_to_long(short_signals, long_size, pad):
+    short_signals = np.asarray(short_signals, dtype=np.float32)
+    long_size = int(long_size)
+    short_size = int(short_signals.shape[0])
+    if short_size > long_size:
+        return short_signals[-long_size:]
+    prefix_size = long_size - short_size
+    if prefix_size <= 0:
+        return short_signals
+    if short_size and pad == "edge":
+        prefix = np.repeat(short_signals[:1], prefix_size, axis=0)
+    else:
+        prefix = np.zeros((prefix_size,) + short_signals.shape[1:], dtype=short_signals.dtype)
+    return np.concatenate([prefix, short_signals], axis=0)
+
+
+def _combine_raw_short_long_window(short_signals, long_signals, sensor_cols, pad):
+    short_aligned = _align_short_to_long(short_signals, len(long_signals), pad)
+    blocks = [short_aligned.T.astype(np.float32), np.asarray(long_signals, dtype=np.float32).T]
+    columns = [f"{column}_short" for column in sensor_cols]
+    columns.extend(f"{column}_long" for column in sensor_cols)
+    return np.concatenate(blocks, axis=0), columns
+
+
+def _combine_multi_window(short_signals, long_signals, sensor_cols, multi_window):
+    mode = multi_window["mode"]
+    if mode in RAW_MULTI_WINDOW_MODES:
+        return _combine_raw_short_long_window(
+            short_signals,
+            long_signals,
+            sensor_cols,
+            multi_window["pad"],
+        )
+    return _combine_short_long_window(
+        short_signals,
+        long_signals,
+        sensor_cols,
+        multi_window["trend_features"],
+        mode,
+    )
+
+
+def _output_seq_len(window_size, multi_window):
+    if multi_window["enabled"] and multi_window["mode"] in RAW_MULTI_WINDOW_MODES:
+        return int(multi_window["long_window_size"])
+    return int(window_size)
 
 
 def _split_subjects(subject_ids, subject_has_fog, val_size, test_size, seed):
@@ -357,12 +411,11 @@ def build_windows(
                 long_end = end
                 long_start = long_end - int(multi_window["long_window_size"])
                 long_signals = _slice_with_left_pad(signals, long_start, long_end, pad=multi_window["pad"])
-                x_window, output_sensor_cols = _combine_short_long_window(
+                x_window, output_sensor_cols = _combine_multi_window(
                     short_signals,
                     long_signals,
                     sensor_cols,
-                    multi_window["trend_features"],
-                    multi_window["mode"],
+                    multi_window,
                 )
             else:
                 x_window = short_signals.T
@@ -501,8 +554,10 @@ def _cache_dir(wcfg, split_strategy, window_size, stride, fog_threshold, keep_ac
     name = f"fogstar_{split_strategy}_win{window_size}_stride{stride}_thr{threshold}_{activity}_seed{seed}"
     multi_window = _normalize_multi_window_config(wcfg.get("multi_window"))
     if multi_window["enabled"]:
-        features = "-".join(multi_window["trend_features"])
-        name += f"_mw_{multi_window['mode']}_long{multi_window['long_window_size']}_{features}"
+        suffix = f"_mw_{multi_window['mode']}_long{multi_window['long_window_size']}"
+        if multi_window["trend_features"]:
+            suffix += "_" + "-".join(multi_window["trend_features"])
+        name += suffix
     return Path(wcfg.get("cache_root", "data/generated")) / name
 
 
@@ -662,7 +717,10 @@ def prepare_window_dataset(cfg):
     cfg["data"]["val_file"] = "val.npz"
     cfg["data"]["test_file"] = "test.npz"
     if bool(wcfg.get("sync_model_seq_len", True)):
-        cfg.setdefault("model", {})["seq_len"] = window_size
+        cfg.setdefault("model", {})["seq_len"] = _output_seq_len(window_size, multi_window)
+        if multi_window["enabled"] and multi_window["mode"] in RAW_MULTI_WINDOW_MODES:
+            cfg["model"]["short_seq_len"] = window_size
+            cfg["model"]["long_seq_len"] = int(multi_window["long_window_size"])
     if split_strategy == "loso":
         cfg.setdefault("experiment", {})["loso_root"] = str(out_dir)
     return cfg

@@ -3,6 +3,7 @@ from . import (  # noqa: F401
     cnn1d,
     conformer_adapters,
     ds_cnn1d,
+    dual_window_cnn,
     forecasting_adapters,
     imu_transformer,
     lightweight_imu_tcn,
