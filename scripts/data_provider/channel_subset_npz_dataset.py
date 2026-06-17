@@ -20,7 +20,7 @@ def _as_list(value):
 
 def _channel_parts(name: str):
     parts = name.split("_")
-    if len(parts) != 3:
+    if len(parts) < 3:
         return None, None, None
     return parts[0], parts[1], parts[2]
 

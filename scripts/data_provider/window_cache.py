@@ -29,6 +29,7 @@ CLASS_NAMES_BY_MODE = {
     "binary": np.array(["NORMAL", "FOG"]),
     "three-class": np.array(["NORMAL", "PRE_FOG", "FOG"]),
 }
+LONG_TREND_FEATURES = ("mean", "std", "delta", "slope")
 
 
 def _mode_int(values, default=0):
@@ -88,6 +89,108 @@ def _window_label(values, label_mode, label_rule, fog_threshold):
         return LABEL_NORMAL
 
     raise ValueError("label_rule must be threshold, priority, center, or majority.")
+
+
+def _normalize_multi_window_config(value):
+    if value in (None, False):
+        return {"enabled": False}
+    if value is True:
+        value = {"enabled": True}
+    if not isinstance(value, dict):
+        raise ValueError("data.windowing.multi_window must be a mapping or boolean.")
+
+    enabled = bool(value.get("enabled", False))
+    if not enabled:
+        return {"enabled": False}
+
+    mode = str(value.get("mode", "short_plus_long_trend")).lower()
+    if mode not in {"short_plus_long_trend", "long_trend"}:
+        raise ValueError("data.windowing.multi_window.mode must be short_plus_long_trend or long_trend.")
+
+    trend_features = value.get("trend_features", list(LONG_TREND_FEATURES))
+    if isinstance(trend_features, str):
+        trend_features = [part.strip() for part in trend_features.split(",") if part.strip()]
+    trend_features = [str(feature).lower() for feature in trend_features]
+    unknown = [feature for feature in trend_features if feature not in LONG_TREND_FEATURES]
+    if unknown:
+        raise ValueError(f"Unknown long-window trend feature(s): {unknown}. Available: {LONG_TREND_FEATURES}")
+    if not trend_features:
+        raise ValueError("data.windowing.multi_window.trend_features cannot be empty.")
+
+    pad = str(value.get("pad", "edge")).lower()
+    if pad not in {"edge", "zero"}:
+        raise ValueError("data.windowing.multi_window.pad must be edge or zero.")
+
+    normalized = {
+        "enabled": True,
+        "mode": mode,
+        "long_window_size": int(value.get("long_window_size", value.get("window_size", 240))),
+        "trend_features": trend_features,
+        "pad": pad,
+    }
+    if normalized["long_window_size"] <= 0:
+        raise ValueError("data.windowing.multi_window.long_window_size must be positive.")
+    return normalized
+
+
+def _slice_with_left_pad(values, start, end, pad="edge"):
+    values = np.asarray(values)
+    if end <= start:
+        raise ValueError("Invalid window slice: end must be greater than start.")
+    left_pad = max(0, -int(start))
+    right_end = min(int(end), len(values))
+    body = values[max(0, int(start)):right_end]
+    if left_pad:
+        if len(body) and pad == "edge":
+            pad_values = np.repeat(body[:1], left_pad, axis=0)
+        else:
+            pad_values = np.zeros((left_pad,) + values.shape[1:], dtype=values.dtype)
+        body = np.concatenate([pad_values, body], axis=0)
+    expected = int(end) - int(start)
+    if len(body) < expected:
+        missing = expected - len(body)
+        if len(body) and pad == "edge":
+            pad_values = np.repeat(body[-1:], missing, axis=0)
+        else:
+            pad_values = np.zeros((missing,) + values.shape[1:], dtype=values.dtype)
+        body = np.concatenate([body, pad_values], axis=0)
+    return body[:expected]
+
+
+def _linear_slope(values):
+    values = np.asarray(values, dtype=np.float32)
+    if len(values) <= 1:
+        return np.zeros(values.shape[1], dtype=np.float32)
+    time = np.linspace(-0.5, 0.5, len(values), dtype=np.float32)
+    denom = float(np.sum(time * time))
+    centered = values - values.mean(axis=0, keepdims=True)
+    return (time[:, None] * centered).sum(axis=0) / max(denom, 1e-8)
+
+
+def _long_trend_values(long_signals, short_size, trend_features):
+    long_signals = np.asarray(long_signals, dtype=np.float32)
+    recent = long_signals[-short_size:]
+    early = long_signals[:short_size]
+    values = {
+        "mean": long_signals.mean(axis=0),
+        "std": long_signals.std(axis=0),
+        "delta": recent.mean(axis=0) - early.mean(axis=0),
+        "slope": _linear_slope(long_signals),
+    }
+    return [values[feature].astype(np.float32) for feature in trend_features]
+
+
+def _combine_short_long_window(short_signals, long_signals, sensor_cols, trend_features, mode):
+    short_size = int(short_signals.shape[0])
+    blocks = []
+    columns = []
+    if mode == "short_plus_long_trend":
+        blocks.append(short_signals.T.astype(np.float32))
+        columns.extend(sensor_cols)
+    for feature, feature_values in zip(trend_features, _long_trend_values(long_signals, short_size, trend_features)):
+        blocks.append(np.repeat(feature_values[:, None], short_size, axis=1).astype(np.float32))
+        columns.extend([f"{column}_long_{feature}" for column in sensor_cols])
+    return np.concatenate(blocks, axis=0), columns
 
 
 def _split_subjects(subject_ids, subject_has_fog, val_size, test_size, seed):
@@ -179,6 +282,7 @@ def build_windows(
     pre_fog_seconds=3.0,
     label_rule=None,
     sampling_rate_hz=60,
+    multi_window=None,
 ):
     label_mode = str(label_mode).lower()
     if label_mode not in CLASS_NAMES_BY_MODE:
@@ -190,6 +294,9 @@ def build_windows(
         raise ValueError("label_rule must be threshold, priority, center, or majority.")
     if label_mode == "three-class" and label_rule == "threshold":
         label_rule = "priority"
+    multi_window = _normalize_multi_window_config(multi_window)
+    if multi_window["enabled"] and int(multi_window["long_window_size"]) < int(window_size):
+        raise ValueError("data.windowing.multi_window.long_window_size must be >= window_size.")
 
     if not keep_activity_zero and "activity" in sensor_df.columns:
         sensor_df = sensor_df[sensor_df["activity"] > 0].copy()
@@ -214,6 +321,7 @@ def build_windows(
     merged = merged.sort_values(ID_COLUMNS + ["timestamp"]).reset_index(drop=True)
 
     X, y = [], []
+    output_sensor_cols = list(sensor_cols)
     meta = {
         "subjectID": [],
         "sessionID": [],
@@ -244,7 +352,22 @@ def build_windows(
             fog_fraction = float(fog_window.mean())
             label = _window_label(state[start:end], label_mode, label_rule, fog_threshold)
 
-            X.append(signals[start:end].T)
+            short_signals = signals[start:end]
+            if multi_window["enabled"]:
+                long_end = end
+                long_start = long_end - int(multi_window["long_window_size"])
+                long_signals = _slice_with_left_pad(signals, long_start, long_end, pad=multi_window["pad"])
+                x_window, output_sensor_cols = _combine_short_long_window(
+                    short_signals,
+                    long_signals,
+                    sensor_cols,
+                    multi_window["trend_features"],
+                    multi_window["mode"],
+                )
+            else:
+                x_window = short_signals.T
+
+            X.append(x_window)
             y.append(label)
             meta["subjectID"].append(int(ids["subjectID"]))
             meta["sessionID"].append(int(ids["sessionID"]))
@@ -266,7 +389,7 @@ def build_windows(
     arrays = {
         "X": np.stack(X).astype(np.float32),
         "y": np.asarray(y, dtype=np.int64),
-        "sensor_columns": np.asarray(sensor_cols),
+        "sensor_columns": np.asarray(output_sensor_cols),
         "clinical_feature_names": np.asarray(clinical_feature_cols),
         "class_names": CLASS_NAMES_BY_MODE[label_mode],
     }
@@ -357,6 +480,8 @@ def _summary_matches(out_dir: Path, expected: dict[str, Any], split_strategy: st
     except json.JSONDecodeError:
         return False
     for key, value in expected.items():
+        if key == "multi_window" and value == {"enabled": False} and key not in summary:
+            continue
         if key == "split_strategy" and value == "subject" and key not in summary:
             continue
         if key == "seed" and key not in summary:
@@ -374,6 +499,10 @@ def _cache_dir(wcfg, split_strategy, window_size, stride, fog_threshold, keep_ac
     threshold = str(fog_threshold).replace(".", "p")
     activity = "keepact0" if keep_activity_zero else "dropact0"
     name = f"fogstar_{split_strategy}_win{window_size}_stride{stride}_thr{threshold}_{activity}_seed{seed}"
+    multi_window = _normalize_multi_window_config(wcfg.get("multi_window"))
+    if multi_window["enabled"]:
+        features = "-".join(multi_window["trend_features"])
+        name += f"_mw_{multi_window['mode']}_long{multi_window['long_window_size']}_{features}"
     return Path(wcfg.get("cache_root", "data/generated")) / name
 
 
@@ -397,6 +526,7 @@ def _prepare_arrays(wcfg):
         pre_fog_seconds=float(wcfg.get("pre_fog_seconds", 3.0)),
         label_rule=wcfg.get("label_rule"),
         sampling_rate_hz=float(wcfg.get("sampling_rate_hz", 60)),
+        multi_window=wcfg.get("multi_window"),
     )
 
 
@@ -424,6 +554,7 @@ def prepare_window_dataset(cfg):
     if label_mode == "three-class" and label_rule == "threshold":
         label_rule = "priority"
     pre_fog_seconds = float(wcfg.get("pre_fog_seconds", 3.0))
+    multi_window = _normalize_multi_window_config(wcfg.get("multi_window"))
     seed = int(wcfg.get("seed", cfg.get("project", {}).get("seed", 42)))
     out_dir = _cache_dir(wcfg, split_strategy, window_size, stride, fog_threshold, keep_activity_zero, seed)
     expected = {
@@ -435,6 +566,7 @@ def prepare_window_dataset(cfg):
         "sampling_rate_hz": int(wcfg.get("sampling_rate_hz", 60)),
         "label_mode": label_mode,
         "label_rule": label_rule,
+        "multi_window": multi_window,
     }
     if label_mode == "three-class":
         expected["pre_fog_seconds"] = pre_fog_seconds
@@ -461,6 +593,7 @@ def prepare_window_dataset(cfg):
                 "label_mode": label_mode,
                 "label_rule": label_rule,
                 "pre_fog_seconds": pre_fog_seconds,
+                "multi_window": multi_window,
             }
         )
         base_summary = dict(expected)
