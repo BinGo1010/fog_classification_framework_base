@@ -1,20 +1,20 @@
 project:
   task_name: fog_classification
   is_training: 1
-  model_id: fogstar_mlp_loso_win2s_prefog1
-  name: fogstar_mlp_loso_win2s_prefog1
-  output_dir: outputs/fogstar_mlp_loso_win2s_prefog1
+  model_id: fogstar_mlp_loso_win2s_prefog3
+  name: fogstar_mlp_loso_win2s_prefog3
+  output_dir: outputs/fogstar_mlp_loso_win2s_prefog3
   seed: 42
   device: auto
 
 experiment:
   mode: loso
-  loso_root: data/fogstar_loso_win2s_prefog1
+  loso_root: data/fogstar_loso_win2s_prefog3
 
 data:
   name: ChannelSubsetNPZDataset
   data: FOG
-  root: data/fogstar_loso_win2s_prefog1
+  root: data/fogstar_loso_win2s_prefog3
   data_path: train.npz
   train_file: train.npz
   val_file: val.npz
@@ -33,7 +33,7 @@ data:
     enabled: true
     sensor_csv: dataset/6.FoG-STAR/sensor_data.csv
     clinical_csv: dataset/6.FoG-STAR/clinical_data.csv
-    out_dir: data/fogstar_loso_win2s_prefog1
+    out_dir: data/fogstar_loso_win2s_prefog3
     split_strategy: loso
     window_size: 120
     stride: 60
@@ -41,7 +41,7 @@ data:
     fog_threshold: 0.25
     keep_activity_zero: false
     label_mode: three-class
-    pre_fog_seconds: 1.0
+    pre_fog_seconds: 3.0
     label_rule: priority
     sync_model_seq_len: true
     force: false
@@ -86,3 +86,4 @@ metrics:
   save_predictions: false
   save_confusion_matrix: true
   save_per_class: true
+
