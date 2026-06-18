@@ -12,6 +12,7 @@ from . import (  # noqa: F401
     mlp,
     mobileone1d_tiny,
     modern_tcn1d_tiny,
+    multi_kernel_cnn,
     sequence_contrastive,
     simclr_cnn1d,
     supcon_cnn1d,

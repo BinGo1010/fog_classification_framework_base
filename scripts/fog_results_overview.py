@@ -26,6 +26,8 @@ PREFERRED_COLUMNS = [
     "pre_fog_seconds",
     "multi_window_mode",
     "trend_features",
+    "small_kernel_size",
+    "large_kernel_size",
     "short_kernel_size",
     "long_kernel_size",
     "input_channels",

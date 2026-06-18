@@ -16,6 +16,8 @@ DEFAULT_SUMMARY_PATTERNS = [
     "outputs/fogstar_mlp_long_short_sweep_summary.csv",
     "outputs/fogstar_dualwindow_raw_long_short_sweep_summary.csv",
     "outputs/fogstar_dualcnn_raw_long_short_sweep_summary.csv",
+    "outputs/fogstar_multikernel_cnn_win1s_sweep_summary.csv",
+    "outputs/fogstar_multikernel_cnn_sweep_summary.csv",
 ]
 
 
@@ -49,6 +51,8 @@ def resolve(path: Path) -> Path:
 
 def infer_sweep(path: Path) -> str:
     name = path.name.lower()
+    if "multikernel" in name:
+        return "multikernel_cnn"
     if "dualwindow" in name and "long_short" in name:
         return "dualwindow_raw_long_short"
     if "dualcnn" in name and "long_short" in name:
