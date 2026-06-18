@@ -14,14 +14,20 @@ PREFERRED_COLUMNS = [
     "updated_at",
     "sweep",
     "experiment",
+    "feature_set",
     "model_name",
     "status",
     "fold_count",
     "test_f1_macro_mean",
+    "test_f1_macro_std",
     "test_recall_macro_mean",
+    "test_recall_macro_std",
     "test_pr_auc_macro_mean",
+    "test_pr_auc_macro_std",
     "pre_fog_recall_mean",
+    "pre_fog_recall_std",
     "pre_fog_f1_mean",
+    "pre_fog_f1_std",
     "pre_fog_support_sum",
     "fog_recall_mean",
     "fog_f1_mean",
@@ -30,9 +36,14 @@ PREFERRED_COLUMNS = [
     "normal_f1_mean",
     "normal_support_sum",
     "best_val_f1_macro_mean",
+    "best_val_f1_macro_std",
     "test_balanced_accuracy_mean",
+    "test_balanced_accuracy_std",
     "test_accuracy_mean",
+    "test_accuracy_std",
     "confusion_matrix_test_sum",
+    "cm_true_normal_pred_pre_fog",
+    "cm_true_fog_pred_pre_fog",
     "window_seconds",
     "long_window_seconds",
     "stride_seconds",
@@ -121,6 +132,13 @@ def _metric_mean(aggregate: dict[str, Any], key: str) -> Any:
     return None
 
 
+def _metric_std(aggregate: dict[str, Any], key: str) -> Any:
+    value = aggregate.get(key)
+    if isinstance(value, dict):
+        return value.get("std")
+    return None
+
+
 def _resolve_existing_path(value: Any) -> Path | None:
     if value in (None, ""):
         return None
@@ -185,6 +203,9 @@ def _enrich_from_loso_summary(row: dict[str, Any], summary_path: Path | None) ->
             value = _metric_mean(aggregate, source_key)
             if value is not None:
                 row[target_key] = value
+            std_value = _metric_std(aggregate, source_key)
+            if std_value is not None and target_key.endswith("_mean"):
+                row[f"{target_key[:-5]}_std"] = std_value
     if summary.get("num_folds") is not None:
         row["fold_count"] = summary.get("num_folds")
     matrix = summary.get("confusion_matrix_test_sum")

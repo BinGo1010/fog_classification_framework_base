@@ -38,6 +38,24 @@ LONG_TREND_FEATURES = (
     "fft_entropy",
     "fft_centroid",
     "fft_peak_freq",
+    "bandpower_low",
+    "bandpower_high",
+    "freeze_index",
+    "bandpower_ratio",
+    "dominant_power",
+)
+FREQUENCY_TREND_FEATURES = frozenset(
+    {
+        "fft_energy",
+        "fft_entropy",
+        "fft_centroid",
+        "fft_peak_freq",
+        "bandpower_low",
+        "bandpower_high",
+        "freeze_index",
+        "bandpower_ratio",
+        "dominant_power",
+    }
 )
 TREND_MULTI_WINDOW_MODES = {"short_plus_long_trend", "long_trend"}
 RAW_MULTI_WINDOW_MODES = {"short_plus_long_raw"}
@@ -192,6 +210,11 @@ def _frequency_trend_values(long_signals, sampling_rate_hz):
             "fft_entropy": zeros,
             "fft_centroid": zeros,
             "fft_peak_freq": zeros,
+            "bandpower_low": zeros,
+            "bandpower_high": zeros,
+            "freeze_index": zeros,
+            "bandpower_ratio": zeros,
+            "dominant_power": zeros,
         }
 
     centered = long_signals - long_signals.mean(axis=0, keepdims=True)
@@ -203,6 +226,11 @@ def _frequency_trend_values(long_signals, sampling_rate_hz):
         freqs = freqs[1:]
     total_power = power.sum(axis=0)
     safe_power = np.maximum(total_power, 1e-12)
+    low_mask = (freqs >= 0.5) & (freqs < 3.0)
+    high_mask = (freqs >= 3.0) & (freqs <= 8.0)
+    low_power = power[low_mask].sum(axis=0) if np.any(low_mask) else np.zeros(num_channels, dtype=np.float64)
+    high_power = power[high_mask].sum(axis=0) if np.any(high_mask) else np.zeros(num_channels, dtype=np.float64)
+    max_power = power.max(axis=0) if power.size else np.zeros(num_channels, dtype=np.float64)
 
     probabilities = power / safe_power[None, :]
     entropy_denom = np.log(max(2, power.shape[0]))
@@ -210,16 +238,27 @@ def _frequency_trend_values(long_signals, sampling_rate_hz):
     centroid = (freqs[:, None] * power).sum(axis=0) / safe_power
     peak_indices = np.argmax(power, axis=0) if power.size else np.zeros(num_channels, dtype=np.int64)
     peak_freq = freqs[peak_indices] if len(freqs) else np.zeros(num_channels, dtype=np.float64)
+    freeze_index = np.log1p(high_power / np.maximum(low_power, 1e-12))
+    bandpower_ratio = high_power / np.maximum(low_power + high_power, 1e-12)
+    dominant_power = max_power / safe_power
     no_signal = total_power <= 1e-12
     entropy[no_signal] = 0.0
     centroid[no_signal] = 0.0
     peak_freq[no_signal] = 0.0
+    freeze_index[no_signal] = 0.0
+    bandpower_ratio[no_signal] = 0.0
+    dominant_power[no_signal] = 0.0
 
     return {
         "fft_energy": np.log1p(total_power / max(1, len(long_signals))).astype(np.float32),
         "fft_entropy": entropy.astype(np.float32),
         "fft_centroid": centroid.astype(np.float32),
         "fft_peak_freq": peak_freq.astype(np.float32),
+        "bandpower_low": np.log1p(low_power).astype(np.float32),
+        "bandpower_high": np.log1p(high_power).astype(np.float32),
+        "freeze_index": freeze_index.astype(np.float32),
+        "bandpower_ratio": bandpower_ratio.astype(np.float32),
+        "dominant_power": dominant_power.astype(np.float32),
     }
 
 
@@ -233,7 +272,7 @@ def _long_trend_values(long_signals, short_size, trend_features, sampling_rate_h
         "delta": recent.mean(axis=0) - early.mean(axis=0),
         "slope": _linear_slope(long_signals),
     }
-    if any(str(feature).startswith("fft_") for feature in trend_features):
+    if any(str(feature) in FREQUENCY_TREND_FEATURES for feature in trend_features):
         values.update(_frequency_trend_values(long_signals, sampling_rate_hz))
     return [values[feature].astype(np.float32) for feature in trend_features]
 

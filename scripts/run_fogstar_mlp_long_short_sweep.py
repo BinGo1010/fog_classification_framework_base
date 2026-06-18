@@ -36,6 +36,11 @@ TREND_FEATURE_SLUGS = {
     "fft_entropy": "fent",
     "fft_centroid": "fc",
     "fft_peak_freq": "fpeak",
+    "bandpower_low": "bpl",
+    "bandpower_high": "bph",
+    "freeze_index": "fi",
+    "bandpower_ratio": "br",
+    "dominant_power": "dp",
 }
 
 FOCUSED_COMBOS = [
@@ -94,7 +99,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Comma-separated long-window trend features. Available: "
-            "mean,std,delta,slope,fft_energy,fft_entropy,fft_centroid,fft_peak_freq."
+            "mean,std,delta,slope,fft_energy,fft_entropy,fft_centroid,fft_peak_freq,"
+            "bandpower_low,bandpower_high,freeze_index,bandpower_ratio,dominant_power."
         ),
     )
     parser.add_argument("--base-config", type=Path, default=BASE_CONFIG)
@@ -240,6 +246,7 @@ def materialize_config(
     long_seconds: float,
     generated_config_dir: Path,
     trend_features: list[str] | None = None,
+    experiment_suffix: str | None = None,
 ) -> Path:
     cfg = copy.deepcopy(base_cfg)
     wcfg = cfg.setdefault("data", {}).setdefault("windowing", {})
@@ -253,7 +260,7 @@ def materialize_config(
     short_slug = seconds_slug(short_seconds)
     long_slug = seconds_slug(long_seconds)
     next_trend_features = list(trend_features or multi_window.get("trend_features") or DEFAULT_TREND_FEATURES)
-    suffix = trend_feature_suffix(next_trend_features)
+    suffix = trend_feature_suffix(next_trend_features) if experiment_suffix is None else str(experiment_suffix)
     run_name = f"fogstar_mlp_loso_win{short_slug}s_long{long_slug}s_prefog0p5{suffix}"
     data_dir = f"data/{run_name.replace('fogstar_mlp_loso_', 'fogstar_loso_')}"
 
@@ -330,6 +337,13 @@ def metric_mean(aggregate: dict[str, Any], key: str) -> Any:
     return value
 
 
+def metric_std(aggregate: dict[str, Any], key: str) -> Any:
+    value = aggregate.get(key)
+    if isinstance(value, dict):
+        return value.get("std")
+    return None
+
+
 def collect_result(config_path: Path, returncode: int, elapsed_sec: float) -> dict[str, Any]:
     cfg = load_yaml(config_path)
     project = cfg.get("project", {})
@@ -375,11 +389,21 @@ def collect_result(config_path: Path, returncode: int, elapsed_sec: float) -> di
             "status": "ok" if returncode == 0 else "failed",
             "fold_count": summary.get("num_folds"),
             "test_f1_macro_mean": metric_mean(aggregate, "test_f1_macro"),
+            "test_f1_macro_std": metric_std(aggregate, "test_f1_macro"),
             "test_recall_macro_mean": metric_mean(aggregate, "test_recall_macro"),
+            "test_recall_macro_std": metric_std(aggregate, "test_recall_macro"),
             "test_pr_auc_macro_mean": metric_mean(aggregate, "test_pr_auc_macro"),
+            "test_pr_auc_macro_std": metric_std(aggregate, "test_pr_auc_macro"),
+            "pre_fog_recall_mean": metric_mean(aggregate, "test_pre_fog_recall"),
+            "pre_fog_recall_std": metric_std(aggregate, "test_pre_fog_recall"),
+            "pre_fog_f1_mean": metric_mean(aggregate, "test_pre_fog_f1"),
+            "pre_fog_f1_std": metric_std(aggregate, "test_pre_fog_f1"),
             "test_balanced_accuracy_mean": metric_mean(aggregate, "test_balanced_accuracy"),
+            "test_balanced_accuracy_std": metric_std(aggregate, "test_balanced_accuracy"),
             "test_accuracy_mean": metric_mean(aggregate, "test_accuracy"),
+            "test_accuracy_std": metric_std(aggregate, "test_accuracy"),
             "best_val_f1_macro_mean": metric_mean(aggregate, "best_val_f1_macro"),
+            "best_val_f1_macro_std": metric_std(aggregate, "best_val_f1_macro"),
         }
     )
     return row
