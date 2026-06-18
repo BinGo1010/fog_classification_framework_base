@@ -79,10 +79,12 @@ train:
   save_last_checkpoint: false
   checkpoint_include_optimizer: false
   checkpoint_include_scheduler: false
-  show_progress: false
+  show_progress: true
+  print_epoch_metrics: false
 
 metrics:
   top_k: [1, 2]
   save_predictions: false
   save_confusion_matrix: true
   save_per_class: true
+

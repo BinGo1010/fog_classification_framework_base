@@ -154,19 +154,21 @@ class Trainer:
         self.out_dir = Path(cfg["project"]["output_dir"])
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.show_progress = bool(cfg.get("train", {}).get("show_progress", True))
+        self.print_epoch_metrics = bool(cfg.get("train", {}).get("print_epoch_metrics", False))
         device_name = torch.cuda.get_device_name(self.device) if self.device.type == "cuda" else "CPU"
         if self.is_main:
             dist_text = f", DDP world_size={cfg.get('runtime', {}).get('world_size', 1)}" if self.distributed else ""
             print(f"Using device: {self.device} ({device_name}{dist_text})")
         self.scaler = torch.amp.GradScaler("cuda", enabled=bool(cfg["train"].get("amp", False) and self.device.type == "cuda"))
 
-    def _run_epoch(self, split, train=False):
+    def _run_epoch(self, split, train=False, epoch=None):
         model = self.model if train else unwrap_model(self.model)
         model.train(train)
         loader = self.loaders[split]
         y_true, y_prob, indices = [], [], []
         total_loss, n = 0.0, 0
-        iterator = tqdm(loader, desc=split, leave=False, disable=(not self.is_main or not self.show_progress))
+        desc = f"{split} e{epoch:03d}" if epoch is not None else split
+        iterator = tqdm(loader, desc=desc, leave=False, disable=(not self.is_main or not self.show_progress))
         for batch in iterator:
             x = batch["x"].to(self.device, non_blocking=True)
             y = batch["y"].to(self.device, non_blocking=True)
@@ -221,19 +223,20 @@ class Trainer:
             if hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
             t0 = time.time()
-            train_metrics, *_ = self._run_epoch("train", train=True)
+            train_metrics, *_ = self._run_epoch("train", train=True, epoch=epoch)
             if self.scheduler is not None:
                 self.scheduler.step()
             stop_now = False
             if self.is_main:
-                val_metrics, y_true, y_prob, idx = self._run_epoch("val", train=False)
+                val_metrics, y_true, y_prob, idx = self._run_epoch("val", train=False, epoch=epoch)
                 row = {"epoch": epoch, "lr": self.optimizer.param_groups[0]["lr"], "time_sec": round(time.time()-t0, 3)}
                 row.update({f"train_{k}": v for k, v in train_metrics.items() if isinstance(v, (int, float))})
                 row.update({f"val_{k}": v for k, v in val_metrics.items() if isinstance(v, (int, float))})
                 append_csv(self.out_dir / "logs" / "train_log.csv", row)
                 current = val_metrics.get(monitor)
                 improved = current is not None and ((mode == "max" and current > best) or (mode == "min" and current < best))
-                print(f"Epoch {epoch:03d} | train_loss={train_metrics['loss']:.4f} | val_loss={val_metrics['loss']:.4f} | val_f1_macro={val_metrics.get('f1_macro', 0):.4f}")
+                if self.print_epoch_metrics:
+                    print(f"Epoch {epoch:03d} | train_loss={train_metrics['loss']:.4f} | val_loss={val_metrics['loss']:.4f} | val_f1_macro={val_metrics.get('f1_macro', 0):.4f}")
                 if improved:
                     best = current
                     bad_epochs = 0

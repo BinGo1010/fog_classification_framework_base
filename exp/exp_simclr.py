@@ -76,7 +76,7 @@ class SimCLRExperiment(SupConExperiment):
                 "time_sec": round(time.time() - t0, 3),
             }
             log_rows.append(row)
-            if self.is_main:
+            if self.is_main and self._print_epoch_metrics():
                 print(f"SimCLR epoch {epoch:03d} | loss={row['loss']:.4f}")
 
         if self.is_main:

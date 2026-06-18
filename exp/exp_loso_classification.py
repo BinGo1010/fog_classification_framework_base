@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import csv
+import json
 from pathlib import Path
 
 from exp.exp_fog_classification import ClassificationExperiment
@@ -9,6 +11,84 @@ from exp.exp_supcon import SupConExperiment
 from exp.exp_utils import scalar_metrics, summarize, write_csv
 from utils.io import load_checkpoint, save_json
 from utils.distributed import barrier, is_main_process
+
+
+CLASS_NAMES_BY_COUNT = {
+    2: ["normal", "fog"],
+    3: ["normal", "pre_fog", "fog"],
+}
+
+
+def _class_key(class_index: int, num_classes: int) -> str:
+    names = CLASS_NAMES_BY_COUNT.get(int(num_classes), [])
+    if 0 <= int(class_index) < len(names):
+        return names[int(class_index)]
+    return f"class_{int(class_index)}"
+
+
+def _read_float(row: dict[str, str], *keys: str) -> float | None:
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return float(value)
+    return None
+
+
+def _read_int(row: dict[str, str], *keys: str) -> int | None:
+    value = _read_float(row, *keys)
+    return None if value is None else int(value)
+
+
+def _read_per_class_metrics(fold_output_dir: Path, num_classes: int) -> dict[str, float | int]:
+    path = fold_output_dir / "per_class_metrics_test.csv"
+    if not path.exists():
+        return {}
+    out: dict[str, float | int] = {}
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            class_index = int(float(row["class"]))
+            prefix = f"test_{_class_key(class_index, num_classes)}"
+            precision = _read_float(row, "precision")
+            recall = _read_float(row, "recall_sensitivity", "recall")
+            f1 = _read_float(row, "f1")
+            support = _read_int(row, "support")
+            if precision is not None:
+                out[f"{prefix}_precision"] = precision
+            if recall is not None:
+                out[f"{prefix}_recall"] = recall
+            if f1 is not None:
+                out[f"{prefix}_f1"] = f1
+            if support is not None:
+                out[f"{prefix}_support"] = support
+    return out
+
+
+def _read_confusion_matrix(path: Path) -> list[list[int]] | None:
+    if not path.exists():
+        return None
+    matrix: list[list[int]] = []
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        next(reader, None)
+        for row in reader:
+            values = row[1:] if len(row) > 1 else row
+            matrix.append([int(float(value)) for value in values if value != ""])
+    return matrix or None
+
+
+def _sum_matrices(matrices: list[list[list[int]]]) -> list[list[int]] | None:
+    if not matrices:
+        return None
+    rows = len(matrices[0])
+    cols = len(matrices[0][0]) if rows else 0
+    total = [[0 for _ in range(cols)] for _ in range(rows)]
+    for matrix in matrices:
+        if len(matrix) != rows or any(len(row) != cols for row in matrix):
+            continue
+        for i in range(rows):
+            for j in range(cols):
+                total[i][j] += int(matrix[i][j])
+    return total
 
 
 class LOSOExperiment:
@@ -87,6 +167,11 @@ class LOSOExperiment:
                 "best_val_f1_macro": (ckpt.get("metrics", {}) or {}).get("f1_macro") if isinstance(ckpt, dict) else None,
             }
             row.update({f"test_{key}": value for key, value in scalar_metrics(metrics).items()})
+            fold_output_dir = self.output_root / fold_name
+            row.update(_read_per_class_metrics(fold_output_dir, int(self.cfg["model"]["num_classes"])))
+            confusion_matrix = _read_confusion_matrix(fold_output_dir / "confusion_matrix_test.csv")
+            if confusion_matrix is not None:
+                row["test_confusion_matrix"] = json.dumps(confusion_matrix, separators=(",", ":"))
             rows.append(row)
             write_csv(self.output_root / "loso_summary.csv", rows)
 
@@ -94,18 +179,46 @@ class LOSOExperiment:
             barrier(self.cfg)
             return {}
 
-        metric_keys = [key for key in rows[0] if key.startswith("test_") or key == "best_val_f1_macro"]
+        metric_keys = sorted(
+            {
+                key
+                for row in rows
+                for key, value in row.items()
+                if (key.startswith("test_") or key == "best_val_f1_macro")
+                and isinstance(value, (int, float))
+            }
+        )
+        confusion_matrices = [
+            json.loads(row["test_confusion_matrix"])
+            for row in rows
+            if row.get("test_confusion_matrix")
+        ]
         summary = {
             "num_folds": len(rows),
             "folds": rows,
             "aggregate": summarize(rows, metric_keys),
         }
+        confusion_matrix_sum = _sum_matrices(confusion_matrices)
+        if confusion_matrix_sum is not None:
+            summary["confusion_matrix_test_sum"] = confusion_matrix_sum
         save_json(summary, self.output_root / "loso_summary.json")
         write_csv(self.output_root / "loso_summary.csv", rows)
 
         print("\n===== LOSO aggregate =====")
-        for key in ["test_f1_macro", "test_balanced_accuracy", "test_accuracy", "test_roc_auc", "test_pr_auc"]:
+        primary_keys = [
+            "test_f1_macro",
+            "test_recall_macro",
+            "test_pr_auc_macro",
+            "test_pre_fog_recall",
+            "test_pre_fog_f1",
+            "test_fog_recall",
+            "test_fog_f1",
+            "test_accuracy",
+            "test_balanced_accuracy",
+        ]
+        for key in primary_keys:
             stats = summary["aggregate"].get(key, {})
-            print(f"{key}: mean={stats.get('mean')} std={stats.get('std')}")
+            if stats:
+                print(f"{key}: mean={stats.get('mean')} std={stats.get('std')}")
         barrier(self.cfg)
         return summary

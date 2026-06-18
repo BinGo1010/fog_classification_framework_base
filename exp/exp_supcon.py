@@ -76,6 +76,9 @@ class SupConExperiment(BaseExperiment):
     def _show_progress(self):
         return bool(self.cfg.get("train", {}).get("show_progress", True))
 
+    def _print_epoch_metrics(self):
+        return bool(self.cfg.get("train", {}).get("print_epoch_metrics", False))
+
     def _augmenter(self):
         acfg = self.cfg.get("augmentations", {})
         return IMUTimeSeriesAugmenter(
@@ -183,7 +186,7 @@ class SupConExperiment(BaseExperiment):
                 "time_sec": round(time.time() - t0, 3),
             }
             log_rows.append(row)
-            if self.is_main:
+            if self.is_main and self._print_epoch_metrics():
                 print(f"SupCon epoch {epoch:03d} | loss={row['loss']:.4f}")
 
         if self.is_main:
@@ -278,12 +281,13 @@ class SupConExperiment(BaseExperiment):
             if self.is_main:
                 current = val_metrics.get(monitor)
                 improved = current is not None and ((mode == "max" and current > best) or (mode == "min" and current < best))
-                print(
-                    f"Finetune epoch {epoch:03d} | "
-                    f"train_loss={train_metrics['loss']:.4f} | "
-                    f"val_loss={val_metrics['loss']:.4f} | "
-                    f"val_f1_macro={val_metrics.get('f1_macro', 0):.4f}"
-                )
+                if self._print_epoch_metrics():
+                    print(
+                        f"Finetune epoch {epoch:03d} | "
+                        f"train_loss={train_metrics['loss']:.4f} | "
+                        f"val_loss={val_metrics['loss']:.4f} | "
+                        f"val_f1_macro={val_metrics.get('f1_macro', 0):.4f}"
+                    )
                 if improved:
                     best = current
                     bad_epochs = 0

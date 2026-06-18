@@ -29,7 +29,16 @@ CLASS_NAMES_BY_MODE = {
     "binary": np.array(["NORMAL", "FOG"]),
     "three-class": np.array(["NORMAL", "PRE_FOG", "FOG"]),
 }
-LONG_TREND_FEATURES = ("mean", "std", "delta", "slope")
+LONG_TREND_FEATURES = (
+    "mean",
+    "std",
+    "delta",
+    "slope",
+    "fft_energy",
+    "fft_entropy",
+    "fft_centroid",
+    "fft_peak_freq",
+)
 TREND_MULTI_WINDOW_MODES = {"short_plus_long_trend", "long_trend"}
 RAW_MULTI_WINDOW_MODES = {"short_plus_long_raw"}
 MULTI_WINDOW_MODES = TREND_MULTI_WINDOW_MODES | RAW_MULTI_WINDOW_MODES
@@ -173,7 +182,48 @@ def _linear_slope(values):
     return (time[:, None] * centered).sum(axis=0) / max(denom, 1e-8)
 
 
-def _long_trend_values(long_signals, short_size, trend_features):
+def _frequency_trend_values(long_signals, sampling_rate_hz):
+    long_signals = np.asarray(long_signals, dtype=np.float32)
+    num_channels = int(long_signals.shape[1])
+    if len(long_signals) <= 1:
+        zeros = np.zeros(num_channels, dtype=np.float32)
+        return {
+            "fft_energy": zeros,
+            "fft_entropy": zeros,
+            "fft_centroid": zeros,
+            "fft_peak_freq": zeros,
+        }
+
+    centered = long_signals - long_signals.mean(axis=0, keepdims=True)
+    spectrum = np.fft.rfft(centered, axis=0)
+    power = np.abs(spectrum).astype(np.float64) ** 2
+    freqs = np.fft.rfftfreq(len(long_signals), d=1.0 / float(sampling_rate_hz))
+    if len(freqs) > 1:
+        power = power[1:]
+        freqs = freqs[1:]
+    total_power = power.sum(axis=0)
+    safe_power = np.maximum(total_power, 1e-12)
+
+    probabilities = power / safe_power[None, :]
+    entropy_denom = np.log(max(2, power.shape[0]))
+    entropy = -(probabilities * np.log(np.maximum(probabilities, 1e-12))).sum(axis=0) / entropy_denom
+    centroid = (freqs[:, None] * power).sum(axis=0) / safe_power
+    peak_indices = np.argmax(power, axis=0) if power.size else np.zeros(num_channels, dtype=np.int64)
+    peak_freq = freqs[peak_indices] if len(freqs) else np.zeros(num_channels, dtype=np.float64)
+    no_signal = total_power <= 1e-12
+    entropy[no_signal] = 0.0
+    centroid[no_signal] = 0.0
+    peak_freq[no_signal] = 0.0
+
+    return {
+        "fft_energy": np.log1p(total_power / max(1, len(long_signals))).astype(np.float32),
+        "fft_entropy": entropy.astype(np.float32),
+        "fft_centroid": centroid.astype(np.float32),
+        "fft_peak_freq": peak_freq.astype(np.float32),
+    }
+
+
+def _long_trend_values(long_signals, short_size, trend_features, sampling_rate_hz):
     long_signals = np.asarray(long_signals, dtype=np.float32)
     recent = long_signals[-short_size:]
     early = long_signals[:short_size]
@@ -183,17 +233,20 @@ def _long_trend_values(long_signals, short_size, trend_features):
         "delta": recent.mean(axis=0) - early.mean(axis=0),
         "slope": _linear_slope(long_signals),
     }
+    if any(str(feature).startswith("fft_") for feature in trend_features):
+        values.update(_frequency_trend_values(long_signals, sampling_rate_hz))
     return [values[feature].astype(np.float32) for feature in trend_features]
 
 
-def _combine_short_long_window(short_signals, long_signals, sensor_cols, trend_features, mode):
+def _combine_short_long_window(short_signals, long_signals, sensor_cols, trend_features, mode, sampling_rate_hz):
     short_size = int(short_signals.shape[0])
     blocks = []
     columns = []
     if mode == "short_plus_long_trend":
         blocks.append(short_signals.T.astype(np.float32))
         columns.extend(sensor_cols)
-    for feature, feature_values in zip(trend_features, _long_trend_values(long_signals, short_size, trend_features)):
+    trend_values = _long_trend_values(long_signals, short_size, trend_features, sampling_rate_hz)
+    for feature, feature_values in zip(trend_features, trend_values):
         blocks.append(np.repeat(feature_values[:, None], short_size, axis=1).astype(np.float32))
         columns.extend([f"{column}_long_{feature}" for column in sensor_cols])
     return np.concatenate(blocks, axis=0), columns
@@ -223,7 +276,7 @@ def _combine_raw_short_long_window(short_signals, long_signals, sensor_cols, pad
     return np.concatenate(blocks, axis=0), columns
 
 
-def _combine_multi_window(short_signals, long_signals, sensor_cols, multi_window):
+def _combine_multi_window(short_signals, long_signals, sensor_cols, multi_window, sampling_rate_hz):
     mode = multi_window["mode"]
     if mode in RAW_MULTI_WINDOW_MODES:
         return _combine_raw_short_long_window(
@@ -238,6 +291,7 @@ def _combine_multi_window(short_signals, long_signals, sensor_cols, multi_window
         sensor_cols,
         multi_window["trend_features"],
         mode,
+        sampling_rate_hz,
     )
 
 
@@ -416,6 +470,7 @@ def build_windows(
                     long_signals,
                     sensor_cols,
                     multi_window,
+                    sampling_rate_hz,
                 )
             else:
                 x_window = short_signals.T

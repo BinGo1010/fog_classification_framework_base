@@ -318,6 +318,8 @@ def collect_result(config_path: Path, returncode: int, elapsed_sec: float) -> di
             "status": "ok" if returncode == 0 else "failed",
             "fold_count": summary.get("num_folds"),
             "test_f1_macro_mean": metric_mean(aggregate, "test_f1_macro"),
+            "test_recall_macro_mean": metric_mean(aggregate, "test_recall_macro"),
+            "test_pr_auc_macro_mean": metric_mean(aggregate, "test_pr_auc_macro"),
             "test_balanced_accuracy_mean": metric_mean(aggregate, "test_balanced_accuracy"),
             "test_accuracy_mean": metric_mean(aggregate, "test_accuracy"),
             "best_val_f1_macro_mean": metric_mean(aggregate, "best_val_f1_macro"),
@@ -353,6 +355,8 @@ def print_summary(rows: list[dict[str, Any]]) -> None:
         "status",
         "fold_count",
         "test_f1_macro_mean",
+        "test_recall_macro_mean",
+        "test_pr_auc_macro_mean",
         "test_balanced_accuracy_mean",
         "test_accuracy_mean",
         "best_val_f1_macro_mean",
@@ -377,7 +381,7 @@ def print_ranked(rows: list[dict[str, Any]], rank_by: str, top_k: int) -> None:
         return
     ranked.sort(key=lambda row: row[rank_by], reverse=True)
     ranked = ranked[:max(1, int(top_k))]
-    columns = ["small_kernel_size", "large_kernel_size", rank_by, "test_balanced_accuracy_mean", "test_accuracy_mean"]
+    columns = ["small_kernel_size", "large_kernel_size", rank_by, "test_recall_macro_mean", "test_pr_auc_macro_mean", "test_balanced_accuracy_mean", "test_accuracy_mean"]
     widths = {
         column: max(len(column), *(len("" if row.get(column) is None else str(row.get(column))) for row in ranked))
         for column in columns

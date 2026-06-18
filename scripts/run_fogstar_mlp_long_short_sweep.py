@@ -26,6 +26,17 @@ from fog_results_overview import update_overview
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BASE_CONFIG = REPO_ROOT / "configs" / "fogstar_mlp_loso_win1p5s_long4s_prefog0p5.yaml"
+DEFAULT_TREND_FEATURES = ["mean", "std", "delta", "slope"]
+TREND_FEATURE_SLUGS = {
+    "mean": "mean",
+    "std": "std",
+    "delta": "delta",
+    "slope": "slope",
+    "fft_energy": "fe",
+    "fft_entropy": "fent",
+    "fft_centroid": "fc",
+    "fft_peak_freq": "fpeak",
+}
 
 FOCUSED_COMBOS = [
     (0.5, 3.0),
@@ -78,6 +89,14 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Add a short,long pair in seconds, for example --combo 1.5,4.0. Can be repeated.",
     )
+    parser.add_argument(
+        "--trend-features",
+        default=None,
+        help=(
+            "Comma-separated long-window trend features. Available: "
+            "mean,std,delta,slope,fft_energy,fft_entropy,fft_centroid,fft_peak_freq."
+        ),
+    )
     parser.add_argument("--base-config", type=Path, default=BASE_CONFIG)
     parser.add_argument(
         "--generated-config-dir",
@@ -106,12 +125,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--summary-csv",
         type=Path,
-        default=Path("outputs/fogstar_mlp_long_short_sweep_summary.csv"),
+        default=None,
     )
     parser.add_argument(
         "--summary-json",
         type=Path,
-        default=Path("outputs/fogstar_mlp_long_short_sweep_summary.json"),
+        default=None,
     )
     parser.add_argument("--rank-by", default="test_f1_macro_mean")
     parser.add_argument("--top-k", type=int, default=10)
@@ -173,12 +192,42 @@ def samples(seconds: float, sampling_rate_hz: float) -> int:
     return max(1, int(round(float(seconds) * float(sampling_rate_hz))))
 
 
-def input_channels_for(cfg: dict[str, Any], trend_features: list[str], mode: str) -> int:
+def parse_trend_features(value: str | None) -> list[str] | None:
+    if value in (None, ""):
+        return None
+    features = [part.strip().lower() for part in str(value).split(",") if part.strip()]
+    if not features:
+        raise ValueError("--trend-features cannot be empty when provided.")
+    return features
+
+
+def trend_feature_suffix(trend_features: list[str]) -> str:
+    if list(trend_features) == DEFAULT_TREND_FEATURES:
+        return ""
+    parts = [TREND_FEATURE_SLUGS.get(feature, feature.replace("_", "")) for feature in trend_features]
+    return "_tf_" + "-".join(parts)
+
+
+def default_summary_paths(trend_features: list[str]) -> tuple[Path, Path]:
+    if list(trend_features) == DEFAULT_TREND_FEATURES:
+        stem = "fogstar_mlp_long_short_sweep_summary"
+    else:
+        stem = "fogstar_mlp_long_short_freq_sweep_summary"
+    return Path(f"outputs/{stem}.csv"), Path(f"outputs/{stem}.json")
+
+
+def input_channels_for(
+    cfg: dict[str, Any],
+    trend_features: list[str],
+    mode: str,
+    base_features: list[str] | None = None,
+    base_mode: str | None = None,
+) -> int:
     model_cfg = cfg.get("model", {})
     windowing = cfg.get("data", {}).get("windowing", {})
     base_multi = windowing.get("multi_window") or {}
-    base_features = base_multi.get("trend_features") or trend_features
-    base_mode = base_multi.get("mode", mode)
+    base_features = base_features or base_multi.get("trend_features") or trend_features
+    base_mode = base_mode or base_multi.get("mode", mode)
     base_channels = int(model_cfg.get("in_channels", 120))
     divisor = len(base_features) + (1 if base_mode == "short_plus_long_trend" else 0)
     raw_channels = max(1, base_channels // max(1, divisor))
@@ -190,17 +239,22 @@ def materialize_config(
     short_seconds: float,
     long_seconds: float,
     generated_config_dir: Path,
+    trend_features: list[str] | None = None,
 ) -> Path:
     cfg = copy.deepcopy(base_cfg)
     wcfg = cfg.setdefault("data", {}).setdefault("windowing", {})
     multi_window = wcfg.setdefault("multi_window", {})
+    base_trend_features = list(multi_window.get("trend_features") or DEFAULT_TREND_FEATURES)
+    base_mode = str(multi_window.get("mode", "short_plus_long_trend"))
     sampling_rate_hz = float(wcfg.get("sampling_rate_hz", 60))
     short_samples = samples(short_seconds, sampling_rate_hz)
     long_samples = samples(long_seconds, sampling_rate_hz)
     stride_samples = max(1, int(round(short_samples * 0.5)))
     short_slug = seconds_slug(short_seconds)
     long_slug = seconds_slug(long_seconds)
-    run_name = f"fogstar_mlp_loso_win{short_slug}s_long{long_slug}s_prefog0p5"
+    next_trend_features = list(trend_features or multi_window.get("trend_features") or DEFAULT_TREND_FEATURES)
+    suffix = trend_feature_suffix(next_trend_features)
+    run_name = f"fogstar_mlp_loso_win{short_slug}s_long{long_slug}s_prefog0p5{suffix}"
     data_dir = f"data/{run_name.replace('fogstar_mlp_loso_', 'fogstar_loso_')}"
 
     cfg.setdefault("project", {})["model_id"] = run_name
@@ -214,7 +268,7 @@ def materialize_config(
     multi_window["enabled"] = True
     multi_window["mode"] = str(multi_window.get("mode", "short_plus_long_trend"))
     multi_window["long_window_size"] = long_samples
-    multi_window.setdefault("trend_features", ["mean", "std", "delta", "slope"])
+    multi_window["trend_features"] = next_trend_features
     multi_window.setdefault("pad", "edge")
 
     cfg.setdefault("model", {})["seq_len"] = short_samples
@@ -222,6 +276,8 @@ def materialize_config(
         cfg,
         list(multi_window.get("trend_features") or []),
         str(multi_window.get("mode", "short_plus_long_trend")),
+        base_features=base_trend_features,
+        base_mode=base_mode,
     )
     cfg["model"]["dec_in"] = cfg["model"]["in_channels"]
 
@@ -319,6 +375,8 @@ def collect_result(config_path: Path, returncode: int, elapsed_sec: float) -> di
             "status": "ok" if returncode == 0 else "failed",
             "fold_count": summary.get("num_folds"),
             "test_f1_macro_mean": metric_mean(aggregate, "test_f1_macro"),
+            "test_recall_macro_mean": metric_mean(aggregate, "test_recall_macro"),
+            "test_pr_auc_macro_mean": metric_mean(aggregate, "test_pr_auc_macro"),
             "test_balanced_accuracy_mean": metric_mean(aggregate, "test_balanced_accuracy"),
             "test_accuracy_mean": metric_mean(aggregate, "test_accuracy"),
             "best_val_f1_macro_mean": metric_mean(aggregate, "best_val_f1_macro"),
@@ -355,6 +413,8 @@ def print_summary(rows: list[dict[str, Any]]) -> None:
         "status",
         "fold_count",
         "test_f1_macro_mean",
+        "test_recall_macro_mean",
+        "test_pr_auc_macro_mean",
         "test_balanced_accuracy_mean",
         "test_accuracy_mean",
         "best_val_f1_macro_mean",
@@ -379,7 +439,7 @@ def print_ranked(rows: list[dict[str, Any]], rank_by: str, top_k: int) -> None:
         return
     ranked.sort(key=lambda row: row[rank_by], reverse=True)
     ranked = ranked[:max(1, int(top_k))]
-    columns = ["window_seconds", "long_window_seconds", rank_by, "test_balanced_accuracy_mean", "test_accuracy_mean"]
+    columns = ["window_seconds", "long_window_seconds", rank_by, "test_recall_macro_mean", "test_pr_auc_macro_mean", "test_balanced_accuracy_mean", "test_accuracy_mean"]
     widths = {
         column: max(len(column), *(len("" if row.get(column) is None else str(row.get(column))) for row in ranked))
         for column in columns
@@ -399,8 +459,25 @@ def summary_path_for(config_path: Path) -> Path:
 def main() -> None:
     args = parse_args()
     base_cfg = load_yaml(resolve_repo_path(args.base_config))
+    requested_trend_features = parse_trend_features(args.trend_features)
+    base_trend_features = (
+        base_cfg.get("data", {})
+        .get("windowing", {})
+        .get("multi_window", {})
+        .get("trend_features", DEFAULT_TREND_FEATURES)
+    )
+    selected_trend_features = list(requested_trend_features or base_trend_features)
+    default_csv, default_json = default_summary_paths(selected_trend_features)
+    if args.summary_csv is None:
+        args.summary_csv = default_csv
+    if args.summary_json is None:
+        args.summary_json = default_json
     combos = selected_combos(args)
-    print(f"[INFO] preset={args.preset} combinations={len(combos)}", flush=True)
+    print(
+        f"[INFO] preset={args.preset} combinations={len(combos)} "
+        f"trend_features={','.join(selected_trend_features)}",
+        flush=True,
+    )
 
     rows: list[dict[str, Any]] = []
     for short_seconds, long_seconds in combos:
@@ -409,6 +486,7 @@ def main() -> None:
             short_seconds,
             long_seconds,
             args.generated_config_dir,
+            trend_features=selected_trend_features,
         )
         cfg = load_yaml(config_path)
         print(f"\n===== {cfg.get('project', {}).get('name', config_path.stem)} =====", flush=True)
