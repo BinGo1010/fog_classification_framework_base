@@ -19,12 +19,23 @@ import argparse
 import csv
 import json
 import shutil
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.data_provider.window_cache import (
+    LONG_TREND_FEATURES,
+    _long_trend_values,
+    _slice_with_left_pad,
+)
 
 
 BINARY_CLASS_NAMES = np.array(["NORMAL", "FOG"])
@@ -33,6 +44,7 @@ LABEL_NORMAL = 0
 LABEL_PRE_FOG = 1
 LABEL_FOG_BINARY = 1
 LABEL_FOG_THREE = 2
+MULTI_WINDOW_MODES = ("none", "short_plus_long_trend", "long_trend")
 
 
 @dataclass(frozen=True)
@@ -126,6 +138,35 @@ def parse_args() -> argparse.Namespace:
         help="How to handle NaN values in x before windowing. Infinite values always fail.",
     )
     parser.add_argument(
+        "--multi-window-mode",
+        choices=MULTI_WINDOW_MODES,
+        default="none",
+        help=(
+            "Optional long-window feature mode. short_plus_long_trend keeps the short raw "
+            "window and appends repeated long-window trend channels."
+        ),
+    )
+    parser.add_argument(
+        "--long-window-seconds",
+        type=float,
+        default=0.0,
+        help="Long context window in seconds for multi-window trend modes.",
+    )
+    parser.add_argument(
+        "--trend-features",
+        default="mean,std,delta,slope",
+        help=(
+            "Comma-separated long-window trend features. Available: "
+            + ",".join(sorted(LONG_TREND_FEATURES))
+        ),
+    )
+    parser.add_argument(
+        "--multi-window-pad",
+        choices=("edge", "zero"),
+        default="edge",
+        help="Left padding mode when long context starts before a record begins.",
+    )
+    parser.add_argument(
         "--num-folds",
         type=int,
         default=0,
@@ -158,6 +199,38 @@ def parse_args() -> argparse.Namespace:
         help="Allow replacing files in an existing output directory.",
     )
     return parser.parse_args()
+
+
+def parse_trend_features(value: str | Iterable[str]) -> list[str]:
+    if isinstance(value, str):
+        features = [part.strip().lower() for part in value.split(",") if part.strip()]
+    else:
+        features = [str(part).strip().lower() for part in value if str(part).strip()]
+    if not features:
+        raise ValueError("--trend-features cannot be empty.")
+    unknown = [feature for feature in features if feature not in LONG_TREND_FEATURES]
+    if unknown:
+        raise ValueError(
+            f"Unknown trend feature(s): {unknown}. Available: {sorted(LONG_TREND_FEATURES)}"
+        )
+    return features
+
+
+def multi_window_enabled(args: argparse.Namespace) -> bool:
+    return str(args.multi_window_mode).lower() != "none"
+
+
+def output_feature_names(base_names: list[str], args: argparse.Namespace) -> list[str]:
+    mode = str(args.multi_window_mode).lower()
+    trend_features = parse_trend_features(args.trend_features)
+    if mode == "none":
+        return list(base_names)
+    names: list[str] = []
+    if mode == "short_plus_long_trend":
+        names.extend(base_names)
+    for feature in trend_features:
+        names.extend(f"{name}_long_{feature}" for name in base_names)
+    return names
 
 
 def parse_bool(value: object, default: bool = True) -> bool:
@@ -252,6 +325,15 @@ def window_params(hz: float, args: argparse.Namespace) -> tuple[int, int, int, f
     return window_size, stride, target_len, target_hz
 
 
+def long_window_size(hz: float, args: argparse.Namespace) -> int:
+    if not multi_window_enabled(args):
+        return 0
+    size = int(round(float(args.long_window_seconds) * float(hz)))
+    if size <= 0:
+        raise ValueError("--long-window-seconds must be positive when multi-window mode is enabled.")
+    return size
+
+
 def window_spans(n_samples: int, window_size: int, stride: int) -> Iterable[tuple[int, int]]:
     last_start = n_samples - window_size
     if last_start < 0:
@@ -326,6 +408,52 @@ def resample_window(window: np.ndarray, target_len: int) -> np.ndarray:
     for col in range(window.shape[1]):
         output[:, col] = np.interp(target_positions, source_positions, window[:, col])
     return output
+
+
+def combine_window_features(
+    features: np.ndarray,
+    start: int,
+    end: int,
+    hz: float,
+    args: argparse.Namespace,
+    target_len: int,
+) -> np.ndarray:
+    short_window = resample_window(features[start:end], target_len)
+    mode = str(args.multi_window_mode).lower()
+    if mode == "none":
+        return short_window.astype(np.float32, copy=False)
+
+    window_size, _, _, _ = window_params(hz, args)
+    long_size = long_window_size(hz, args)
+    if long_size < window_size:
+        raise ValueError("--long-window-seconds must be >= --window-seconds.")
+
+    long_end = int(end)
+    long_start = long_end - long_size
+    long_signals = _slice_with_left_pad(
+        features,
+        long_start,
+        long_end,
+        pad=str(args.multi_window_pad),
+    )
+    trend_features = parse_trend_features(args.trend_features)
+    trend_values = _long_trend_values(
+        long_signals,
+        short_size=window_size,
+        trend_features=trend_features,
+        sampling_rate_hz=hz,
+    )
+
+    blocks: list[np.ndarray] = []
+    if mode == "short_plus_long_trend":
+        blocks.append(short_window.astype(np.float32, copy=False))
+    elif mode != "long_trend":
+        raise ValueError(f"Unsupported multi-window mode: {mode}")
+
+    for values in trend_values:
+        repeated = np.repeat(values.astype(np.float32, copy=False)[None, :], target_len, axis=0)
+        blocks.append(repeated)
+    return np.concatenate(blocks, axis=1).astype(np.float32, copy=False)
 
 
 def load_record_arrays(record: Record, nan_policy: str) -> tuple[np.ndarray, np.ndarray]:
@@ -435,7 +563,14 @@ def fill_record_windows(
 
     index = offset
     for start, end in window_spans(features.shape[0], window_size, stride):
-        x_out[index] = resample_window(features[start:end], target_len)
+        x_out[index] = combine_window_features(
+            features=features,
+            start=start,
+            end=end,
+            hz=record.hz,
+            args=args,
+            target_len=target_len,
+        )
         arrays["y"][index] = label_window(state[start:end], args.label_mode, args.label_rule)
         arrays["subject"][index] = record.subject
         arrays["source"][index] = record.source
@@ -658,6 +793,13 @@ def main() -> None:
         raise ValueError("--stride-seconds must be positive.")
     if args.pre_fog_seconds < 0:
         raise ValueError("--pre-fog-seconds must be non-negative.")
+    args.multi_window_mode = str(args.multi_window_mode).lower()
+    args.trend_features = parse_trend_features(args.trend_features)
+    if multi_window_enabled(args):
+        if args.long_window_seconds <= 0:
+            raise ValueError("--long-window-seconds must be positive when multi-window mode is enabled.")
+        if args.long_window_seconds < args.window_seconds:
+            raise ValueError("--long-window-seconds must be >= --window-seconds.")
 
     processed_dir = args.processed_dir.resolve()
     output_dir = args.output_dir.resolve()
@@ -671,6 +813,7 @@ def main() -> None:
     features = channel_names(schema)
     if not features:
         raise ValueError(f"No channels found in {schema_source_path}")
+    output_features = output_feature_names(features, args)
 
     records = load_records(processed_dir, args.max_records)
     if len({record.subject for record in records}) < 2:
@@ -699,11 +842,19 @@ def main() -> None:
         "target_hz": first_target_hz,
         "target_len": first_target_len,
         "nan_policy": args.nan_policy,
+        "multi_window": {
+            "enabled": multi_window_enabled(args),
+            "mode": None if args.multi_window_mode == "none" else args.multi_window_mode,
+            "long_window_seconds": args.long_window_seconds if multi_window_enabled(args) else None,
+            "trend_features": args.trend_features if multi_window_enabled(args) else [],
+            "pad": args.multi_window_pad if multi_window_enabled(args) else None,
+        },
         "require_success": args.require_success,
         "num_folds": args.num_folds,
         "fold_seed": args.fold_seed,
         "class_names": class_names.tolist(),
         "feature_names": features,
+        "output_feature_names": output_features,
         "source_schema": str(schema_source_path),
     }
     (output_dir / "config.json").write_text(
@@ -734,7 +885,7 @@ def main() -> None:
         output_dir=output_dir,
         total_windows=total_windows,
         target_len=first_target_len,
-        n_channels=len(features),
+        n_channels=len(output_features),
     )
     try:
         print("Writing window arrays...")
@@ -771,7 +922,8 @@ def main() -> None:
             end_sample=arrays["end_sample"],
             native_hz=arrays["native_hz"],
             class_names=class_names,
-            feature_names=np.array(features),
+            feature_names=np.array(output_features),
+            sensor_columns=np.array(output_features),
             config_json=np.array(json.dumps(config, ensure_ascii=False)),
         )
         write_loso_folds(

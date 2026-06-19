@@ -13,6 +13,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PREFERRED_COLUMNS = [
     "updated_at",
     "sweep",
+    "dataset_key",
+    "dataset_name",
     "experiment",
     "feature_set",
     "model_name",
