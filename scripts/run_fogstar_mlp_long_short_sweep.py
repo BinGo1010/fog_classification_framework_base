@@ -247,6 +247,7 @@ def materialize_config(
     generated_config_dir: Path,
     trend_features: list[str] | None = None,
     experiment_suffix: str | None = None,
+    stride_seconds: float | None = None,
 ) -> Path:
     cfg = copy.deepcopy(base_cfg)
     wcfg = cfg.setdefault("data", {}).setdefault("windowing", {})
@@ -256,7 +257,7 @@ def materialize_config(
     sampling_rate_hz = float(wcfg.get("sampling_rate_hz", 60))
     short_samples = samples(short_seconds, sampling_rate_hz)
     long_samples = samples(long_seconds, sampling_rate_hz)
-    stride_samples = max(1, int(round(short_samples * 0.5)))
+    stride_samples = samples(stride_seconds, sampling_rate_hz) if stride_seconds is not None else max(1, int(round(short_samples * 0.5)))
     short_slug = seconds_slug(short_seconds)
     long_slug = seconds_slug(long_seconds)
     next_trend_features = list(trend_features or multi_window.get("trend_features") or DEFAULT_TREND_FEATURES)
