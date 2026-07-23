@@ -191,6 +191,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Daphnet three-IMU 5x4 NBM residual LOSO suite",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--data-dir",
@@ -203,6 +204,22 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OUTPUT_DIR,
     )
     parser.add_argument("--folds", default="all")
+    parser.add_argument(
+        "--worker-fold",
+        default="",
+        help=(
+            "Execute exactly one fold while keeping --folds as the shared "
+            "scientific protocol. Used by the multi-GPU scheduler."
+        ),
+    )
+    parser.add_argument(
+        "--finalize-only",
+        action="store_true",
+        help=(
+            "Validate the shared protocol and rebuild root summaries without "
+            "training. Used after parallel fold workers finish."
+        ),
+    )
     parser.add_argument("--nbms", default=",".join(NBM_NAMES))
     parser.add_argument("--history-seconds", default="0.5,1,2,4")
     parser.add_argument("--exclude-subjects", default="S04,S10")
@@ -264,6 +281,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if args.finalize_only and str(args.worker_fold).strip():
+        raise ValueError("--finalize-only and --worker-fold cannot be combined")
     if not args.cache_residuals:
         raise ValueError(
             "The core suite requires residual-cache saving for exact recovery "
@@ -1683,6 +1702,7 @@ def prepare_fold(
 def main() -> None:
     args = parse_args()
     validate_args(args)
+    worker_mode = bool(str(args.worker_fold).strip())
     args.data_dir = args.data_dir.resolve()
     args.output_dir = args.output_dir.resolve()
     if set(parse_subject_list(args.exclude_subjects)) != {"S04", "S10"}:
@@ -1747,6 +1767,21 @@ def main() -> None:
         args.history_seconds, fs, horizon_samples, stride_samples
     )
     folds = parse_folds(args.folds, dataset.subjects)
+    if worker_mode and tuple(folds) != EXPECTED_LOSO_SUBJECTS:
+        raise ValueError(
+            "Parallel worker mode requires --folds all so every worker shares "
+            "the canonical eight-fold protocol"
+        )
+    execution_folds = list(folds)
+    if str(args.worker_fold).strip():
+        worker_folds = parse_folds(args.worker_fold, dataset.subjects)
+        if len(worker_folds) != 1:
+            raise ValueError("--worker-fold must resolve to exactly one subject")
+        if worker_folds[0] not in folds:
+            raise ValueError(
+                f"Worker fold {worker_folds[0]} is outside configured folds {folds}"
+            )
+        execution_folds = worker_folds
     global_plan = make_common_history_plan(
         windows,
         np.arange(len(windows), dtype=np.int64),
@@ -1787,6 +1822,11 @@ def main() -> None:
         device,
     )
     config_path = args.output_dir / "config.json"
+    if worker_mode and not config_path.exists():
+        raise RuntimeError(
+            "Parallel worker bootstrap is missing config.json; run the same "
+            "protocol once with --finalize-only before launching workers"
+        )
     if config_path.exists():
         with config_path.open("r", encoding="utf-8") as handle:
             existing = json.load(handle)
@@ -1797,7 +1837,8 @@ def main() -> None:
     # Refresh only runtime/provenance fields on a compatible resume. The
     # scientific portion is protected by protocol_fingerprint and duplicated
     # in immutable run_manifest.json.
-    atomic_json_dump(config, config_path)
+    if not worker_mode:
+        atomic_json_dump(config, config_path)
     runtime_only = {
         "data_dir",
         "output_dir",
@@ -1805,26 +1846,64 @@ def main() -> None:
         "resume",
         "num_workers",
     }
-    save_or_validate_json(
-        args.output_dir / "run_manifest.json",
-        {key: value for key, value in config.items() if key not in runtime_only},
-    )
-    atomic_json_dump(
-        environment_payload(device),
-        args.output_dir / "environment.json",
-    )
-    refresh_summaries(args.output_dir, config)
+    run_manifest_path = args.output_dir / "run_manifest.json"
+    if worker_mode and not run_manifest_path.exists():
+        raise RuntimeError(
+            "Parallel worker bootstrap is missing run_manifest.json"
+        )
+    run_manifest = {
+        key: value for key, value in config.items() if key not in runtime_only
+    }
+    if worker_mode:
+        with run_manifest_path.open("r", encoding="utf-8") as handle:
+            existing_run_manifest = json.load(handle)
+        if existing_run_manifest != run_manifest:
+            raise ValueError(
+                f"Saved JSON is incompatible: {run_manifest_path}"
+            )
+    else:
+        save_or_validate_json(run_manifest_path, run_manifest)
+    current_environment = environment_payload(device)
+    if worker_mode:
+        current_environment.update(
+            {
+                "protocol_fingerprint": config["protocol_fingerprint"],
+                "worker_fold": execution_folds[0],
+            }
+        )
+        atomic_json_dump(
+            current_environment,
+            args.output_dir
+            / "worker_environments"
+            / f"loso_{execution_folds[0]}.json",
+        )
+    else:
+        atomic_json_dump(
+            current_environment,
+            args.output_dir / "environment.json",
+        )
+        refresh_summaries(args.output_dir, config)
     print(
         f"[INFO] suite={SUITE_VERSION} device={device} channels={dataset.n_channels} "
         f"subjects={dataset.subjects} windows={len(windows)} "
         f"common={config['evaluation_windows']} "
         f"counts={config['evaluation_window_class_counts']} "
-        f"folds={folds} nbms={nbms} histories={[v[1] for v in histories]}",
+        f"configured_folds={folds} execution_folds={execution_folds} "
+        f"nbms={nbms} histories={[v[1] for v in histories]}",
         flush=True,
     )
 
+    if args.finalize_only:
+        with (args.output_dir / "status.json").open(
+            "r", encoding="utf-8"
+        ) as handle:
+            status = json.load(handle)
+        print("[INFO] finalize-only: root summaries refreshed", flush=True)
+        print(json.dumps(status, indent=2, ensure_ascii=False), flush=True)
+        return
+
     completed_this_run = 0
-    for test_subject in folds:
+    for test_subject in execution_folds:
         fold_index = dataset.subjects.index(test_subject)
         (
             fold_root,
@@ -1943,7 +2022,8 @@ def main() -> None:
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
                 completed_this_run += 1
-                refresh_summaries(args.output_dir, config)
+                if not worker_mode:
+                    refresh_summaries(args.output_dir, config)
                 if (
                     args.stop_after_completed_tasks > 0
                     and completed_this_run >= args.stop_after_completed_tasks
@@ -1954,6 +2034,22 @@ def main() -> None:
             del features
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+    if worker_mode:
+        print(
+            json.dumps(
+                {
+                    "suite_version": SUITE_VERSION,
+                    "protocol_fingerprint": config["protocol_fingerprint"],
+                    "worker_fold": execution_folds[0],
+                    "classifier_cells_visited": completed_this_run,
+                    "status": "worker_complete",
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return
     refresh_summaries(args.output_dir, config)
     with (args.output_dir / "status.json").open("r", encoding="utf-8") as handle:
         status = json.load(handle)
