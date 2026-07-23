@@ -55,14 +55,22 @@ CHANNELS = (
 
 @dataclass
 class ManifestRow:
+    dataset_id: str
     record_id: str
     source_file: str
     subject_id: str
+    source_subject_id: int
     run_id: str
     segment_id: int
     record_path: str
     sampling_rate: int
+    sampling_rate_hz: int
     n_samples: int
+    n_normal_samples: int
+    n_fog_samples: int
+    fog_event_count: int
+    has_fog: bool
+    usable: bool
     duration_sec: float
     channels: str
     sensor_positions: str
@@ -99,6 +107,11 @@ def parse_args() -> argparse.Namespace:
         "--overwrite",
         action="store_true",
         help="Delete output directory first if it already exists.",
+    )
+    parser.add_argument(
+        "--exclude-no-fog-subjects",
+        action="store_true",
+        help="Keep only subjects that have at least one FOG sample in retained walking/turning activities.",
     )
     return parser.parse_args()
 
@@ -149,7 +162,7 @@ def prepare_output_dir(output_dir: Path, overwrite: bool) -> None:
     if output_dir.exists():
         if not overwrite:
             raise FileExistsError(f"{output_dir} already exists; pass --overwrite to rebuild it")
-        if output_dir.name != "processed":
+        if not output_dir.name.startswith("processed"):
             raise ValueError(f"Refusing to overwrite unexpected output directory: {output_dir}")
         shutil.rmtree(output_dir)
     (output_dir / "records").mkdir(parents=True, exist_ok=True)
@@ -162,6 +175,11 @@ def validate_sensor_frame(df: pd.DataFrame) -> None:
     fog_values = set(pd.unique(df["fog"].dropna()).tolist())
     if not fog_values.issubset({0, 1}):
         raise ValueError(f"Unexpected fog values: {sorted(fog_values)}")
+
+
+def subjects_with_retained_fog(sensor_df: pd.DataFrame) -> set[int]:
+    kept = sensor_df.loc[sensor_df["activity"].isin(WALKING_ACTIVITY_IDS)]
+    return set(map(int, kept.loc[kept["fog"] == 1, "subjectID"].unique().tolist()))
 
 
 def build_records(sensor_df: pd.DataFrame, output_dir: Path) -> list[ManifestRow]:
@@ -193,16 +211,27 @@ def build_records(sensor_df: pd.DataFrame, output_dir: Path) -> list[ManifestRow
             np.savez_compressed(output_dir / record_relpath, x=x, y_binary=y_binary)
 
             n_samples = int(y_binary.size)
+            n_fog_samples = int(y_binary.sum())
+            n_normal_samples = int(n_samples - n_fog_samples)
+            fog_event_count = len(contiguous_true_segments(y_binary.astype(bool)))
             manifest_rows.append(
                 ManifestRow(
+                    dataset_id=DATASET_NAME,
                     record_id=record_id,
                     source_file="sensor_data.csv",
                     subject_id=subject_id,
+                    source_subject_id=int(raw_subject_id),
                     run_id=run_id,
                     segment_id=segment_id,
                     record_path=record_relpath.as_posix(),
                     sampling_rate=SAMPLING_RATE,
+                    sampling_rate_hz=SAMPLING_RATE,
                     n_samples=n_samples,
+                    n_normal_samples=n_normal_samples,
+                    n_fog_samples=n_fog_samples,
+                    fog_event_count=fog_event_count,
+                    has_fog=n_fog_samples > 0,
+                    usable=n_samples > 0,
                     duration_sec=round(float(n_samples / SAMPLING_RATE), 9),
                     channels=channel_json,
                     sensor_positions=position_json,
@@ -258,6 +287,7 @@ def write_config(
     sensor_df: pd.DataFrame,
     manifest_rows: list[ManifestRow],
     subject_rows: list[dict[str, object]],
+    excluded_no_fog_subjects: list[int],
 ) -> None:
     kept_mask = sensor_df["activity"].isin(WALKING_ACTIVITY_IDS)
     kept_df = sensor_df.loc[kept_mask]
@@ -303,6 +333,12 @@ def write_config(
         "channels": list(CHANNELS),
         "sensor_positions": list(SENSOR_POSITIONS),
         "record_segmentation": "Within each subject/session/task run, keep contiguous samples whose activity is in [1,6,7]; segment_id is subject-level and zero-based.",
+        "subject_filtering": {
+            "exclude_no_fog_subjects": bool(excluded_no_fog_subjects),
+            "no_fog_definition": "subject has zero FOG samples after retaining walking/turning activities [1,6,7]",
+            "excluded_source_subject_ids": excluded_no_fog_subjects,
+            "excluded_subject_ids": [subject_code(subject) for subject in excluded_no_fog_subjects],
+        },
         "split_strategy": "LOSO by subject",
         "windowing": False,
         "pre_fog_labeling": False,
@@ -316,6 +352,8 @@ def write_config(
             "total_normal_samples": int(total_samples - total_fog_samples),
             "total_fog_samples": total_fog_samples,
             "records_with_fog": 0,
+            "excluded_no_fog_subject_count": len(excluded_no_fog_subjects),
+            "excluded_no_fog_subjects": [subject_code(subject) for subject in excluded_no_fog_subjects],
             "source_rows_with_any_sensor_nan": int(sensor_nan_mask.sum()),
             "kept_rows_with_any_sensor_nan": int(kept_sensor_nan_mask.sum()),
             "kept_fog_rows_with_any_sensor_nan": int(
@@ -346,6 +384,20 @@ def write_config(
         handle.write("\n")
 
 
+def write_success_marker(output_dir: Path, manifest_rows: list[ManifestRow], subject_rows: list[dict[str, object]]) -> None:
+    payload = {
+        "status": "complete",
+        "dataset_name": DATASET_NAME,
+        "record_count": len(manifest_rows),
+        "subject_count": len(subject_rows),
+        "total_samples": int(sum(row.n_samples for row in manifest_rows)),
+        "total_fog_samples": int(sum(row.n_fog_samples for row in manifest_rows)),
+    }
+    with (output_dir / "_SUCCESS.json").open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=True, indent=2)
+        handle.write("\n")
+
+
 def main() -> None:
     args = parse_args()
     data_dir = args.data_dir.resolve()
@@ -359,6 +411,16 @@ def main() -> None:
     validate_sensor_frame(sensor_df)
     clinical_df = pd.read_csv(clinical_path)
 
+    excluded_no_fog_subjects: list[int] = []
+    if args.exclude_no_fog_subjects:
+        fog_subjects = subjects_with_retained_fog(sensor_df)
+        all_subjects = set(map(int, sensor_df["subjectID"].unique().tolist()))
+        excluded_no_fog_subjects = sorted(all_subjects - fog_subjects)
+        sensor_df = sensor_df.loc[sensor_df["subjectID"].isin(sorted(fog_subjects))].copy()
+        clinical_df = clinical_df.loc[clinical_df["subjectID"].isin(sorted(fog_subjects))].copy()
+        if len(fog_subjects) < 2:
+            raise ValueError("At least two FOG-positive subjects are needed for LOSO after filtering.")
+
     manifest_rows = build_records(sensor_df, output_dir)
     subject_rows = build_subject_rows(clinical_df)
     loso_rows = build_loso_rows(manifest_rows)
@@ -366,13 +428,19 @@ def main() -> None:
     write_csv(output_dir / "manifest.csv", manifest_rows)
     write_csv(output_dir / "subjects.csv", subject_rows)
     write_csv(output_dir / "loso_folds.csv", loso_rows)
-    write_config(output_dir, sensor_df, manifest_rows, subject_rows)
+    write_config(output_dir, sensor_df, manifest_rows, subject_rows, excluded_no_fog_subjects)
+    write_success_marker(output_dir, manifest_rows, subject_rows)
 
     total_samples = int(sum(row.n_samples for row in manifest_rows))
     print(
         f"Wrote {len(manifest_rows)} records, {len(subject_rows)} subjects, "
         f"{len(loso_rows)} LOSO rows, {total_samples} samples to {output_dir}"
     )
+    if excluded_no_fog_subjects:
+        print(
+            "Excluded no-FOG subjects: "
+            + ", ".join(subject_code(subject) for subject in excluded_no_fog_subjects)
+        )
 
 
 if __name__ == "__main__":
