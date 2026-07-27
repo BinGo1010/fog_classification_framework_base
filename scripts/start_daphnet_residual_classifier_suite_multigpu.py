@@ -32,6 +32,7 @@ RUNNER = REPO_ROOT / "scripts" / "run_daphnet_residual_classifier_suite.py"
 AUDITOR = REPO_ROOT / "scripts" / "audit_daphnet_residual_classifier_suite.py"
 CANONICAL_FOLDS = scheduler_base.CANONICAL_FOLDS
 CANONICAL_CLASSIFIERS = ("mlp", "cnn1d", "gru", "transformer")
+SCHEDULER_VERSION = "daphnet_residual_classifier_multigpu.v1"
 RESERVED_PREFIXES = (
     "--data-dir",
     "--source-suite-dir",
@@ -217,7 +218,7 @@ def main() -> None:
     status_path = args.output_dir / "multigpu_status.json"
     state: dict[str, Any] = {
         "format_version": 1,
-        "scheduler_version": "daphnet_residual_classifier_multigpu.v1",
+        "scheduler_version": SCHEDULER_VERSION,
         "run_id": uuid.uuid4().hex,
         "status": "initializing",
         "started_at": timestamp(),

@@ -53,6 +53,18 @@ AUDIT_VERSION = "daphnet_residual_classifier_suite_audit.v1"
 SUITE_VERSION = "daphnet_persistence_h4_residual_classifier_suite.v1"
 SOURCE_SUITE_VERSION = "daphnet_3imu_nbm_suite.v1"
 CLASSIFIER_STAGE = "residual_classifier"
+EXPECTED_ABLATION_AXIS = "downstream_classifier_architecture"
+EXPECT_DIFFERENT_PARAMETER_SHAPES = True
+EXPECT_IDENTICAL_INITIAL_STATES = False
+PAIRED_REFERENCE = "mlp"
+PAIRED_AGGREGATE_KEY = "paired_deltas_vs_mlp"
+PAIRED_DELTA_LABEL = "vs_mlp"
+PAIRED_INCLUDE_WIN_STATS = False
+PAIRED_TOLERANCE = 1e-12
+LOWER_IS_BETTER_METRICS = {
+    "false_alarm_events_per_hour",
+    "median_detection_delay_sec",
+}
 EXPECTED_SUBJECTS = (
     "S01",
     "S02",
@@ -381,12 +393,13 @@ def validate_protocol(
     names = [str(value) for value in config.get("classifier_names", ())]
     require(
         tuple(names) == CANONICAL_CLASSIFIER_NAMES,
-        "config: classifier names/order must be mlp, cnn1d, gru, transformer",
+        "config: classifier names/order differs from the canonical suite",
     )
     definitions = config.get("classifiers")
     require(
-        isinstance(definitions, list) and len(definitions) == 4,
-        "config: expected exactly four classifier definitions",
+        isinstance(definitions, list)
+        and len(definitions) == len(CANONICAL_CLASSIFIER_NAMES),
+        "config: classifier definition count mismatch",
     )
     require(
         [item.get("classifier") for item in definitions] == names,
@@ -446,13 +459,14 @@ def validate_protocol(
     fairness = config.get("fairness_contract")
     require(isinstance(fairness, dict), "config: missing fairness contract")
     require(
-        fairness.get("ablation_axis") == "downstream_classifier_architecture",
+        fairness.get("ablation_axis") == EXPECTED_ABLATION_AXIS,
         "config: wrong ablation axis",
     )
     require(
         fairness.get("same_classifier_seed_within_fold") is True
         and fairness.get("same_epoch_shuffle_within_fold") is True
-        and fairness.get("different_parameter_shapes_expected") is True,
+        and fairness.get("different_parameter_shapes_expected")
+        is EXPECT_DIFFERENT_PARAMETER_SHAPES,
         "config: fairness contract is incomplete",
     )
     require(
@@ -1313,8 +1327,32 @@ def validate_cross_classifier_fairness(
             ],
             f"{subject}: classifiers do not share epoch shuffle seeds",
         )
-    # Different architectures are intentionally not required to have equal
-    # initial hashes; each hash was independently reconstructed above.
+        if EXPECT_IDENTICAL_INITIAL_STATES:
+            require(
+                item["initial_state_sha256"]
+                == reference["initial_state_sha256"],
+                f"{subject}: classifiers do not share one initial state",
+            )
+            require(
+                item["parameter_count"] == reference["parameter_count"],
+                f"{subject}: classifiers do not share one parameter count",
+            )
+            architecture = item["metrics"]["architecture"]
+            reference_architecture = reference["metrics"]["architecture"]
+            require(
+                architecture.get("parameter_schema_sha256")
+                == reference_architecture.get("parameter_schema_sha256"),
+                f"{subject}: classifiers do not share one parameter schema",
+            )
+            require(
+                architecture.get("conv_linear_macs_per_window")
+                == reference_architecture.get(
+                    "conv_linear_macs_per_window"
+                ),
+                f"{subject}: classifiers do not share Conv/Linear MACs",
+            )
+    # Unmatched suites reconstruct each initial state independently.  Matched
+    # suites can additionally require identical hashes and parameter schemas.
 
 
 def aggregate_fold_metrics(
@@ -1423,37 +1461,70 @@ def paired_deltas(
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for name in CANONICAL_CLASSIFIER_NAMES:
-        if name == "mlp":
+        if name == PAIRED_REFERENCE:
             continue
         subjects = [
             subject
             for subject in EXPECTED_SUBJECTS
-            if (subject, "mlp") in cells and (subject, name) in cells
+            if (subject, PAIRED_REFERENCE) in cells
+            and (subject, name) in cells
         ]
         metric_map: dict[str, Any] = {}
         for metric in CLASSIFICATION_METRICS:
             values = [
                 float(cells[(subject, name)]["metrics"][metric])
-                - float(cells[(subject, "mlp")]["metrics"][metric])
+                - float(
+                    cells[(subject, PAIRED_REFERENCE)]["metrics"][metric]
+                )
                 for subject in subjects
                 if cells[(subject, name)]["metrics"].get(metric) is not None
-                and cells[(subject, "mlp")]["metrics"].get(metric) is not None
+                and cells[(subject, PAIRED_REFERENCE)]["metrics"].get(metric)
+                is not None
             ]
             array = np.asarray(values, dtype=np.float64)
-            metric_map[metric] = {
-                "mean_delta_vs_mlp": (
+            payload = {
+                f"mean_delta_{PAIRED_DELTA_LABEL}": (
                     float(array.mean()) if len(array) else None
                 ),
-                "std_delta_vs_mlp": (
+                f"std_delta_{PAIRED_DELTA_LABEL}": (
                     float(array.std(ddof=0)) if len(array) else None
                 ),
                 "n_paired_folds": int(len(array)),
             }
+            if PAIRED_INCLUDE_WIN_STATS:
+                lower_is_better = metric in LOWER_IS_BETTER_METRICS
+                oriented = -array if lower_is_better else array
+                payload.update(
+                    {
+                        f"median_delta_{PAIRED_DELTA_LABEL}": (
+                            float(np.median(array)) if len(array) else None
+                        ),
+                        "optimization_direction": (
+                            "lower_is_better"
+                            if lower_is_better
+                            else "higher_is_better"
+                        ),
+                        "wins": int(
+                            np.count_nonzero(oriented > PAIRED_TOLERANCE)
+                        ),
+                        "ties": int(
+                            np.count_nonzero(
+                                np.abs(oriented) <= PAIRED_TOLERANCE
+                            )
+                        ),
+                        "losses": int(
+                            np.count_nonzero(oriented < -PAIRED_TOLERANCE)
+                        ),
+                    }
+                )
+            metric_map[metric] = payload
         result[name] = {
-            "reference": "mlp",
+            "reference": PAIRED_REFERENCE,
             "common_subjects": subjects,
             "metrics": metric_map,
         }
+        if PAIRED_INCLUDE_WIN_STATS:
+            result[name]["delta"] = PAIRED_DELTA_LABEL
     return result
 
 
@@ -1524,7 +1595,10 @@ def validate_summaries(
             )
 
     _, manifest_rows = read_csv(root / "experiment_manifest.csv")
-    require(len(manifest_rows) == 4, "experiment_manifest: expected four rows")
+    require(
+        len(manifest_rows) == len(CANONICAL_CLASSIFIER_NAMES),
+        "experiment_manifest: classifier row count mismatch",
+    )
     manifest_by_name = {row["classifier"]: row for row in manifest_rows}
     require(
         set(manifest_by_name) == set(CANONICAL_CLASSIFIER_NAMES),
@@ -1594,17 +1668,17 @@ def validate_summaries(
         )
     expected_paired = paired_deltas(cells)
     require(
-        aggregate.get("paired_deltas_vs_mlp") is not None,
+        aggregate.get(PAIRED_AGGREGATE_KEY) is not None,
         "aggregate: missing paired deltas",
     )
     assert_json_metric_map(
-        aggregate["paired_deltas_vs_mlp"],
+        aggregate[PAIRED_AGGREGATE_KEY],
         expected_paired,
         "aggregate/paired",
         tolerance,
     )
     require(
-        set(aggregate) == expected_group_keys | {"paired_deltas_vs_mlp"},
+        set(aggregate) == expected_group_keys | {PAIRED_AGGREGATE_KEY},
         "aggregate: stale or unexpected groups",
     )
 
@@ -1641,13 +1715,16 @@ def validate_summaries(
                 )
 
     status = load_json(root / "status.json")
+    expected_cells = len(EXPECTED_SUBJECTS) * len(
+        CANONICAL_CLASSIFIER_NAMES
+    )
     expected_status = {
         "suite_version": SUITE_VERSION,
         "protocol_fingerprint": config["protocol_fingerprint"],
-        "expected_experiments": 4,
-        "expected_fold_cells": 32,
+        "expected_experiments": len(CANONICAL_CLASSIFIER_NAMES),
+        "expected_fold_cells": expected_cells,
         "completed_fold_cells": len(cells),
-        "status": "complete" if len(cells) == 32 else "partial",
+        "status": "complete" if len(cells) == expected_cells else "partial",
     }
     require(status == expected_status, "status.json is stale or inconsistent")
 
@@ -1745,9 +1822,8 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         validate_summaries(root, config, definitions, cells, args.tolerance)
     except Exception as error:
         failures.append(f"root summaries: {type(error).__name__}: {error}")
-    full_complete = (
-        len(cells) == 32 and not missing and not failures
-    )
+    expected_cells = len(folds) * len(CANONICAL_CLASSIFIER_NAMES)
+    full_complete = len(cells) == expected_cells and not missing and not failures
     return {
         "audit_version": AUDIT_VERSION,
         "captured_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -1755,7 +1831,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         "source_suite_dir": str(source_root),
         "data_dir": str(data_root),
         "protocol_fingerprint": config["protocol_fingerprint"],
-        "expected_cells": 32,
+        "expected_cells": expected_cells,
         "checked_cells": len(cells),
         "missing_cells": missing,
         "allow_partial": bool(args.allow_partial),
@@ -1769,6 +1845,9 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
 def main() -> None:
     args = parse_args()
     root = args.result_dir.resolve()
+    expected_cells = len(EXPECTED_SUBJECTS) * len(
+        CANONICAL_CLASSIFIER_NAMES
+    )
     try:
         report = audit(args)
     except Exception as error:
@@ -1776,7 +1855,7 @@ def main() -> None:
             "audit_version": AUDIT_VERSION,
             "captured_at_utc": datetime.now(timezone.utc).isoformat(),
             "result_dir": str(root),
-            "expected_cells": 32,
+            "expected_cells": expected_cells,
             "checked_cells": 0,
             "missing_cells": [],
             "allow_partial": bool(args.allow_partial),
@@ -1797,8 +1876,8 @@ def main() -> None:
                 "audit_version": AUDIT_VERSION,
                 "status": "complete",
                 "protocol_fingerprint": report["protocol_fingerprint"],
-                "expected_cells": 32,
-                "checked_cells": 32,
+                "expected_cells": expected_cells,
+                "checked_cells": expected_cells,
                 "completed_at_utc": datetime.now(timezone.utc).isoformat(),
                 "audit_report_sha256": sha256_file(report_path),
             },
@@ -1809,7 +1888,7 @@ def main() -> None:
 
     print(
         f"[classifier-audit] status={report['status']} "
-        f"checked={report.get('checked_cells', 0)}/32 "
+        f"checked={report.get('checked_cells', 0)}/{expected_cells} "
         f"missing={len(report.get('missing_cells', []))}",
         flush=True,
     )
