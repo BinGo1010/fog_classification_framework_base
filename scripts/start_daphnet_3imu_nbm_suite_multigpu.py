@@ -36,7 +36,15 @@ if os.name == "nt":
     from ctypes import wintypes
 
 
+RUNNER_FILENAME = "run_daphnet_3imu_nbm_suite.py"
+AUDITOR_FILENAME = "audit_daphnet_3imu_nbm_suite.py"
 SCHEDULER_VERSION = "daphnet_3imu_nbm_multigpu.v1"
+DEFAULT_OUTPUT_DIRNAME = "daphnet_3imu_nbm_5x4_loso_seed42"
+SCHEDULER_DESCRIPTION = (
+    "Run Daphnet 3-IMU LOSO folds on independent GPUs. With defaults, "
+    "seven workers start S01..S08 and the first free GPU continues S09; "
+    "each fold runs all 5 NBMs and all 20 downstream classifiers."
+)
 CANONICAL_FOLDS = (
     "S01",
     "S02",
@@ -483,18 +491,14 @@ def validate_forwarded(arguments: Sequence[str]) -> None:
 
 def build_parser(repo_root: Path) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
-            "Run Daphnet 3-IMU LOSO folds on independent GPUs. With defaults, "
-            "seven workers start S01..S08 and the first free GPU continues S09; "
-            "each fold runs all 5 NBMs and all 20 downstream classifiers."
-        ),
+        description=SCHEDULER_DESCRIPTION,
         formatter_class=RawDefaultsHelpFormatter,
         allow_abbrev=False,
         epilog=(
             "Example:\n"
             "  %(prog)s --data-dir /home/chb/Documents/FOG/"
             "fog_classification_framework_base/processed "
-            "--output-dir outputs/daphnet_3imu_nbm_5x4_loso_seed42 "
+            f"--output-dir outputs/{DEFAULT_OUTPUT_DIRNAME} "
             "--gpus 0-6\n\n"
             "Unknown scientific arguments, for example --normal-epochs 12, "
             "are passed to every fold worker and both protocol-finalization "
@@ -515,7 +519,7 @@ def build_parser(repo_root: Path) -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=repo_root / "outputs" / "daphnet_3imu_nbm_5x4_loso_seed42",
+        default=repo_root / "outputs" / DEFAULT_OUTPUT_DIRNAME,
         help="Shared result directory used by every fold",
     )
     parser.add_argument(
@@ -1102,8 +1106,8 @@ def dry_run_report(
 
 def main(argv: Sequence[str] | None = None) -> int:
     repo_root = Path(__file__).resolve().parents[1]
-    runner = repo_root / "scripts" / "run_daphnet_3imu_nbm_suite.py"
-    auditor = repo_root / "scripts" / "audit_daphnet_3imu_nbm_suite.py"
+    runner = repo_root / "scripts" / RUNNER_FILENAME
+    auditor = repo_root / "scripts" / AUDITOR_FILENAME
     parser = build_parser(repo_root)
     args, forwarded_raw = parser.parse_known_args(argv)
     forwarded = strip_forward_separator(list(forwarded_raw))
