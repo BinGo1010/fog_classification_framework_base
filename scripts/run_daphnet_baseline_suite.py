@@ -1,14 +1,17 @@
 #!/usr/bin/env python
-"""Run three reference FoG baselines under one strict Daphnet LOSO protocol.
+"""Run four reference FoG baselines under one strict subject-level protocol.
 
 The suite contains:
 
 * Freeze Index: a validation-thresholded domain rule;
 * time-frequency handcrafted features with an RBF-SVM;
+* the same time-frequency features with a random forest;
 * a raw-IMU CNN-GRU classifier.
 
 All methods use the same causal raw-history support and the same label attached
-to the final 0.5-second target block. S04 and S10 are removed before windowing.
+to the final 0.5-second target block.  The canonical Daphnet adapter removes
+S04 and S10 before windowing; a manifest adapter exposes the same protocol to
+private binary FoG datasets.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 import joblib
 import numpy as np
 import torch
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -68,12 +72,17 @@ from cnbr_fog.resume import (
     validate_done,
 )
 from daphnet_baselines import (
+    ADAPTERS,
     CNNGRUClassifier,
+    DAPHNET_CHANNEL_NAMES,
+    DAPHNET_LOSO_SUBJECTS,
     HistoryWindowDataset,
     TimeFrequencyFeatureExtractor,
     freeze_index_features,
+    load_dataset,
     materialize_history_windows,
     parameter_count,
+    resolve_sensor_channel_indices,
 )
 from run_cnbr_fog_loso import (
     deterministic_subsample,
@@ -85,39 +94,17 @@ from run_cnbr_fog_loso import (
 )
 
 
-SUITE_VERSION = "daphnet_reference_baselines.v1"
-METHODS = ("cnn_gru", "freeze_index", "tf_svm")
-EXPECTED_CHANNEL_NAMES = (
-    "ankle_acc_forward",
-    "ankle_acc_vertical",
-    "ankle_acc_lateral",
-    "thigh_acc_forward",
-    "thigh_acc_vertical",
-    "thigh_acc_lateral",
-    "trunk_acc_forward",
-    "trunk_acc_vertical",
-    "trunk_acc_lateral",
-)
-EXPECTED_LOSO_SUBJECTS = (
-    "S01",
-    "S02",
-    "S03",
-    "S05",
-    "S06",
-    "S07",
-    "S08",
-    "S09",
-)
-SENSOR_SETS = {
-    "all": tuple(range(9)),
-    "ankle": (0, 1, 2),
-    "thigh": (3, 4, 5),
-    "trunk": (6, 7, 8),
-}
+SUITE_VERSION = "fog_reference_baselines.v2"
+METHODS = ("cnn_gru", "freeze_index", "tf_svm", "tf_rf")
+# Backward-compatible names imported by the audit program.
+EXPECTED_CHANNEL_NAMES = DAPHNET_CHANNEL_NAMES
+EXPECTED_LOSO_SUBJECTS = DAPHNET_LOSO_SUBJECTS
+SENSOR_SET_NAMES = ("all", "ankle", "thigh", "trunk")
 IMPLEMENTATION_FILES = (
     "scripts/run_daphnet_baseline_suite.py",
     "scripts/run_cnbr_fog_loso.py",
     "daphnet_baselines/__init__.py",
+    "daphnet_baselines/adapters.py",
     "daphnet_baselines/data.py",
     "daphnet_baselines/features.py",
     "daphnet_baselines/models.py",
@@ -145,9 +132,20 @@ METRIC_KEYS = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Daphnet FI / time-frequency SVM / CNN-GRU LOSO suite",
+        description=(
+            "FoG FI / time-frequency SVM+RF / CNN-GRU subject-level suite"
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         allow_abbrev=False,
+    )
+    parser.add_argument(
+        "--dataset-adapter",
+        choices=tuple(ADAPTERS),
+        default="daphnet",
+        help=(
+            "daphnet enforces the canonical public protocol; manifest_npz "
+            "accepts the same processed record contract for private data"
+        ),
     )
     parser.add_argument(
         "--data-dir",
@@ -162,14 +160,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=REPO_ROOT / "outputs" / "daphnet_reference_baselines_seed42",
+        default=REPO_ROOT / "outputs" / "fog_reference_baselines_seed3407",
     )
     parser.add_argument("--folds", default="all")
     parser.add_argument("--worker-fold", default="")
     parser.add_argument("--finalize-only", action="store_true")
     parser.add_argument("--methods", default=",".join(METHODS))
     parser.add_argument("--exclude-subjects", default="S04,S10")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=3407)
 
     parser.add_argument("--context-seconds", type=float, default=2.0)
     parser.add_argument("--horizon-seconds", type=float, default=0.5)
@@ -182,15 +180,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--robust-clip", type=float, default=12.0)
     parser.add_argument(
         "--sensor-set",
-        choices=tuple(SENSOR_SETS),
+        choices=SENSOR_SET_NAMES,
         default="all",
         help="Channels supplied to SVM and CNN-GRU",
     )
 
     parser.add_argument(
         "--fi-channels",
-        default="ankle_acc_vertical",
-        help="Comma-separated raw channels; multiple scores use --fi-aggregation",
+        default="auto",
+        help=(
+            "Comma-separated raw channels; auto uses the adapter default. "
+            "Multiple scores use --fi-aggregation"
+        ),
     )
     parser.add_argument(
         "--fi-aggregation",
@@ -218,6 +219,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--svm-kernel", choices=("rbf", "linear"), default="rbf")
     parser.add_argument("--svm-max-iter", type=int, default=-1)
     parser.add_argument("--svm-cache-mb", type=float, default=2048.0)
+    parser.add_argument("--rf-n-estimators", type=int, default=500)
+    parser.add_argument(
+        "--rf-min-samples-leaf-grid",
+        default="1,2,5",
+        help="Validation PR-AUC selects one predeclared leaf-size candidate",
+    )
+    parser.add_argument(
+        "--rf-max-depth",
+        type=int,
+        default=0,
+        help="Maximum tree depth; 0 means unlimited",
+    )
+    parser.add_argument(
+        "--rf-max-features",
+        default="sqrt",
+        help="RandomForest max_features: sqrt, log2, or a positive fraction",
+    )
+    parser.add_argument(
+        "--rf-n-jobs",
+        type=int,
+        default=1,
+        help=(
+            "Per-fold RF workers; keep 1 when multiple LOSO folds already run "
+            "in parallel to avoid CPU oversubscription"
+        ),
+    )
     parser.add_argument("--feature-batch-size", type=int, default=2048)
     parser.add_argument(
         "--feature-magnitudes",
@@ -234,8 +261,8 @@ def parse_args() -> argparse.Namespace:
         default=False,
     )
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--classifier-epochs", type=int, default=20)
-    parser.add_argument("--classifier-patience", type=int, default=5)
+    parser.add_argument("--classifier-epochs", type=int, default=50)
+    parser.add_argument("--classifier-patience", type=int, default=10)
     parser.add_argument("--classifier-lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -310,6 +337,18 @@ def parse_positive_ints(specification: str, label: str) -> tuple[int, ...]:
     return values
 
 
+def parse_rf_max_features(specification: str) -> str | float:
+    value = str(specification).strip().lower()
+    if value in {"sqrt", "log2"}:
+        return value
+    numeric = float(value)
+    if not 0.0 < numeric <= 1.0:
+        raise ValueError(
+            "--rf-max-features must be sqrt, log2, or a fraction in (0,1]"
+        )
+    return numeric
+
+
 def validate_args(args: argparse.Namespace) -> None:
     if args.finalize_only and str(args.worker_fold).strip():
         raise ValueError("--finalize-only and --worker-fold cannot be combined")
@@ -322,6 +361,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "flatline_seconds": args.flatline_seconds,
         "robust_clip": args.robust_clip,
         "svm_cache_mb": args.svm_cache_mb,
+        "rf_n_estimators": args.rf_n_estimators,
         "feature_batch_size": args.feature_batch_size,
         "gru_hidden": args.gru_hidden,
         "gru_layers": args.gru_layers,
@@ -335,12 +375,21 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"These arguments must be positive: {invalid}")
     if args.num_workers < 0 or args.max_train_windows < 0:
         raise ValueError("worker counts and train cap must be non-negative")
+    if args.rf_max_depth < 0 or args.rf_n_jobs == 0:
+        raise ValueError(
+            "--rf-max-depth must be non-negative and --rf-n-jobs cannot be 0"
+        )
     if not 0.0 < args.fog_fraction_threshold <= 1.0:
         raise ValueError("--fog-fraction-threshold must be in (0,1]")
     if not 0.0 <= args.dropout < 1.0:
         raise ValueError("--dropout must be in [0,1)")
     parse_methods(args.methods)
     parse_positive_floats(args.svm_c_grid, "--svm-c-grid")
+    parse_positive_ints(
+        args.rf_min_samples_leaf_grid,
+        "--rf-min-samples-leaf-grid",
+    )
+    parse_rf_max_features(args.rf_max_features)
     parse_positive_ints(args.cnn_channels, "--cnn-channels")
     quantiles = [
         float(value)
@@ -534,12 +583,21 @@ def metrics_from_predictions(
 def parse_fi_channel_indices(
     specification: str,
     channel_names: Sequence[str],
+    default_channel_names: Sequence[str] = (),
 ) -> list[int]:
-    names = [
-        value.strip()
-        for value in str(specification).split(",")
-        if value.strip()
-    ]
+    if str(specification).strip().lower() == "auto":
+        names = [str(value) for value in default_channel_names]
+        if not names:
+            raise ValueError(
+                "The selected dataset adapter has no automatic Freeze Index "
+                "channel; pass --fi-channels with an explicit channel name"
+            )
+    else:
+        names = [
+            value.strip()
+            for value in str(specification).split(",")
+            if value.strip()
+        ]
     if not names:
         raise ValueError("--fi-channels must not be empty")
     if len(names) != len(set(names)):
@@ -608,13 +666,17 @@ def build_protocol(
     windows: WindowTable,
     eligible_indices: np.ndarray,
     samples: dict[str, int],
+    sensor_channel_indices: tuple[int, ...],
     fi_channel_indices: list[int],
     cnn_channels: tuple[int, ...],
     svm_c_grid: list[float],
+    rf_min_samples_leaf_grid: tuple[int, ...],
+    rf_max_features: str | float,
     device: torch.device,
 ) -> dict[str, Any]:
     protocol = {
         "suite_version": SUITE_VERSION,
+        "dataset_adapter": args.dataset_adapter,
         "implementation": implementation_manifest(),
         "data_sha256": data_sha256,
         "sampling_rate_hz": dataset.sampling_rate_hz,
@@ -635,7 +697,7 @@ def build_protocol(
         "zero_tolerance": args.zero_tolerance,
         "robust_clip": args.robust_clip,
         "sensor_set": args.sensor_set,
-        "sensor_channel_indices": list(SENSOR_SETS[args.sensor_set]),
+        "sensor_channel_indices": list(sensor_channel_indices),
         "fi_channel_indices": fi_channel_indices,
         "fi_channel_names": [
             dataset.channel_names[index] for index in fi_channel_indices
@@ -656,6 +718,15 @@ def build_protocol(
         "svm_class_weight": "balanced",
         "svm_max_iter": args.svm_max_iter,
         "svm_cache_mb": args.svm_cache_mb,
+        "rf_n_estimators": args.rf_n_estimators,
+        "rf_min_samples_leaf_grid": list(rf_min_samples_leaf_grid),
+        "rf_max_depth": (
+            None if args.rf_max_depth == 0 else int(args.rf_max_depth)
+        ),
+        "rf_max_features": rf_max_features,
+        "rf_class_weight": "balanced_subsample",
+        "rf_bootstrap": True,
+        "rf_n_jobs": args.rf_n_jobs,
         "feature_batch_size": args.feature_batch_size,
         "feature_magnitudes": args.feature_magnitudes,
         "cnn_channels": list(cnn_channels),
@@ -667,6 +738,8 @@ def build_protocol(
         "classifier_patience": args.classifier_patience,
         "classifier_lr": args.classifier_lr,
         "weight_decay": args.weight_decay,
+        "cnn_pos_weight_policy": "min(sqrt(n_nonfog/n_fog),6)",
+        "cnn_gradient_clip_norm": 5.0,
         "batch_size": args.batch_size,
         "max_train_windows": args.max_train_windows,
         "seed": args.seed,
@@ -689,6 +762,14 @@ def build_protocol(
             f"final_{args.horizon_seconds:g}s_fog_fraction_at_least_"
             f"{args.fog_fraction_threshold:g}"
         ),
+        "event_metrics": {
+            "version": "coverage_aware.v2",
+            "minimum_positive_windows": 2,
+            "merge_gap_seconds": 0.5,
+            "false_alarm_denominator": (
+                "evaluated_valid_nonfog_target_coverage_hours"
+            ),
+        },
     }
     fingerprint = canonical_fingerprint(protocol)
     return {
@@ -1284,7 +1365,9 @@ def run_tf_svm(
             return json.load(handle)
 
     started = time.perf_counter()
-    channel_indices = SENSOR_SETS[args.sensor_set]
+    channel_indices = tuple(
+        int(index) for index in config["sensor_channel_indices"]
+    )
     channel_names = tuple(
         dataset.channel_names[index] for index in channel_indices
     )
@@ -1477,6 +1560,279 @@ def run_tf_svm(
     )
 
 
+def _random_forest(
+    args: argparse.Namespace,
+    min_samples_leaf: int,
+    *,
+    seed: int,
+) -> RandomForestClassifier:
+    return RandomForestClassifier(
+        n_estimators=int(args.rf_n_estimators),
+        criterion="gini",
+        max_depth=(
+            None if int(args.rf_max_depth) == 0 else int(args.rf_max_depth)
+        ),
+        min_samples_split=2,
+        min_samples_leaf=int(min_samples_leaf),
+        max_features=parse_rf_max_features(args.rf_max_features),
+        bootstrap=True,
+        class_weight="balanced_subsample",
+        n_jobs=int(args.rf_n_jobs),
+        random_state=int(seed),
+    )
+
+
+def run_tf_rf(
+    *,
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    fold_root: Path,
+    test_subject: str,
+    val_subject: str,
+    dataset: DaphnetDataset,
+    windows: WindowTable,
+    split_indices: dict[str, np.ndarray],
+    scaler: RobustChannelScaler,
+    samples: dict[str, int],
+    rf_min_samples_leaf_grid: tuple[int, ...],
+) -> dict[str, Any]:
+    """Train a random forest on the exact TF feature representation of SVM."""
+
+    method = "tf_rf"
+    task_id = f"{test_subject}/{method}"
+    root = fold_root / method
+    root.mkdir(parents=True, exist_ok=True)
+    if args.resume and method_is_complete(
+        root,
+        config["protocol_fingerprint"],
+        task_id,
+    ):
+        with (root / "metrics.json").open("r", encoding="utf-8") as handle:
+            print(f"  [{test_subject}] {method}: complete", flush=True)
+            return json.load(handle)
+
+    started = time.perf_counter()
+    channel_indices = tuple(
+        int(index) for index in config["sensor_channel_indices"]
+    )
+    channel_names = tuple(
+        dataset.channel_names[index] for index in channel_indices
+    )
+    extractor = TimeFrequencyFeatureExtractor(
+        dataset.sampling_rate_hz,
+        channel_names,
+        include_triad_magnitudes=args.feature_magnitudes,
+        batch_size=args.feature_batch_size,
+    )
+    x_train, y_train, _ = _extract_tf_features(
+        dataset=dataset,
+        windows=windows,
+        window_indices=split_indices["train"],
+        history_samples=samples["history"],
+        scaler=scaler,
+        channel_indices=channel_indices,
+        extractor=extractor,
+    )
+    x_val, y_val, val_indices = _extract_tf_features(
+        dataset=dataset,
+        windows=windows,
+        window_indices=split_indices["validation"],
+        history_samples=samples["history"],
+        scaler=scaler,
+        channel_indices=channel_indices,
+        extractor=extractor,
+    )
+    x_test, y_test, test_indices = _extract_tf_features(
+        dataset=dataset,
+        windows=windows,
+        window_indices=split_indices["test"],
+        history_samples=samples["history"],
+        scaler=scaler,
+        channel_indices=channel_indices,
+        extractor=extractor,
+    )
+    if not (
+        np.isfinite(x_train).all()
+        and np.isfinite(x_val).all()
+        and np.isfinite(x_test).all()
+    ):
+        raise ValueError("Time-frequency features contain non-finite values")
+
+    method_seed = args.seed + 20000 + dataset.subjects.index(test_subject)
+    search_path = root / "search_results.json"
+    search_payload: dict[str, Any] = {
+        "protocol_fingerprint": config["protocol_fingerprint"],
+        "task_id": task_id,
+        "selection_metric": "validation_pr_auc",
+        "fixed": {
+            "n_estimators": int(args.rf_n_estimators),
+            "max_depth": (
+                None
+                if int(args.rf_max_depth) == 0
+                else int(args.rf_max_depth)
+            ),
+            "max_features": parse_rf_max_features(args.rf_max_features),
+            "class_weight": "balanced_subsample",
+            "bootstrap": True,
+        },
+        "candidates": [],
+    }
+    if args.resume and search_path.exists():
+        with search_path.open("r", encoding="utf-8") as handle:
+            search_payload = json.load(handle)
+        if (
+            search_payload.get("protocol_fingerprint")
+            != config["protocol_fingerprint"]
+            or search_payload.get("task_id") != task_id
+        ):
+            raise ValueError(f"Incompatible RF search state: {search_path}")
+    completed = {
+        int(candidate["min_samples_leaf"]): candidate
+        for candidate in search_payload.get("candidates", [])
+    }
+    for leaf_size in rf_min_samples_leaf_grid:
+        if int(leaf_size) in completed:
+            continue
+        candidate = _random_forest(
+            args,
+            int(leaf_size),
+            seed=method_seed,
+        )
+        candidate.fit(x_train, y_train)
+        validation_probability = np.asarray(
+            candidate.predict_proba(x_val)[:, 1],
+            dtype=np.float64,
+        )
+        row = {
+            "min_samples_leaf": int(leaf_size),
+            "validation_pr_auc": float(
+                average_precision_score(y_val, validation_probability)
+            ),
+            "validation_roc_auc": float(
+                roc_auc_score(y_val, validation_probability)
+            ),
+            "tree_count": int(len(candidate.estimators_)),
+        }
+        search_payload.setdefault("candidates", []).append(row)
+        atomic_json_dump(search_payload, search_path)
+        completed[int(leaf_size)] = row
+
+    best = max(
+        completed.values(),
+        key=lambda row: (
+            float(row["validation_pr_auc"]),
+            float(row["validation_roc_auc"]),
+            int(row["min_samples_leaf"]),
+        ),
+    )
+    selected_leaf_size = int(best["min_samples_leaf"])
+    model = _random_forest(
+        args,
+        selected_leaf_size,
+        seed=method_seed,
+    )
+    model.fit(x_train, y_train)
+    val_prob = np.asarray(model.predict_proba(x_val)[:, 1], dtype=np.float64)
+    test_prob = np.asarray(model.predict_proba(x_test)[:, 1], dtype=np.float64)
+    metrics, val_pred, test_pred, threshold = common_metrics(
+        method=method,
+        test_subject=test_subject,
+        val_subject=val_subject,
+        args=args,
+        samples=samples,
+        validation_true=y_val,
+        validation_prob=val_prob,
+        test_true=y_test,
+        test_prob=test_prob,
+        test_indices=test_indices,
+        dataset=dataset,
+        windows=windows,
+    )
+    metrics.update(
+        {
+            "rf_n_estimators": int(args.rf_n_estimators),
+            "rf_max_depth": (
+                None
+                if int(args.rf_max_depth) == 0
+                else int(args.rf_max_depth)
+            ),
+            "rf_max_features": parse_rf_max_features(args.rf_max_features),
+            "selected_min_samples_leaf": selected_leaf_size,
+            "selection_validation_pr_auc": float(
+                best["validation_pr_auc"]
+            ),
+            "selection_validation_roc_auc": float(
+                best["validation_roc_auc"]
+            ),
+            "n_features": int(x_train.shape[1]),
+            "train_counts": np.bincount(
+                y_train,
+                minlength=2,
+            ).astype(int).tolist(),
+            "method_seed": method_seed,
+            "elapsed_sec": time.perf_counter() - started,
+        }
+    )
+    model_path = root / "model.joblib"
+    schema_path = root / "feature_schema.json"
+    importance_path = root / "feature_importance.npz"
+    atomic_joblib_dump(model, model_path)
+    atomic_json_dump(
+        {
+            "version": "daphnet_time_frequency.v1",
+            "classifier": method,
+            "sampling_rate_hz": dataset.sampling_rate_hz,
+            "history_samples": samples["history"],
+            "history_seconds": args.input_seconds,
+            "raw_scaler": scaler.as_dict(),
+            "sensor_set": args.sensor_set,
+            "channel_indices": list(channel_indices),
+            "channel_names": list(channel_names),
+            "include_triad_magnitudes": bool(args.feature_magnitudes),
+            "feature_names": list(extractor.feature_names()),
+            "feature_count": len(extractor.feature_names()),
+            "spectral_estimator": "mean_removed_hann_rfft_one_sided_power",
+            "locomotor_band_hz": [0.5, 3.0],
+            "locomotor_high_exclusive": True,
+            "freeze_band_hz": [3.0, 8.0],
+            "freeze_high_inclusive": True,
+        },
+        schema_path,
+    )
+    atomic_npz_save(
+        importance_path,
+        importance=np.asarray(model.feature_importances_, dtype=np.float64),
+    )
+    print(
+        f"  [{test_subject}] {method}: leaf={selected_leaf_size} "
+        f"BA={metrics['balanced_accuracy']:.4f} "
+        f"PR-AUC={metrics['pr_auc']:.4f}",
+        flush=True,
+    )
+    return finalise_method_artifacts(
+        root=root,
+        protocol_fingerprint=config["protocol_fingerprint"],
+        task_id=task_id,
+        metrics=metrics,
+        validation_indices=val_indices,
+        validation_true=y_val,
+        validation_prob=val_prob,
+        validation_pred=val_pred,
+        test_indices=test_indices,
+        test_true=y_test,
+        test_prob=test_prob,
+        test_pred=test_pred,
+        dataset=dataset,
+        windows=windows,
+        additional_artifacts={
+            "model": model_path,
+            "feature_schema": schema_path,
+            "feature_importance": importance_path,
+            "search_results": search_path,
+        },
+    )
+
+
 def make_history_loader(
     *,
     dataset: DaphnetDataset,
@@ -1593,7 +1949,9 @@ def run_cnn_gru(
     started = time.perf_counter()
     method_seed = args.seed + 10000 + dataset.subjects.index(test_subject)
     set_seed(method_seed, args.deterministic)
-    channel_indices = SENSOR_SETS[args.sensor_set]
+    channel_indices = tuple(
+        int(index) for index in config["sensor_channel_indices"]
+    )
     pin_memory = device.type == "cuda"
     train_loader = make_history_loader(
         dataset=dataset,
@@ -1959,6 +2317,10 @@ def refresh_summaries(output_dir: Path, config: dict[str, Any]) -> None:
         "best_epoch",
         "best_validation_pr_auc",
         "selected_c",
+        "selected_min_samples_leaf",
+        "rf_n_estimators",
+        "rf_max_depth",
+        "rf_max_features",
         "selection_validation_pr_auc",
         "n_features",
         "fi_score_threshold",
@@ -2013,11 +2375,6 @@ def main() -> None:
     args.data_dir = args.data_dir.resolve()
     args.output_dir = args.output_dir.resolve()
     excluded_subjects = parse_subject_list(args.exclude_subjects)
-    if set(excluded_subjects) != {"S04", "S10"}:
-        raise ValueError(
-            "The core baseline suite requires exactly "
-            "--exclude-subjects S04,S10"
-        )
     if (
         args.output_dir.exists()
         and any(args.output_dir.iterdir())
@@ -2031,30 +2388,16 @@ def main() -> None:
     set_seed(args.seed, args.deterministic)
 
     data_sha256 = dataset_fingerprint(args.data_dir)
-    dataset = DaphnetDataset.load(
+    loaded = load_dataset(
+        args.dataset_adapter,
         args.data_dir,
+        excluded_subjects=excluded_subjects,
         flatline_seconds=args.flatline_seconds,
         zero_tolerance=args.zero_tolerance,
     )
-    if dataset.n_channels != 9:
-        raise ValueError(
-            f"Core three-IMU suite requires 9 channels, got {dataset.n_channels}"
-        )
-    if tuple(dataset.channel_names) != EXPECTED_CHANNEL_NAMES:
-        raise ValueError(
-            "Expected ordered ankle/thigh/trunk channels, got "
-            f"{dataset.channel_names}"
-        )
-    source_subjects = list(dataset.subjects)
-    dataset = filter_dataset(dataset, excluded_subjects)
-    if tuple(dataset.subjects) != EXPECTED_LOSO_SUBJECTS:
-        raise ValueError(
-            "Core suite requires the eight post-exclusion subjects "
-            f"{EXPECTED_LOSO_SUBJECTS}, got {tuple(dataset.subjects)}"
-        )
+    dataset = loaded.dataset
+    source_subjects = list(loaded.source_subjects)
     fs = dataset.sampling_rate_hz
-    if fs != 64:
-        raise ValueError(f"Core Daphnet suite requires 64 Hz, got {fs} Hz")
 
     sample_values = {
         "context": args.context_seconds * fs,
@@ -2078,7 +2421,7 @@ def main() -> None:
     folds = parse_folds(args.folds, dataset.subjects)
     if not folds or len(folds) != len(set(folds)):
         raise ValueError("--folds must resolve to unique subjects")
-    if worker_mode and tuple(folds) != EXPECTED_LOSO_SUBJECTS:
+    if worker_mode and tuple(folds) != tuple(dataset.subjects):
         raise ValueError(
             "Parallel worker mode requires --folds all so every worker "
             "shares one canonical protocol"
@@ -2105,9 +2448,14 @@ def main() -> None:
     # requested.  Otherwise a one-fold smoke run would accidentally discard
     # the other subjects from its train and validation partitions.
     eligible_indices = global_plan.anchor_window_indices
+    sensor_channel_indices = resolve_sensor_channel_indices(
+        args.sensor_set,
+        dataset.channel_names,
+    )
     fi_channel_indices = parse_fi_channel_indices(
         args.fi_channels,
         dataset.channel_names,
+        loaded.default_fi_channels,
     )
     cnn_channels = parse_positive_ints(
         args.cnn_channels,
@@ -2117,6 +2465,11 @@ def main() -> None:
         args.svm_c_grid,
         "--svm-c-grid",
     )
+    rf_min_samples_leaf_grid = parse_positive_ints(
+        args.rf_min_samples_leaf_grid,
+        "--rf-min-samples-leaf-grid",
+    )
+    rf_max_features = parse_rf_max_features(args.rf_max_features)
     config = build_protocol(
         args,
         dataset,
@@ -2128,9 +2481,12 @@ def main() -> None:
         windows,
         eligible_indices,
         samples,
+        sensor_channel_indices,
         fi_channel_indices,
         cnn_channels,
         svm_c_grid,
+        rf_min_samples_leaf_grid,
+        rf_max_features,
         device,
     )
     config_path = args.output_dir / "config.json"
@@ -2250,6 +2606,20 @@ def main() -> None:
                 scaler=scaler,
                 samples=samples,
                 svm_c_grid=svm_c_grid,
+            )
+        if "tf_rf" in methods:
+            run_tf_rf(
+                args=args,
+                config=config,
+                fold_root=fold_root,
+                test_subject=test_subject,
+                val_subject=val_subject,
+                dataset=dataset,
+                windows=windows,
+                split_indices=split_indices,
+                scaler=scaler,
+                samples=samples,
+                rf_min_samples_leaf_grid=rf_min_samples_leaf_grid,
             )
         if not worker_mode:
             refresh_summaries(args.output_dir, config)

@@ -1,188 +1,355 @@
-# Daphnet 参考基线实验
+# Daphnet 四类参考基线：5-seed 论文复现实验
 
-该 suite 为 FoG/non-FoG 二分类提供三个独立参考方法：
+本套件在统一的窗口、LOSO 划分、验证集模型选择、阈值和评价程序下比较：
 
-1. `freeze_index`：领域规则方法；
-2. `tf_svm`：时频人工特征 + SVM；
-3. `cnn_gru`：直接读取原始 IMU 历史的通用深度时序分类器。
+1. Freeze Index；
+2. 时频人工特征 + RBF-SVM；
+3. 相同时频人工特征 + Random Forest；
+4. 原始加速度序列 + CNN-GRU。
 
-它不会修改 NBM/residual suite，也不会向正在运行的 NBM 输出目录写入文件。
-
-## 公平比较协议
-
-- 数据：Daphnet 三个 IMU、9 个加速度通道、64 Hz；
-- 先排除 S04 和 S10，再做窗口化、scaler 和 LOSO；
-- 外层 8-fold LOSO：1 个 test subject；
-- 按现有循环规则从剩余受试者中固定 1 个 validation subject；
-- 其余 6 个 subject 用于训练；
-- 输入：决策时刻之前严格因果的 4 秒 IMU 历史；
-- anchor：复用最大 4 秒历史的公共支持集；
-- 标签：末端 0.5 秒中 FoG 占比至少 0.5；
-- 步长：0.25 秒；
-- 阈值：只根据 validation subject 的 Balanced Accuracy 选择；
-- test subject 只在模型、超参数和阈值全部固定后评估一次。
-
-三个方法在每个 fold 中必须具有逐元素相同的 `window_index` 和
-`y_true`。`scripts/audit_daphnet_baseline_suite.py` 会检查该条件。
-
-## 方法定义
-
-### Freeze Index
-
-默认只使用 `ankle_acc_vertical` 的原始加速度，不使用 fold scaler：
+正式种子固定为：
 
 ```text
-locomotor power = sum |FFT(x - mean(x))|², f in [0.5, 3.0) Hz
-freeze power    = sum |FFT(x - mean(x))|², f in [3.0, 8.0] Hz
-FI              = freeze power / locomotor power
-bounded score   = FI / (1 + FI)
+3407, 3408, 3409, 3410, 3411
 ```
 
-FFT 不加 taper、不补零。边界固定为半开/闭区间，3 Hz 只进入 freeze
-band。bounded score 只是便于共享 `[0,1]` 阈值和指标接口，不声称是校准概率。
+声明式协议位于
+`configs/daphnet_reference_baselines_5seed.json`。运行产生的 `config.json`、
+环境文件、实现文件哈希、预测文件和审计报告共同构成结果的可追溯证据。
 
-多通道接口通过 `--fi-channels` 提供；默认 `--fi-aggregation power_pool`
-先聚合频带功率再求比值。可选 `--fi-power-gate` 仅利用 train power
-候选和 validation 指标选择低运动门限。
+## 1. 统一实验协议
 
-### 时频特征 + SVM
+### 1.1 数据与被试
 
-输入先用该 fold 的六个训练 subject 中有效 non-FoG 样本拟合
-median/IQR scaler。每个物理通道以及每组三轴模长提取：
+- Daphnet 为踝部、大腿和躯干三个三轴加速度计位置，共 9 个加速度通道；
+- 采样率 64 Hz；
+- S04 和 S10 没有 FoG，正式二分类比较在窗口化前将二者完全排除；
+- 外层 LOSO 被试固定为：
+  `S01,S02,S03,S05,S06,S07,S08,S09`；
+- 同一被试的所有 run 和连续 segment 始终属于同一个 split。
 
-- 均值、标准差、RMS、极值、峰峰值、中位数、IQR、MAD；
-- 过零率、差分 RMS、偏度、峰度；
-- 0.5–3、3–8、8–15 Hz 频带功率；
-- Freeze Index、主频、谱质心、谱熵和相对功率；
-- 同一传感器轴间相关性及不同传感器同轴相关性。
+### 1.2 因果输入与标签
 
-9 通道配置共产生 306 个确定性特征。`StandardScaler` 和 SVM 都只在
-outer-train 上拟合。默认 `RBF-SVC + class_weight=balanced`，C 候选只由
-validation PR-AUC 选择；最终概率阈值仍只由 validation Balanced Accuracy
-选择。`--svm-kernel linear` 可作为线性核消融。
+- 输入为决策时刻之前的 4 s 原始加速度历史，即 256 点；
+- 目标标签取末端 0.5 s；
+- 该 0.5 s 内 FoG 样本比例至少为 0.5 时记为 FoG；
+- 窗口步长 0.25 s；
+- 窗口不跨 record、无效样本或采样断点；
+- 四种方法和所有种子共用相同的 test anchors 与 `y_true`。
 
-### CNN-GRU
+### 1.3 训练、验证和测试
 
-输入形状为 `[batch, channel, time]`。模型由两个
-`Conv1d + BatchNorm + GELU + MaxPool` block、单向 GRU、temporal
-mean/max pooling 和二分类 head 组成。训练使用：
+每个外层 fold：
 
-- `AdamW`；
-- train-only class imbalance `pos_weight`；
-- AMP（CUDA）；
-- gradient clipping；
-- validation PR-AUC early stopping；
-- 每个 epoch 原子保存 last checkpoint，另保存 best checkpoint；
-- checkpoint 包含模型、optimizer、GradScaler、RNG、early-stop 和历史状态。
+1. 一名完整被试作为 test；
+2. 从剩余被试中按固定规则选择一名完整被试作为 validation；
+3. 其余六名被试训练；
+4. scaler、特征标准化和类别权重只使用训练被试；
+5. SVM/RF 超参数和 CNN-GRU checkpoint 只按 validation PR-AUC 选择；
+6. 最终分类阈值只在 validation 上最大化 Balanced Accuracy；
+7. test 不参与任何模型、超参数、阈值或后处理选择。
 
-## 运行接口
+禁止将重叠窗口随机拆分到 train/test。
 
-### 7 GPU 正式 LOSO
+## 2. 四组实验大纲
 
-在服务器仓库根目录运行：
+### B1. Freeze Index
+
+**类别：** 传统频段阈值。
+
+**目的：** 检验提出方法是否优于经典冻结频段指标。
+
+**输入：** 默认只用 `ankle_acc_vertical`，不使用 fold scaler。
+
+对每个 4 s 窗去均值，不加 taper、不补零：
+
+```text
+locomotor power = Σ|FFT(x-mean(x))|², 0.5 ≤ f < 3 Hz
+freeze power    = Σ|FFT(x-mean(x))|², 3 ≤ f ≤ 8 Hz
+FI              = freeze power / (locomotor power + ε)
+score           = FI / (1 + FI)
+```
+
+连续 `score` 用于 PR-AUC/AUROC；阈值由 validation BA 选择。FI 为确定性
+方法，5 个种子的结果应逐元素相同。重复运行用于审计复现性，不能当作 5 个
+独立统计样本。
+
+### B2. 时频特征 + SVM
+
+**类别：** 传统人工特征机器学习。
+
+**目的：** 检验提出方法是否优于经典 FoG 人工特征路线。
+
+输入先用训练被试的 valid non-FoG 样本拟合 median/IQR scaler。每个物理
+通道和三轴模长提取：
+
+- mean、std、RMS、min、max、peak-to-peak、median、IQR、MAD；
+- absolute mean、zero-crossing rate、derivative RMS、skewness、kurtosis；
+- 0.5–3、3–8、8–15 和 0.5–15 Hz 功率及相对功率；
+- log-FI、dominant frequency、spectral centroid、spectral entropy；
+- 同一传感器轴间相关性和不同传感器同轴相关性。
+
+九通道配置共产生 306 个固定特征。模型为：
+
+```text
+StandardScaler
+RBF-SVC
+class_weight = balanced
+C ∈ {0.1, 1, 10}
+gamma = scale
+```
+
+`C` 仅由 validation PR-AUC 选择。
+
+### B3. 时频特征 + Random Forest
+
+**类别：** 非线性人工特征集成模型。
+
+**目的：** 检验提出方法是否优于基于相同人工特征的树集成路线。
+
+RF 必须读取与 SVM 逐元素相同的 306 维特征，只允许分类器不同：
+
+```text
+n_estimators = 500
+criterion = gini
+bootstrap = true
+class_weight = balanced_subsample
+max_depth = None
+max_features = sqrt
+min_samples_leaf ∈ {1, 2, 5}
+```
+
+叶节点候选仅由 validation PR-AUC 选择；`random_state` 使用当前正式 seed。
+输出保存模型、搜索结果、特征 schema 和 feature importance。
+
+### B4. CNN-GRU
+
+**类别：** 通用深度时序模型。
+
+**目的：** 检验提出方法是否优于卷积与循环联合建模的通用深度路线。
+
+输入形状为 `[batch, 9, 256]`。默认网络：
+
+```text
+Conv1d(9→32, kernel=7) + BN + GELU + MaxPool
+Conv1d(32→64, kernel=5) + BN + GELU + MaxPool
+unidirectional GRU(hidden=64)
+temporal mean/max pooling
+MLP binary head
+```
+
+训练配置：
+
+```text
+AdamW
+learning rate = 1e-3
+weight decay = 1e-4
+batch size = 256
+maximum epochs = 50
+patience = 10
+validation metric = PR-AUC
+```
+
+损失为 train-only 类别权重的 BCE，其中
+`pos_weight=min(sqrt(N_nonFoG/N_FoG),6)`；梯度范数裁剪为 5。程序支持 AMP、
+确定性 seed 和 epoch-boundary 断点续训。
+
+## 3. 指标与统计
+
+### 3.1 窗口级论文主表
+
+```text
+PR-AUC
+ΔPR-AUC [95% CI]
+Balanced Accuracy
+Macro-F1
+AUROC
+FoG Sensitivity/Recall
+Specificity
+FoG Precision
+FoG F1
+```
+
+主指标为 held-out-subject macro PR-AUC，不以 Accuracy 或 pooled-window
+PR-AUC 选择模型。
+
+### 3.2 事件级表
+
+```text
+Event Sensitivity
+FA/h
+Median Detection Delay
+```
+
+事件定义版本为 `coverage_aware.v2`：
+
+- 至少连续两个阳性窗口形成候选事件；
+- 间隔不超过 0.5 s 的候选事件可合并；
+- 无效或未评估的真实时间间隔不能被数组相邻关系跨越；
+- FA/h 分母为实际被评估、有效的 non-FoG target coverage 小时数；
+- delay 从真实 FoG 起点到首次满足报警条件的时刻计算，早于起点的覆盖记 0。
+
+所有最终对照方法和 Proposed 必须使用同一事件定义。历史输出若使用旧定义，
+必须由保存的 predictions 重新计算后才能进入同一事件表。
+
+### 3.3 五种子统计顺序
+
+不能把 `8 subjects × 5 seeds = 40` 当作 40 个独立受试者。对每项指标先在
+每名被试内平均 5 个 seed：
+
+\[
+\bar m_s=\frac{1}{5}\sum_{r=1}^{5}m_{s,r},
+\]
+
+再对八个 \(\bar m_s\) 计算 subject-macro mean 和 SD。
+
+若以 Proposed 为参考：
+
+\[
+\Delta_s =
+\overline{\mathrm{PR}}_{\mathrm{Proposed},s}
+-
+\overline{\mathrm{PR}}_{\mathrm{Baseline},s}.
+\]
+
+正值表示 Proposed 更好。对 8 个配对被试差值进行 100,000 次 subject-level
+bootstrap，报告均值差和 95% percentile CI。Proposed 也应使用相同五个 seed；
+否则只能做非 seed-matched 的补充比较。
+
+聚合器接受可选参考 CSV：
+
+```csv
+seed,test_subject,pr_auc
+3407,S01,0.50
+...
+```
+
+没有参考 CSV 时，主表的 Δ 列明确输出 `NA (reference required)`，不会擅自
+把某个 baseline 当作参考。同时输出四基线之间的全部配对 PR-AUC CI。
+
+## 4. 正式服务器运行
+
+在仓库根目录运行：
 
 ```bash
-python -u scripts/start_daphnet_baseline_suite_multigpu.py \
-  --data-dir "/home/chb/Documents/FOG/fog_classification_framework_base/dataset/1.Daphnet Freezing of Gait Dataset/processed" \
-  --output-dir "$PWD/outputs/daphnet_reference_baselines_h4s_seed42" \
+python -u scripts/run_fog_baseline_seed_sweep.py \
+  --dataset-adapter daphnet \
+  --data-dir "/path/to/Daphnet/processed" \
+  --output-dir "$PWD/outputs/daphnet_reference_baselines_h4s_5seed" \
+  --seeds 3407,3408,3409,3410,3411 \
+  --launcher multigpu \
   --gpus 0-6 \
-  --work-folds all \
-  --max-retries 2 \
-  --launch-delay 2 \
   --audit \
-  --seed 42 \
+  --rf-n-jobs 1 \
   --batch-size 256 \
   --num-workers 0
 ```
 
-调度器先用 CPU 初始化不可变 protocol，然后让每张 GPU 独立完成一个
-fold 内的 CNN-GRU、Freeze Index 和 SVM。前 7 个 fold 完成后，空闲 GPU
-自动接手第 8 个 fold。SVM 是 CPU 方法，因此一个 fold 进入 SVM 阶段后，
-对应 GPU 利用率下降是正常现象。调度状态位于：
+每个 seed 使用独立目录：
 
 ```text
-outputs/daphnet_reference_baselines_h4s_seed42/multigpu_status.json
+outputs/daphnet_reference_baselines_h4s_5seed/
+  seed_3407/
+  seed_3408/
+  seed_3409/
+  seed_3410/
+  seed_3411/
+  fold_seed_metrics.csv
+  subject_seed_averaged_metrics.csv
+  pairwise_pr_auc_deltas.csv
+  publication_table.csv
+  event_metrics_table.csv
+  aggregate_multiseed_metrics.json
+  multiseed_audit_report.json
 ```
 
-### 单 fold smoke test
+若 Proposed 的 PR-AUC CSV 已准备好：
+
+```bash
+python -u scripts/aggregate_fog_baseline_multiseed.py \
+  --output-dir "$PWD/outputs/daphnet_reference_baselines_h4s_5seed" \
+  --seeds 3407,3408,3409,3410,3411 \
+  --reference-pr-csv "/path/to/proposed_subject_seed_pr.csv"
+```
+
+## 5. 单折 smoke test
+
+Smoke test 只验证软件链路，不进入论文：
 
 ```bash
 python -u scripts/run_daphnet_baseline_suite.py \
-  --data-dir "/path/to/processed" \
+  --dataset-adapter daphnet \
+  --data-dir "/path/to/Daphnet/processed" \
   --output-dir "$PWD/outputs/baseline_smoke" \
   --folds S01 \
-  --device cuda \
+  --seed 3407 \
+  --device cpu \
+  --no-amp \
   --classifier-epochs 1 \
-  --max-train-windows 2000 \
+  --classifier-patience 1 \
+  --max-train-windows 256 \
   --svm-c-grid 1 \
-  --batch-size 128
+  --rf-n-estimators 20 \
+  --rf-min-samples-leaf-grid 1
 ```
 
-`--max-train-windows` 只用于 smoke/debug；正式结果保持默认 `0`，即使用全部
-公共 train anchors。
-
-### 只运行指定方法
-
-```bash
-python -u scripts/run_daphnet_baseline_suite.py \
-  --data-dir "/path/to/processed" \
-  --output-dir "$PWD/outputs/domain_and_ml_only" \
-  --folds all \
-  --methods freeze_index,tf_svm \
-  --device cpu
-```
-
-### 其他输入历史
-
-主比较固定 4 秒。需要 0.5、1 或 2 秒消融时，用独立输出目录运行
-`--input-seconds 0.5`、`1` 或 `2`，不要把不同 protocol 写入同一目录。
-
-## 输出
-
-```text
-outputs/daphnet_reference_baselines_h4s_seed42/
-  config.json
-  environment.json
-  run_manifest.json
-  status.json
-  fold_summary.csv
-  experiment_manifest.csv
-  aggregate_metrics.json
-  audit_report.json
-  loso_S01/
-    fold_config.json
-    input_support.npz
-    freeze_index/
-      rule.json
-      fi_features.npz
-      metrics.json
-      predictions.npz
-      validation_predictions.npz
-      predictions.csv
-      DONE.json
-    tf_svm/
-      model.joblib
-      feature_schema.json
-      search_results.json
-      ...
-    cnn_gru/
-      best.pt
-      last.pt
-      ...
-```
-
-每种方法均报告 Accuracy、Balanced Accuracy、Macro-F1、ROC-AUC、
-PR-AUC、FoG Recall、FoG F1、Specificity、Precision、MCC，以及事件敏感度、
-每小时误报事件数和检测延迟。
-
-## 审计
+审计：
 
 ```bash
 python -u scripts/audit_daphnet_baseline_suite.py \
-  --data-dir "/path/to/processed" \
-  --output-dir "$PWD/outputs/daphnet_reference_baselines_h4s_seed42"
+  --data-dir "/path/to/Daphnet/processed" \
+  --output-dir "$PWD/outputs/baseline_smoke"
 ```
 
-审计会验证 DONE hash、公共 anchor、标签、概率范围、阈值、窗口级指标、
-事件级指标和 pooled aggregate。未完成的正式 suite 默认审计失败；调试时才使用
-`--allow-partial`。
+## 6. 私有数据接入
+
+使用：
+
+```text
+--dataset-adapter manifest_npz
+```
+
+处理目录契约：
+
+```text
+private_processed/
+  schema.json
+  manifest.csv
+  records/
+    record_001.npz
+```
+
+每个 NPZ 严格包含：
+
+```text
+x          float32 [time, channel]
+y_binary   int8    [time], 0=non-FoG, 1=FoG
+```
+
+`manifest.csv` 至少包含：
+
+```text
+record_path,record_id,subject_id,run_id,n_samples,sampling_rate_hz,usable
+```
+
+`subject_id` 是 LOSO 分组键。标签映射、单位换算、重采样、通道重排和无效区间
+必须在数据适配器/预处理阶段完成，训练代码只读取统一的二分类记录。若私有数据
+没有 `ankle_acc_vertical` 或其他带 `vertical` 的通道，应显式指定
+`--fi-channels <channel_name>`。
+
+私有数据直接运行示例：
+
+```bash
+python -u scripts/run_fog_baseline_seed_sweep.py \
+  --dataset-adapter manifest_npz \
+  --data-dir "/path/to/private_processed" \
+  --output-dir "$PWD/outputs/private_reference_baselines_h4s_5seed" \
+  --exclude-subjects "" \
+  --launcher direct \
+  --device cuda \
+  --fi-channels "waist_acc_vertical"
+```
+
+当前通用 adapter 要求保留至少三名被试，以形成 train/validation/test
+subject-level 划分。正式评价还要求每个 test subject 同时具有 FoG 和 non-FoG，
+否则 PR-AUC、AUROC 等二分类指标无法定义。

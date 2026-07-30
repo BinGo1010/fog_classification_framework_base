@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Recompute and audit Daphnet reference-baseline suite artifacts."""
+"""Recompute and audit the four-method FoG reference-baseline suite."""
 
 from __future__ import annotations
 
@@ -20,17 +20,16 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from cnbr_fog.data import DaphnetDataset
 from cnbr_fog.evaluation import binary_metrics
 from cnbr_fog.histories import make_common_history_plan
 from cnbr_fog.resume import atomic_json_dump, validate_done
+from daphnet_baselines import load_dataset
 from run_daphnet_baseline_suite import (
     EXPECTED_CHANNEL_NAMES,
     EXPECTED_LOSO_SUBJECTS,
     SUITE_VERSION,
     add_requested_metrics,
     eligible_indices_for_subjects,
-    filter_dataset,
     metrics_from_predictions,
 )
 from run_cnbr_fog_loso import event_metrics
@@ -38,7 +37,7 @@ from run_cnbr_fog_loso import event_metrics
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Audit Daphnet FI / TF-SVM / CNN-GRU outputs",
+        description="Audit FI / TF-SVM / TF-RF / CNN-GRU outputs",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -81,19 +80,31 @@ def main() -> None:
         failures.append(
             f"suite_version={config.get('suite_version')!r}, expected={SUITE_VERSION}"
         )
-    if tuple(config.get("channel_names", [])) != EXPECTED_CHANNEL_NAMES:
-        failures.append("configured channel order is not the canonical 9-channel order")
-    if set(config.get("excluded_subjects", [])) != {"S04", "S10"}:
-        failures.append("configured exclusions are not exactly S04/S10")
-    if tuple(config.get("subjects", [])) != EXPECTED_LOSO_SUBJECTS:
-        failures.append("configured post-exclusion subject list is not canonical")
+    adapter_name = str(config.get("dataset_adapter", "daphnet"))
+    if adapter_name == "daphnet":
+        if tuple(config.get("channel_names", [])) != EXPECTED_CHANNEL_NAMES:
+            failures.append(
+                "configured channel order is not the canonical 9-channel order"
+            )
+        if set(config.get("excluded_subjects", [])) != {"S04", "S10"}:
+            failures.append("configured exclusions are not exactly S04/S10")
+        if tuple(config.get("subjects", [])) != EXPECTED_LOSO_SUBJECTS:
+            failures.append(
+                "configured post-exclusion subject list is not canonical"
+            )
 
-    dataset = DaphnetDataset.load(
+    loaded = load_dataset(
+        adapter_name,
         data_dir,
+        excluded_subjects=config["excluded_subjects"],
         flatline_seconds=float(config["flatline_seconds"]),
         zero_tolerance=float(config["zero_tolerance"]),
     )
-    dataset = filter_dataset(dataset, config["excluded_subjects"])
+    dataset = loaded.dataset
+    if tuple(dataset.subjects) != tuple(config.get("subjects", [])):
+        failures.append(
+            "loaded subject list differs from the configured subject list"
+        )
     windows = dataset.make_windows(
         warmup_samples=int(config["context_samples"]),
         target_samples=int(config["horizon_samples"]),
@@ -307,7 +318,7 @@ def main() -> None:
         len(config["folds_resolved"]) * len(config["methods_resolved"])
     )
     report = {
-        "audit_version": "daphnet_reference_baselines_audit.v1",
+        "audit_version": "fog_reference_baselines_audit.v2",
         "captured_at_utc": datetime.now(timezone.utc).isoformat(),
         "output_dir": str(args.output_dir),
         "data_dir": str(data_dir),

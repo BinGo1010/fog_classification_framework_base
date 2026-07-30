@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Schedule one complete baseline-suite LOSO fold per physical GPU."""
+"""Schedule one complete four-method Daphnet LOSO fold per physical GPU."""
 
 from __future__ import annotations
 
@@ -185,7 +185,7 @@ def main() -> None:
     status_path = args.output_dir / "multigpu_status.json"
     state: dict[str, Any] = {
         "format_version": 1,
-        "scheduler_version": "daphnet_reference_baselines_multigpu.v1",
+        "scheduler_version": "daphnet_reference_baselines_multigpu.v2",
         "run_id": uuid.uuid4().hex,
         "status": "initializing",
         "started_at": timestamp(),

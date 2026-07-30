@@ -1,0 +1,131 @@
+{
+  "experiment_id": "daphnet_reference_baselines_h4s_5seed",
+  "suite_version": "fog_reference_baselines.v2",
+  "dataset": {
+    "adapter": "daphnet",
+    "sampling_rate_hz": 64,
+    "excluded_subjects": [
+      "S04",
+      "S10"
+    ],
+    "loso_subjects": [
+      "S01",
+      "S02",
+      "S03",
+      "S05",
+      "S06",
+      "S07",
+      "S08",
+      "S09"
+    ],
+    "input_locations": [
+      "ankle",
+      "thigh",
+      "trunk"
+    ],
+    "input_channels": 9
+  },
+  "seeds": [
+    3407,
+    3408,
+    3409,
+    3410,
+    3411
+  ],
+  "window_protocol": {
+    "context_seconds": 2.0,
+    "input_history_seconds": 4.0,
+    "label_horizon_seconds": 0.5,
+    "stride_seconds": 0.25,
+    "fog_fraction_threshold": 0.5,
+    "normal_guard_seconds": 0.5,
+    "causal": true
+  },
+  "split_protocol": {
+    "outer": "8-fold leave-one-subject-out",
+    "validation": "one complete subject selected deterministically from the remaining seven",
+    "training_subjects_per_fold": 6,
+    "test_used_for_selection": false
+  },
+  "methods": {
+    "freeze_index": {
+      "input": "ankle_acc_vertical",
+      "locomotor_band_hz": [
+        0.5,
+        3.0
+      ],
+      "freeze_band_hz": [
+        3.0,
+        8.0
+      ],
+      "fft_taper": "none",
+      "score": "FI/(1+FI)",
+      "threshold_selection": "validation balanced accuracy"
+    },
+    "tf_svm": {
+      "input": "all nine acceleration channels",
+      "feature_count": 306,
+      "kernel": "rbf",
+      "class_weight": "balanced",
+      "c_grid": [
+        0.1,
+        1.0,
+        10.0
+      ],
+      "model_selection": "validation PR-AUC"
+    },
+    "tf_rf": {
+      "input": "the exact same 306 features as tf_svm",
+      "n_estimators": 500,
+      "criterion": "gini",
+      "bootstrap": true,
+      "class_weight": "balanced_subsample",
+      "min_samples_leaf_grid": [
+        1,
+        2,
+        5
+      ],
+      "max_depth": null,
+      "max_features": "sqrt",
+      "model_selection": "validation PR-AUC"
+    },
+    "cnn_gru": {
+      "input": "robust-scaled raw 9x256 history",
+      "cnn_channels": [
+        32,
+        64
+      ],
+      "gru_hidden": 64,
+      "gru_layers": 1,
+      "bidirectional": false,
+      "dropout": 0.2,
+      "optimizer": "AdamW",
+      "learning_rate": 0.001,
+      "weight_decay": 0.0001,
+      "positive_class_weight": "min(sqrt(n_nonfog/n_fog), 6)",
+      "gradient_clip_norm": 5.0,
+      "maximum_epochs": 50,
+      "patience": 10,
+      "model_selection": "validation PR-AUC"
+    }
+  },
+  "threshold_protocol": {
+    "selection_split": "validation subject only",
+    "objective": "balanced accuracy",
+    "test_threshold_tuning": false
+  },
+  "event_protocol": {
+    "version": "coverage_aware.v2",
+    "minimum_positive_windows": 2,
+    "merge_gap_seconds": 0.5,
+    "false_alarm_denominator": "evaluated valid non-FoG target coverage hours"
+  },
+  "statistics": {
+    "primary_metric": "subject-macro PR-AUC",
+    "aggregation_order": "mean seeds within subject, then summarize the eight subjects",
+    "paired_delta": "Proposed minus baseline",
+    "bootstrap_samples": 100000,
+    "bootstrap_seed": 3411,
+    "confidence_level": 0.95
+  }
+}

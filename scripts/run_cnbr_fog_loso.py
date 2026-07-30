@@ -753,7 +753,13 @@ def event_metrics(
     minimum_positive_windows: int = 2,
     merge_gap_seconds: float = 0.5,
 ) -> dict:
-    """Compute overlap-based event detection metrics on one held-out subject."""
+    """Compute coverage-aware event metrics on one held-out subject.
+
+    False alarms are normalized by the union of actually evaluated, valid
+    non-FoG target samples.  Positive runs are formed in record time, so an
+    invalid or unevaluated gap cannot be bridged merely because two prediction
+    rows are adjacent in an array.
+    """
 
     fs = dataset.sampling_rate_hz
     by_record: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
@@ -772,26 +778,53 @@ def event_metrics(
     predicted_total = 0
     matched_predictions = 0
     delays: list[float] = []
-    evaluated_seconds = 0.0
+    evaluated_nonfog_seconds = 0.0
     merge_gap = int(round(merge_gap_seconds * fs))
 
     for rec_idx, rows in by_record.items():
         record = dataset.records[rec_idx]
-        evaluated_seconds += float(record.valid.sum()) / fs
         rows.sort(key=lambda item: item[0])
+        coverage = np.zeros(len(record.y), dtype=bool)
+        for start, end, _ in rows:
+            coverage[start:end] = True
+        evaluated_nonfog_seconds += float(
+            np.sum(coverage & record.valid & (record.y == 0))
+        ) / fs
+
         predicted_intervals: list[tuple[int, int, int]] = []
-        pred_values = np.asarray([row[2] for row in rows], dtype=np.int8)
-        for run_start, run_end in _boolean_runs(pred_values == 1):
-            if run_end - run_start < minimum_positive_windows:
-                continue
-            interval_start = rows[run_start][0]
-            interval_end = rows[run_end - 1][1]
-            decision_sample = rows[run_start + minimum_positive_windows - 1][1]
-            if predicted_intervals and interval_start - predicted_intervals[-1][1] <= merge_gap:
+        active: list[tuple[int, int, int]] = []
+
+        def finish_active() -> None:
+            if len(active) < minimum_positive_windows:
+                active.clear()
+                return
+            interval_start = active[0][0]
+            interval_end = active[-1][1]
+            decision_sample = active[minimum_positive_windows - 1][1]
+            if (
+                predicted_intervals
+                and interval_start - predicted_intervals[-1][1] <= merge_gap
+            ):
                 previous = predicted_intervals[-1]
-                predicted_intervals[-1] = (previous[0], interval_end, previous[2])
+                predicted_intervals[-1] = (
+                    previous[0],
+                    interval_end,
+                    previous[2],
+                )
             else:
-                predicted_intervals.append((interval_start, interval_end, decision_sample))
+                predicted_intervals.append(
+                    (interval_start, interval_end, decision_sample)
+                )
+            active.clear()
+
+        for start, end, prediction in rows:
+            if prediction != 1:
+                finish_active()
+                continue
+            if active and start - active[-1][1] > merge_gap:
+                finish_active()
+            active.append((start, end, prediction))
+        finish_active()
 
         true_intervals = _boolean_runs(record.y == 1)
         # Only score events that overlap at least one evaluated target window.
@@ -803,36 +836,42 @@ def event_metrics(
         ]
         true_total += len(true_intervals)
         predicted_total += len(predicted_intervals)
-        used_predictions: set[int] = set()
+        matched_prediction_indices: set[int] = set()
         for true_start, true_end in true_intervals:
             matches = [
                 index
                 for index, (pred_start, pred_end, _) in enumerate(predicted_intervals)
-                if index not in used_predictions
-                and max(true_start, pred_start) < min(true_end, pred_end)
+                if max(true_start, pred_start) < min(true_end, pred_end)
             ]
             if not matches:
                 continue
             match = min(matches, key=lambda index: predicted_intervals[index][0])
-            used_predictions.add(match)
+            matched_prediction_indices.update(matches)
             true_detected += 1
             _, _, decision_sample = predicted_intervals[match]
             delays.append(max(0.0, (decision_sample - true_start) / fs))
-        matched_predictions += len(used_predictions)
+        matched_predictions += len(matched_prediction_indices)
 
     false_events = predicted_total - matched_predictions
     return {
+        "event_metric_version": "coverage_aware.v2",
+        "minimum_positive_windows": int(minimum_positive_windows),
+        "merge_gap_seconds": float(merge_gap_seconds),
         "evaluable_true_events": int(true_total),
         "detected_true_events": int(true_detected),
         "predicted_events": int(predicted_total),
         "false_alarm_events": int(false_events),
         "event_sensitivity": true_detected / true_total if true_total else None,
         "false_alarm_events_per_hour": (
-            false_events / (evaluated_seconds / 3600.0) if evaluated_seconds else None
+            false_events / (evaluated_nonfog_seconds / 3600.0)
+            if evaluated_nonfog_seconds
+            else None
         ),
         "median_detection_delay_sec": float(np.median(delays)) if delays else None,
         "mean_detection_delay_sec": float(np.mean(delays)) if delays else None,
-        "evaluated_hours": evaluated_seconds / 3600.0,
+        "evaluated_nonfog_hours": evaluated_nonfog_seconds / 3600.0,
+        # Retained as an alias for older result consumers.
+        "evaluated_hours": evaluated_nonfog_seconds / 3600.0,
     }
 
 

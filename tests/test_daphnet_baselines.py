@@ -1,17 +1,29 @@
 from __future__ import annotations
 
+import csv
+import json
+
 import numpy as np
 import pytest
 import torch
 
-from cnbr_fog.data import Record, RobustChannelScaler, WindowTable
+from cnbr_fog.data import (
+    DaphnetDataset,
+    Record,
+    RobustChannelScaler,
+    WindowTable,
+)
+from cnbr_fog.histories import make_common_history_plan
 from daphnet_baselines import (
     CNNGRUClassifier,
     HistoryWindowDataset,
     TimeFrequencyFeatureExtractor,
     freeze_index_features,
+    load_dataset,
     materialize_history_windows,
+    resolve_sensor_channel_indices,
 )
+from scripts.run_cnbr_fog_loso import event_metrics
 
 
 FS = 64
@@ -165,4 +177,145 @@ def test_cnn_gru_output_shape_and_gradient() -> None:
         parameter.grad is not None
         for parameter in model.parameters()
         if parameter.requires_grad
+    )
+
+
+def test_manifest_adapter_supports_private_subjects(tmp_path) -> None:
+    record_root = tmp_path / "records"
+    record_root.mkdir()
+    channel_names = (
+        "waist_acc_forward",
+        "waist_acc_vertical",
+        "waist_acc_lateral",
+    )
+    with (tmp_path / "schema.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "channels": [
+                    {"name": name, "unit": "g"} for name in channel_names
+                ]
+            },
+            handle,
+        )
+    rows = []
+    for index, subject in enumerate(("P01", "P02", "P03")):
+        time = np.arange(768, dtype=np.float32)
+        x = np.stack(
+            [
+                1.0 + 0.01 * time + index,
+                2.0 + np.sin(time / 5.0),
+                3.0 + np.cos(time / 7.0),
+            ],
+            axis=1,
+        ).astype(np.float32)
+        y = np.zeros(768, dtype=np.int8)
+        y[400:496] = 1
+        relative = f"records/{subject}.npz"
+        np.savez_compressed(tmp_path / relative, x=x, y_binary=y)
+        rows.append(
+            {
+                "record_path": relative,
+                "record_id": f"{subject}_record",
+                "subject_id": subject,
+                "run_id": "R01",
+                "n_samples": len(x),
+                "sampling_rate_hz": 64,
+                "usable": "true",
+            }
+        )
+    with (tmp_path / "manifest.csv").open(
+        "w",
+        encoding="utf-8",
+        newline="",
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    loaded = load_dataset(
+        "manifest_npz",
+        tmp_path,
+        excluded_subjects=(),
+        flatline_seconds=1.0,
+        zero_tolerance=1e-8,
+    )
+    assert tuple(loaded.dataset.subjects) == ("P01", "P02", "P03")
+    assert loaded.default_fi_channels == ("waist_acc_vertical",)
+    assert resolve_sensor_channel_indices(
+        "all",
+        loaded.dataset.channel_names,
+    ) == (0, 1, 2)
+    windows = loaded.dataset.make_windows(
+        warmup_samples=128,
+        target_samples=32,
+        stride_samples=16,
+        fog_fraction_threshold=0.5,
+        normal_guard_samples=32,
+    )
+    plan = make_common_history_plan(
+        windows,
+        np.arange(len(windows), dtype=np.int64),
+        horizon_samples=32,
+        stride_samples=16,
+        max_history_samples=256,
+    )
+    for subject in loaded.dataset.subjects:
+        indices = loaded.dataset.window_indices_for_subjects(
+            windows,
+            [subject],
+        )
+        eligible = np.intersect1d(
+            indices,
+            plan.anchor_window_indices,
+            assume_unique=True,
+        )
+        assert set(windows.label[eligible]) == {0, 1}
+    with pytest.raises(ValueError, match="unavailable"):
+        resolve_sensor_channel_indices(
+            "ankle",
+            loaded.dataset.channel_names,
+        )
+
+
+def test_event_metrics_use_evaluated_nonfog_coverage_and_split_gaps() -> None:
+    record = Record(
+        record_id="record",
+        subject_id="S01",
+        run_id="R01",
+        x=np.ones((40, 3), dtype=np.float32),
+        y=np.zeros(40, dtype=np.int8),
+        valid=np.ones(40, dtype=bool),
+    )
+    dataset = DaphnetDataset(
+        root=".",
+        records=[record],
+        sampling_rate_hz=4,
+        channel_names=("a", "b", "c"),
+    )
+    windows = WindowTable(
+        record_index=np.zeros(4, dtype=np.int32),
+        start=np.asarray([0, 1, 10, 11], dtype=np.int32),
+        target_start=np.asarray([0, 1, 10, 11], dtype=np.int32),
+        target_end=np.asarray([2, 3, 12, 13], dtype=np.int32),
+        label=np.zeros(4, dtype=np.int8),
+        fog_fraction=np.zeros(4, dtype=np.float32),
+        clean_normal=np.ones(4, dtype=bool),
+    )
+    metrics = event_metrics(
+        dataset,
+        windows,
+        np.arange(4, dtype=np.int64),
+        np.ones(4, dtype=np.int8),
+        minimum_positive_windows=2,
+        merge_gap_seconds=0.5,
+    )
+    evaluated_seconds = 6.0 / 4.0
+    assert metrics["event_metric_version"] == "coverage_aware.v2"
+    assert metrics["predicted_events"] == 2
+    assert metrics["false_alarm_events"] == 2
+    assert metrics["evaluated_nonfog_hours"] == pytest.approx(
+        evaluated_seconds / 3600.0
+    )
+    assert metrics["false_alarm_events_per_hour"] == pytest.approx(
+        2.0 / (evaluated_seconds / 3600.0)
     )
