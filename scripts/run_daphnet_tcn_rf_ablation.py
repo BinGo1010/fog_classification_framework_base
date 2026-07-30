@@ -1245,6 +1245,9 @@ def train_classifier_resumable(
         dropout=args.classifier_dropout,
         dilations=dilations,
     ).to(device)
+    reference_initial_state = fold_config.get("_reference_initial_state")
+    if reference_initial_state is not None:
+        model.load_state_dict(reference_initial_state, strict=True)
     initial_state_sha = state_dict_sha256(model.state_dict())
     if initial_state_sha != fold_config["reference_initial_state_sha256"]:
         raise AssertionError(
@@ -1308,7 +1311,10 @@ def train_classifier_resumable(
     history: list[dict] = []
     elapsed_before = 0.0
     if args.resume and last_path.exists():
-        payload = torch.load(last_path, map_location=device, weights_only=False)
+        # Keep RNG state tensors on CPU.  Loading the whole checkpoint directly
+        # onto CUDA makes torch.set_rng_state reject the saved CPU RNG tensor
+        # during an interrupted multi-GPU resume.
+        payload = torch.load(last_path, map_location="cpu", weights_only=False)
         validate_rf_checkpoint(
             payload,
             protocol_fingerprint=config["protocol_fingerprint"],
