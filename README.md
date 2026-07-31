@@ -31,6 +31,15 @@ pip install -e .
 python run.py --config configs/default.yaml
 ```
 
+## Daphnet GRU-H200 Residual Feasibility
+
+The staged causal normal-forecast/residual-fusion experiment is available at
+`scripts/run_daphnet_gru_residual_feasibility.py`. It implements Phase 0/1/2
+screening and leakage-safe Phase 3A/3B subject cross-fitting without modifying
+the completed H200 source suite. See the
+[Chinese runbook](docs/DAPHNET_GRU_RESIDUAL_FEASIBILITY_RUNBOOK.md) for commands,
+gates, resume behavior, and output layout.
+
 Run the unified experiment template:
 
 ```bash
