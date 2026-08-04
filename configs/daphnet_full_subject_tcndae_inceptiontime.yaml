@@ -1,0 +1,80 @@
+experiment: daphnet_full_subject_tcndae_inceptiontime_v1
+subjects: [S01, S02, S03, S05, S06, S07, S08, S09]
+sampling_rate_hz: 64
+window_samples: 128
+stride_samples: 64
+outer_protocol:
+  multi_record: leave one complete valid record out
+  single_record: five chronological blocks with five-second purge
+inner_protocol:
+  folds: 3
+  record_first: true
+  time_block_purge_seconds: 5
+  oof_residual_required: true
+nbm:
+  architecture: hierarchical_noncausal_tcndae
+  input_shape: [batch, 9, 128]
+  latent_shape: [batch, 32, 32]
+  stem_channels: 48
+  encoder_channels: [48, 64, 96]
+  encoder_dilations: [[1, 2], [1, 2, 4], [1, 2, 4, 8]]
+  decoder_dilations: [[1, 2, 4], [1, 2, 4], [1, 2]]
+  dropout: 0.10
+  normalization: GroupNorm
+  activation: GELU
+  downsampling: two stride-2 convolutions
+  upsampling: linear interpolation followed by convolution
+  output_activation: null
+  training_population: strict-clean Non-FoG from outer training only
+  loss: L4
+  seed: 20260802
+  optimizer: AdamW
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  batch_size: 64
+  maximum_epochs: 2000
+  patience: 100
+classifier:
+  architecture: inceptiontime_6module
+  input_layout: [batch, channel, time]
+  modules: 6
+  residual_after_modules: [3, 6]
+  bottleneck_channels: 32
+  branch_channels: 32
+  kernel_sizes: [9, 19, 39]
+  final_pooling: global_average
+  optimizer: AdamW
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  batch_size: 128
+  maximum_epochs: 50
+  patience: 8
+  seeds: [20260802, 20260803, 20260804]
+methods:
+  B0: {name: Raw-InceptionTime, channels: 9}
+  B1: {name: TCNDAE-R-InceptionTime, channels: 9}
+  B2: {name: TCNDAE-R5-InceptionTime, channels: 27}
+  B3: {name: Raw+TCNDAE-R5-InceptionTime, channels: 36}
+parallel_execution:
+  recommended_devices: [cuda:0, cuda:1, cuda:2, cuda:3, cuda:4, cuda:5, cuda:6, cuda:7]
+  process_model: one_process_per_gpu
+  fold_assignment: greedy_lpt_by_outer_train_windows
+  cpu_threads_per_worker: 2
+  worker_retries: 2
+resume:
+  tcndae_checkpoint_every_epochs: 1
+  classifier_checkpoint_every_epochs: 1
+  atomic_checkpoint_replace: true
+  restored_tcndae_state: [model, optimizer, best_model, early_stopping, dataloader_shuffle, torch_rng, cuda_rng]
+  completed_run_skip_requires: [run_metrics.json, test_predictions.csv]
+statistics:
+  unit: subject
+  bootstrap_samples: 10000
+  paired_test: Wilcoxon signed-rank
+  multiplicity: Holm
+leakage_policy:
+  outer_test_used_for_scaler: false
+  outer_test_used_for_tcndae_training: false
+  outer_test_used_for_early_stopping: false
+  outer_test_used_for_threshold: false
+  classifier_training_residuals_are_oof: true
