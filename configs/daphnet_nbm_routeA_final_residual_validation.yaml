@@ -1,0 +1,67 @@
+experiment:
+  name: daphnet_nbm_routeA_final_residual_validation_v1
+  subjects: [S01, S02, S05, S06, S07, S08, S09]
+  seeds: [20260802, 20260803, 20260804]
+  stage_order: [A0, A1, A2, A3, A4, A5, A6, A7]
+  stop_when_previous_gate_fails: true
+
+protocol:
+  sampling_rate_hz: 64
+  window_samples: 128
+  window_seconds: 2
+  stride_samples: 64
+  stride_seconds: 1
+  fog_guard_seconds_each_side: 1
+  endpoint_label_seconds: 0.5
+  endpoint_fog_fraction_threshold: 0.5
+  preprocessor: P0_current
+  scaler_fit_scope: unique_raw_points_covered_by_training_clean_nonfog_windows
+  window_axis_centering: true
+
+splits:
+  fixed_record_holdout_subjects: [S01, S05, S06, S08, S09]
+  temporal_block_subjects: [S02, S07]
+  temporal_ratios: [0.60, 0.20, 0.20]
+  temporal_gap_seconds: 5
+  frozen_record_holdouts:
+    S01: S01_seg002
+    S05: S05_seg005
+    S06: S06_seg002
+    S08: S08_seg003
+    S09: S09_seg004
+
+A1:
+  architecture: M3_tcdae_long
+  parameter_count: 64633
+  training_input: clean_nonfog
+  training_target: same_clean_nonfog
+  loss: MSE
+  optimizer: AdamW
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  batch_size: 64
+  maximum_epochs: 2000
+  patience: 100
+  gradient_clip_norm: 1.0
+  baselines: [zero_output, training_mean_template, nearest_training_window]
+  run_gate:
+    minimum_zero_improvement_percent_exclusive: 20
+    minimum_template_improvement_percent_exclusive: 10
+    minimum_pearson: 0.50
+    maximum_nrmse: 0.85
+    maximum_nrmse_p90: 1.30
+    maximum_negative_improvement_window_fraction: 0.20
+  subject_gate:
+    minimum_seed_passes: 2
+    total_seeds: 3
+  overall_gate:
+    minimum_subject_passes: 5
+    maximum_waveform_collapse_subjects: 2
+  waveform_collapse_definition:
+    minimum_pearson: 0.20
+    amplitude_ratio: [0.50, 1.50]
+    minimum_zero_improvement_percent_exclusive: 0
+
+interpretation_boundary: >-
+  A1 evaluates unseen-record or unseen-time-block clean Non-FoG reconstruction.
+  Later residual and classifier stages may run only if the preceding gate passes.

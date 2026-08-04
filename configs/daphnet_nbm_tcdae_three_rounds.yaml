@@ -1,0 +1,73 @@
+experiment:
+  name: daphnet_nbm_tcdae_three_rounds_v1
+  representatives: [S01, S03, S05, S07]
+  all_subjects: [S01, S02, S03, S05, S06, S07, S08, S09]
+  seed: 20260802
+
+round1:
+  preprocessors: [P0_current, P1_no_window_centering, P2_clip_only]
+  sample_count: 1
+  model: M1_tcdae_base
+  optimizer: Adam
+  learning_rate: 0.001
+  weight_decay: 0.0
+  max_epochs: 3000
+  loss: MSE
+
+round2:
+  models: [M0_gru_baseline, M1_tcdae_base, M2_tcdae_wide, M3_tcdae_long]
+  sample_counts: [1, 8]
+  optimizer: Adam
+  learning_rate: 0.001
+  weight_decay: 0.0
+  max_epochs: 3000
+  loss: MSE
+  review_seeds: [20260802, 20260803, 20260804]
+  revised_gate:
+    preserve_original_strict_gate: true
+    structure_feasibility:
+      minimum_primary_seed_passes: 3
+      minimum_median_improvement_percent: 95
+      minimum_median_pearson: 0.90
+      maximum_median_nrmse: 0.35
+      maximum_amplitude_collapse_subjects: 1
+      minimum_median_raw_latent_distance_correlation: 0.70
+    engineering_progression:
+      minimum_strict_pass_rate: 0.90
+      safety_floor:
+        minimum_improvement_percent: 95
+        minimum_pearson: 0.80
+        maximum_nrmse: 0.60
+        amplitude_ratio: [0.75, 1.25]
+        minimum_raw_latent_distance_correlation: 0.50
+      aggregate_medians:
+        minimum_improvement_percent: 98
+        minimum_pearson: 0.95
+        maximum_nrmse: 0.30
+        amplitude_ratio: [0.85, 1.15]
+        minimum_raw_latent_distance_correlation: 0.70
+      boundary_failure:
+        maximum_failed_strict_metrics: 1
+        maximum_relative_threshold_excess: 0.20
+    m3_review:
+      subjects: [S01, S03, S05, S07]
+      sample_count: 8
+      seeds: [20260802, 20260803, 20260804]
+
+round3:
+  sample_counts: [1, 8, 32]
+  optional_sample_count: 128
+  seeds: [20260802, 20260803, 20260804]
+  optimizer: AdamW
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  max_epochs: 2000
+  patience: 100
+  loss: MSE
+
+fixed:
+  sampling_rate_hz: 64
+  input_shape: [batch, 128, 9]
+  augmentation: false
+  gradient_clip_norm: 1.0
+  evaluation_set_equals_training_set: true

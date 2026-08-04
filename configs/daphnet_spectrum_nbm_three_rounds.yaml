@@ -1,0 +1,104 @@
+experiment:
+  name: daphnet_spectrum_nbm_three_rounds_v1
+  purpose: independent-record clean Non-FoG spectral reconstruction and residual analysis
+  subjects: [S01, S02, S03, S05, S06, S07, S08, S09]
+  real_subject_mapping_note: Daphnet S04 and S10 contain no annotated FoG and are excluded
+  recommended_training_runs: 106
+
+data:
+  sampling_rate_hz: 64
+  channels: 9
+  window_samples: 128
+  stride_samples: 64
+  endpoint_label_samples: 32
+  fog_guard_before_seconds: 2
+  fog_guard_after_seconds: 1
+  split_priority: complete record, then non-overlapping contiguous time blocks
+  train_and_validation_pool: clean Non-FoG only
+  test_pool: all valid windows from frozen test record
+  scaler: per-subject channel RobustScaler fitted on clean training windows only
+  spectrum: log1p(abs(rfft(periodic_hann*x))**2 / sum(periodic_hann**2))
+  full_spectrum_shape: [9, 65]
+  cropped_spectrum:
+    range_hz: [0.5, 12.0]
+    shape: [9, 24]
+  task_metadata: unavailable in released Daphnet txt files
+
+round1:
+  subjects: [S03, S06, S01]
+  subsets_per_subject: 3
+  windows_per_subset: 32
+  energy_quartile_counts: {Q1: 8, Q2: 8, Q3: 8, Q4: 8}
+  subsets_disjoint: true
+  prefer_single_record: true
+  model: 585 -> 128 -> 32 -> 128 -> 585
+  losses:
+    A0_mse: MSE
+    A1_balanced_smoothl1: clipped sqrt inverse-energy window weighting with SmoothL1
+  optimizer: Adam
+  learning_rate: 1.0e-3
+  batch_size: 32
+  max_epochs: 3000
+  early_stopping: false
+  scheduler: none
+  gradient_clip: null
+  dropout: 0
+  batch_norm: false
+  weight_decay: 0
+  augmentation: false
+  seed: 20260803
+  runs: 18
+  gate:
+    q1_p90_improvement_min_pct: 20
+    q3_q4_degradation_max_pct: 10
+    output_target_std_ratio: [0.9, 1.1]
+    passing_subsets_per_subject: 2
+    passing_subjects: 2
+
+round2:
+  model: 585 -> 128 -> 32 -> 128 -> 585
+  loss: selected_by_round1
+  optimizer: Adam
+  learning_rate: 1.0e-3
+  batch_size: 128
+  max_epochs: 300
+  early_stopping:
+    metric: validation_NMAE_floor
+    patience: 30
+  scheduler: ReduceLROnPlateau
+  gradient_clip_norm: 1.0
+  dropout: 0
+  weight_decay: 0
+  augmentation: false
+  seeds: [20260803, 20260804, 20260805]
+  runs: 24
+
+round3:
+  common_training: same_as_round2
+  screening_seed: 20260803
+  screening_runs: 32
+  supplement_top_models: 2
+  supplement_seeds: [20260804, 20260805]
+  supplement_runs: 32
+  total_runs: 64
+  models:
+    B0_gru65:
+      input: {range_hz: [0.0, 32.0], bins: 65, representation: log-power}
+      backbone: frequency-axis GRU(9,64) plus MLP decoder
+    B1_mlp24:
+      input: {range_hz: [0.5, 12.0], bins: 24, representation: log-power}
+      backbone: 216 -> 128 -> 32 -> 128 -> 216
+    B2_conv24:
+      input: {range_hz: [0.5, 12.0], bins: 24, representation: log-power}
+      backbone: exact-length frequency Conv-AE
+    B3_shape_energy_conv24:
+      input: {range_hz: [0.5, 12.0], bins: 24, representation: normalized power shape plus log energy}
+      backbone: dual-head exact-length frequency Conv-AE
+
+reproducibility:
+  deterministic: true
+  seeds: [20260803, 20260804, 20260805]
+  save_checkpoints: true
+  save_predictions: true
+  save_histories: true
+  overwrite_existing_runs: false

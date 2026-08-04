@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,8 @@ import torch
 
 
 CHECKPOINT_FORMAT_VERSION = 1
+ATOMIC_REPLACE_ATTEMPTS = 30
+ATOMIC_REPLACE_MAX_DELAY_SECONDS = 0.5
 
 
 def canonical_fingerprint(payload: Any) -> str:
@@ -71,6 +74,21 @@ def _temporary_path(path: Path, suffix: str) -> Path:
     return path.with_name(f".{path.name}.tmp-{os.getpid()}-{suffix}")
 
 
+def _replace_with_retry(temporary: Path, path: Path) -> None:
+    """Replace an artifact, tolerating short-lived Windows scanner locks."""
+
+    delay = 0.01
+    for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            if attempt + 1 >= ATOMIC_REPLACE_ATTEMPTS:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2.0, ATOMIC_REPLACE_MAX_DELAY_SECONDS)
+
+
 def atomic_torch_save(payload: dict, path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -78,7 +96,7 @@ def atomic_torch_save(payload: dict, path: str | Path) -> None:
     torch.save(payload, temporary)
     with temporary.open("rb+") as handle:
         os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    _replace_with_retry(temporary, path)
 
 
 def atomic_json_dump(payload: Any, path: str | Path) -> None:
@@ -95,7 +113,7 @@ def atomic_json_dump(payload: Any, path: str | Path) -> None:
         )
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    _replace_with_retry(temporary, path)
 
 
 def atomic_npz_save(path: str | Path, compressed: bool = True, **arrays: Any) -> None:
@@ -108,7 +126,7 @@ def atomic_npz_save(path: str | Path, compressed: bool = True, **arrays: Any) ->
         np.savez(temporary, **arrays)
     with temporary.open("rb+") as handle:
         os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    _replace_with_retry(temporary, path)
 
 
 def capture_rng_state() -> dict[str, Any]:

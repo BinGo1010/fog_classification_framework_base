@@ -1,0 +1,59 @@
+experiment: daphnet_nbm_zero_shot_causal_waveform_context_v1
+template: C:/Users/bin/Downloads/Daphnet_NBM_zero_shot_causal_waveform_context_experiment_template.md
+parent_a1: outputs/daphnet_nbm_routeA_final_residual_validation_v1/routeA_final_residual_validation
+parent_a1b: outputs/daphnet_nbm_routeA_A1b_generalization_repair_v1/routeA_A1b_generalization_repair
+subjects: [S01, S02, S05, S06, S07, S08, S09]
+seeds: [20260802, 20260803, 20260804]
+zero_shot_policy:
+  scaler_fit: training clean Non-FoG unique points only
+  test_nonfog_calibration: false
+  test_fog_used_for_selection: false
+  decoder_fine_tuning: false
+  future_samples_in_main_context: false
+model:
+  architecture: M3_tcdae_long
+  channels: 9
+  target_samples: 128
+  parameter_count: 64633
+losses:
+  L0: MSE
+  L1: per-channel normalized MSE
+  L2: 0.8 MSE + 0.2 correlation
+  L3: 0.70 MSE + 0.15 correlation + 0.15 first-difference MSE
+  L4: 0.70 Huber + 0.15 correlation + 0.15 first-difference MSE
+  L5: 0.60 MSE + 0.15 correlation + 0.15 first-difference MSE + 0.10 log-spectrum L1
+contexts:
+  W0:
+    input_samples: 128
+    target: last 128 samples
+    causal: true
+  W1_causal:
+    input_samples: 256
+    target: last 128 samples
+    causal: true
+  W2_causal:
+    input_samples: 384
+    target: last 128 samples
+    causal: true
+  W1_center_upper_bound:
+    input_samples: 256
+    target: central 128 samples
+    causal: false
+    selection_eligible: false
+training:
+  optimizer: AdamW
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  batch_size: 64
+  maximum_epochs: 2000
+  patience: 100
+  gradient_clip_norm: 1.0
+gate:
+  zero_improvement_pct_strictly_greater_than: 20
+  template_improvement_pct_strictly_greater_than: 10
+  median_pearson_at_least: 0.50
+  median_nrmse_at_most: 0.85
+  nrmse_p90_at_most: 1.30
+  negative_improvement_fraction_at_most: 0.20
+  subject_seed_passes_at_least: 2
+  overall_subject_passes_at_least: 5

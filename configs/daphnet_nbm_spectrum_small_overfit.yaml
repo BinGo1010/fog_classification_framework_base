@@ -1,0 +1,48 @@
+experiment:
+  name: daphnet_nbm_spectrum_small_overfit_v1
+  purpose: diagnostic memorization of small clean Non-FoG log-power spectra
+  subjects: [S01, S02, S03, S05, S06, S07, S08, S09]
+  sample_counts: [1, 8, 32]
+  models: [mlp_ae, current_nbm]
+
+data:
+  sampling_rate_hz: 64
+  channels: 9
+  window_samples: 128
+  stride_samples: 64
+  fog_guard_before_seconds: 2
+  fog_guard_after_seconds: 1
+  source_pool: frozen within-subject training split
+  selection: longest stable Non-FoG intervals, uniformly sampled without overlap
+  task_metadata: unavailable in released Daphnet txt files
+  raw_scaler: per-run channel RobustScaler fitted on unique selected raw points
+  spectrum: log1p(abs(rfft(hann*x))**2 / sum(hann**2))
+  spectrum_shape: [9, 65]
+  spectral_standardization: false
+
+models:
+  mlp_ae:
+    architecture: 585 -> 256 -> 64 -> 256 -> 585
+  current_nbm:
+    architecture: frequency-axis GRU(9,64) -> Linear(64,128) -> GELU -> Linear(128,585)
+  dropout: 0
+  output_activation: linear
+
+training:
+  optimizer: Adam
+  learning_rate: 1.0e-3
+  weight_decay: 0
+  batch_size: full selected subset
+  max_epochs: 3000
+  early_stopping: false
+  target_stop_patience_epochs: 50
+  gradient_clip: null
+  augmentation: false
+  loss: MSE
+  seed: 20260803
+  deterministic: true
+
+thresholds:
+  N1: {nmae_max: 0.01, cosine_min: 0.995}
+  N8: {nmae_max: 0.03, cosine_min: 0.990, mean_template_improvement_min_pct: 90}
+  N32: {nmae_max: 0.05, cosine_min: 0.980, mean_template_improvement_min_pct: 80}

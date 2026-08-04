@@ -1,0 +1,46 @@
+experiment: daphnet_nbm_routeA_A2_A4_v1
+template: C:/Users/bin/Downloads/Daphnet_NBM_routeA_final_residual_validation_template.md
+parent_experiment: outputs/daphnet_nbm_routeA_A1b_generalization_repair_v1/routeA_A1b_generalization_repair
+subjects: [S01, S05, S07, S08, S09]
+diagnostic_only_subjects: [S02, S06]
+seeds: [20260802, 20260803, 20260804]
+frozen_model:
+  architecture: M3_tcdae_long
+  calibration: C0
+  loss: L4
+  context: W0
+  input_samples: 128
+denoising:
+  D0: {clean: 1.0}
+  D1: {clean: 0.7, gaussian_std_0p01_0p03: 0.3}
+  D2: {clean: 0.6, continuous_mask_8_16: 0.4}
+  D3: {clean: 0.2, gaussian_std_0p01_0p03: 0.4, continuous_mask_8_16: 0.3, single_axis_short_mask: 0.1}
+  test_conditions: [clean, gaussian_0p01, gaussian_0p03, mask_8, mask_16, single_axis_mask]
+training:
+  optimizer: AdamW
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  batch_size: 64
+  maximum_epochs: 2000
+  patience: 100
+  gradient_clip_norm: 1.0
+a2_gate:
+  clean_nrmse_relative_degradation_at_most: 0.10
+  clean_pearson_absolute_decline_at_most: 0.05
+  corruption_conditions_better_than_D0_at_least: 3
+  clean_nrmse_p90_no_worse_than_D0: true
+  subject_clean_preservation_passes_at_least: 4
+  amplitude_safe_range: [0.5, 1.5]
+  fallback_if_no_denoising_scheme_passes: D0
+residual_calibration:
+  methods: [C0, C1, C2]
+  sigma_min: 0.05
+  clips: [none, 6, 12]
+  selection_subjects: [S01, S05, S08, S09]
+  sparse_validation_diagnostic_subjects: [S07]
+representations: [R0, R1, R2, R3, R4, R5, R6]
+leakage_policy:
+  a2_selection: test clean Non-FoG plus synthetic corruptions only
+  a3_a4_selection: validation Non-FoG/FoG only
+  final_report: test Non-FoG/FoG after configuration freeze
+  test_fog_used_for_selection: false

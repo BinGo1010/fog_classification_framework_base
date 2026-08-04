@@ -1,0 +1,47 @@
+experiment: daphnet_nbm_routeA_A1b_generalization_repair_v1
+template: C:/Users/bin/Downloads/Daphnet_NBM_RouteA_A1b_generalization_repair_template.md
+parent_experiment: outputs/daphnet_nbm_routeA_final_residual_validation_v1/routeA_final_residual_validation
+subjects: [S01, S02, S05, S06, S07, S08, S09]
+original_pass_subjects: [S01, S07, S08]
+original_fail_subjects: [S02, S05, S06, S09]
+seeds: [20260802, 20260803, 20260804]
+data_policy:
+  training: clean Non-FoG from frozen A1 train split only
+  early_stopping: clean Non-FoG from frozen A1 calibration split only
+  deployment_calibration: early reliable clean Non-FoG from the frozen A1 test record/time block
+  final_evaluation: clean Non-FoG windows disjoint from calibration samples with a 5-second guard
+  test_fog_used: false
+model:
+  architecture: M3_tcdae_long
+  base_input_samples: 128
+  channels: 9
+  latent: [48, 32]
+training:
+  optimizer: AdamW
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  batch_size: 64
+  maximum_epochs: 2000
+  patience: 100
+  gradient_clip_norm: 1.0
+calibration:
+  durations_seconds: [10, 20, 30, 60]
+  methods: [C0, C1, C2, C3]
+  c4_epochs: [5, 10, 20]
+  c4_learning_rate: 0.0001
+  c4_weight_decay: 0.0
+losses: [L0, L1, L2, L3, L4]
+contexts:
+  W0: 128
+  W1: 256
+  W2: 384
+gate:
+  zero_improvement_pct_strictly_greater_than: 20
+  template_improvement_pct_strictly_greater_than: 10
+  median_pearson_at_least: 0.50
+  median_nrmse_at_most: 0.85
+  nrmse_p90_at_most: 1.30
+  negative_improvement_window_fraction_at_most: 0.20
+  subject_seed_passes_at_least: 2
+  overall_subject_passes_at_least: 5
+  waveform_collapse_subjects_at_most: 2

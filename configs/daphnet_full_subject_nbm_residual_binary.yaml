@@ -1,0 +1,64 @@
+experiment: daphnet_full_subject_nbm_residual_binary_v1
+template: C:/Users/bin/Downloads/Daphnet_full_subject_NBM_residual_binary_classification_experiment_outline.md
+subjects: [S01, S02, S03, S05, S06, S07, S08, S09]
+a1_pass_subjects: [S01, S05, S07, S08, S09]
+difficult_subjects: [S02, S03, S06]
+sampling_rate_hz: 64
+window_samples: 128
+stride_samples: 64
+label_rule: final 32 samples FoG fraction at least 0.5
+pure_nonfog_guard_seconds: 5
+outer_protocol:
+  multi_record: leave one complete valid record out
+  single_record: five chronological blocks with five-second purge
+inner_protocol:
+  folds: 3
+  record_first: true
+  time_block_purge_seconds: 5
+  oof_residual_required: true
+nbm:
+  architecture: M3_tcdae_long
+  input_samples: 128
+  loss: L4
+  calibration: C0
+  denoising: D0
+  seed: 20260802
+  optimizer: AdamW
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  batch_size: 64
+  maximum_epochs: 2000
+  patience: 100
+classifier:
+  architecture: fixed_tcn
+  hidden_channels: 64
+  kernel_size: 5
+  dilations: [1, 2, 4, 8]
+  dropout: 0.2
+  normalization: GroupNorm
+  activation: GELU
+  optimizer: AdamW
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  batch_size: 128
+  maximum_epochs: 50
+  patience: 8
+  gradient_clip_norm: 1.0
+  seeds: [20260802, 20260803, 20260804]
+methods:
+  B0: {name: Raw-TCN, channels: 9}
+  B1: {name: R-TCN, channels: 9}
+  B2: {name: R5-TCN, channels: 27}
+  B3: {name: Raw+R5-TCN, channels: 36}
+statistics:
+  unit: subject
+  bootstrap_samples: 10000
+  bootstrap_seed: 20260804
+  paired_test: Wilcoxon signed-rank
+  multiplicity: Holm
+leakage_policy:
+  test_record_used_for_scaler: false
+  test_record_used_for_nbm_training: false
+  test_record_used_for_early_stopping: false
+  test_record_used_for_threshold: false
+  tcn_training_residuals_are_oof: true
