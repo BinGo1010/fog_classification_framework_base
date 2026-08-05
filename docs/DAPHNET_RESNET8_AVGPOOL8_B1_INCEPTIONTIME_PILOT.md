@@ -62,3 +62,27 @@ python scripts/run_daphnet_resnet8_avgpool8_b1_inceptiontime_pilot.py --finalize
 ```
 
 The final report is written to `reports/b1_resnet8_avgpool8_inceptiontime_pilot_report.md` under the output root.
+
+## Seven-GPU launcher
+
+The repository includes a seven-GPU launcher. It assigns one mutually exclusive
+outer-fold shard to each GPU, waits for all seven processes, and then performs
+the final CPU aggregation:
+
+```bash
+chmod +x scripts/launch_daphnet_resnet8_avgpool8_b1_7gpu.sh
+PYTHON_BIN=/path/to/conda/env/bin/python \
+  scripts/launch_daphnet_resnet8_avgpool8_b1_7gpu.sh
+```
+
+To keep it running after an SSH disconnect:
+
+```bash
+nohup env PYTHON_BIN=/path/to/conda/env/bin/python \
+  bash scripts/launch_daphnet_resnet8_avgpool8_b1_7gpu.sh \
+  > resnet8_avgpool8_b1_7gpu.manager.log 2>&1 &
+```
+
+Shard 0 and shard 1 receive five outer folds each; shards 2-6 receive four folds
+each. Logs are stored in `OUTPUT_ROOT/logs`. Rerunning the same launcher resumes
+incomplete NBM/InceptionTime training and skips completed runs.
