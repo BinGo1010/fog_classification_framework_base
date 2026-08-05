@@ -83,6 +83,8 @@ nohup env PYTHON_BIN=/path/to/conda/env/bin/python \
   > resnet8_avgpool8_b1_7gpu.manager.log 2>&1 &
 ```
 
-Shard 0 and shard 1 receive five outer folds each; shards 2-6 receive four folds
-each. Logs are stored in `OUTPUT_ROOT/logs`. Rerunning the same launcher resumes
-incomplete NBM/InceptionTime training and skips completed runs.
+Each worker is restricted to one physical GPU with `CUDA_VISIBLE_DEVICES` and
+uses that GPU internally as `--device cuda`. Shard 0 and shard 1 receive five
+outer folds each; shards 2-6 receive four folds each. Logs are stored in
+`OUTPUT_ROOT/logs`. Rerunning the same launcher resumes incomplete
+NBM/InceptionTime training and skips completed runs.

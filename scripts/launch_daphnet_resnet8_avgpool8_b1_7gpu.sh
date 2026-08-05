@@ -11,8 +11,9 @@ mkdir -p "$LOG_DIR"
 
 pids=()
 for gpu in 0 1 2 3 4 5 6; do
-  "$PYTHON_BIN" scripts/run_daphnet_resnet8_avgpool8_b1_inceptiontime_pilot.py \
-    --device "cuda:$gpu" \
+  CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" \
+    scripts/run_daphnet_resnet8_avgpool8_b1_inceptiontime_pilot.py \
+    --device cuda \
     --shard-index "$gpu" \
     --shard-count 7 \
     --output-root "$OUTPUT_ROOT" \
