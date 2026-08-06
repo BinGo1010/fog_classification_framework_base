@@ -160,7 +160,11 @@ def configure_plotting() -> None:
     )
 
 
-def plot_confusion_matrices(overall: pd.DataFrame, output_stem: Path) -> None:
+def plot_confusion_matrices(
+    overall: pd.DataFrame,
+    output_stem: Path,
+    figure_title: str = "Raw + InceptionTime: train, validation and outer-test confusion matrices",
+) -> None:
     configure_plotting()
     main = overall.loc[overall["split"].isin(["train", "validation", "test"])].copy()
     main["split"] = pd.Categorical(
@@ -217,7 +221,7 @@ def plot_confusion_matrices(overall: pd.DataFrame, output_stem: Path) -> None:
             fontweight="bold",
             va="top",
         )
-    fig.suptitle("Raw + InceptionTime: train, validation and outer-test confusion matrices", fontsize=10)
+    fig.suptitle(figure_title, fontsize=10)
     output_stem.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_stem.with_suffix(".png"), dpi=300, bbox_inches="tight")
     fig.savefig(output_stem.with_suffix(".tiff"), dpi=600, bbox_inches="tight")
@@ -235,11 +239,15 @@ def matrix_markdown(row: pd.Series) -> str:
     )
 
 
-def write_report(overall: pd.DataFrame, output_path: Path) -> None:
+def write_report(
+    overall: pd.DataFrame,
+    output_path: Path,
+    method_title: str = "Raw + InceptionTime",
+) -> None:
     main_order = ["train", "validation", "test", "official_test_seed_median"]
     indexed = overall.set_index("split")
     lines = [
-        "# Raw + InceptionTime三集合混淆矩阵与主指标",
+        f"# {method_title}三集合混淆矩阵与主指标",
         "",
         "## 统计口径",
         "",
