@@ -1,0 +1,638 @@
+{
+  "protocol_id": "CA-SUPCON-SUBJECT-V1",
+  "subject_id": "S08",
+  "seed": 2026,
+  "started_utc": "2026-08-06T10:27:09.295552+00:00",
+  "methods": {
+    "S0": {
+      "protocol_id": "CA-SUPCON-SUBJECT-V1",
+      "method": "S0",
+      "seed": 2026,
+      "threshold_source": "validation only; maximize balanced accuracy, tie by F1 then higher threshold",
+      "selected_threshold": 0.15000000000000002,
+      "training_selection": {
+        "best_epoch": 1,
+        "best_validation_pr_auc": 0.6527762153630899,
+        "loss": "unweighted BCEWithLogitsLoss",
+        "sampling": "natural",
+        "sampler_audit": {
+          "sampling": "natural class prevalence"
+        }
+      },
+      "validation": {
+        "threshold": 0.15000000000000002,
+        "n": 85,
+        "n_normal": 59,
+        "n_fog": 26,
+        "accuracy": 0.6705882352941176,
+        "balanced_accuracy": 0.7089308996088657,
+        "precision": 0.4772727272727273,
+        "sensitivity": 0.8076923076923077,
+        "specificity": 0.6101694915254238,
+        "f1": 0.6,
+        "mcc": 0.3853249077513327,
+        "auroc": 0.7359843546284224,
+        "auprc": 0.6527762153630899,
+        "tn": 36,
+        "fp": 23,
+        "fn": 5,
+        "tp": 21,
+        "confusion_matrix": [
+          [
+            36,
+            23
+          ],
+          [
+            5,
+            21
+          ]
+        ]
+      },
+      "test": {
+        "threshold": 0.15000000000000002,
+        "n": 106,
+        "n_normal": 71,
+        "n_fog": 35,
+        "accuracy": 0.2641509433962264,
+        "balanced_accuracy": 0.3348088531187122,
+        "precision": 0.2345679012345679,
+        "sensitivity": 0.5428571428571428,
+        "specificity": 0.1267605633802817,
+        "f1": 0.3275862068965517,
+        "mcc": -0.3659885063155652,
+        "auroc": 0.27887323943661974,
+        "auprc": 0.23722446213099635,
+        "tn": 9,
+        "fp": 62,
+        "fn": 16,
+        "tp": 19,
+        "confusion_matrix": [
+          [
+            9,
+            62
+          ],
+          [
+            16,
+            19
+          ]
+        ]
+      },
+      "test_event": {
+        "event_definition": "record_id + original overlapping_event_ids",
+        "total_fog_events_with_pure_windows": 3,
+        "detected_fog_events": 2,
+        "fog_event_sensitivity": 0.6666666666666666,
+        "mean_detection_latency_sec": 0.0,
+        "false_positive_episodes": 5,
+        "nonfog_exposure_hours_unique_union": 0.020277777777777777,
+        "false_alarms_per_hour": 246.57534246575344,
+        "false_positive_windows_per_hour": 3057.534246575343,
+        "events": [
+          {
+            "event_id": "S08_seg000:fog_event:0",
+            "detected": true,
+            "latency_sec": 0.0,
+            "n_pure_fog_windows": 20
+          },
+          {
+            "event_id": "S08_seg002:fog_event:0",
+            "detected": true,
+            "latency_sec": 0.0,
+            "n_pure_fog_windows": 1
+          },
+          {
+            "event_id": "S08_seg003:fog_event:2",
+            "detected": false,
+            "latency_sec": null,
+            "n_pure_fog_windows": 14
+          }
+        ]
+      },
+      "representation": {
+        "split": "test",
+        "feature": "TCN-M pooled h (not projection z)",
+        "fog_intra_class_distance": 24.802515029907227,
+        "nonfog_intra_class_distance": 18.886489868164062,
+        "class_center_distance": 11.739043235778809,
+        "between_to_within_ratio": 0.5373911931922737
+      },
+      "scaler": {
+        "definition": "median and IQR fitted on training windows only",
+        "center": [
+          0.14100000262260437,
+          0.9800000190734863,
+          0.32600000500679016,
+          -0.23600000143051147,
+          0.9350000023841858,
+          0.24199999868869781,
+          0.057999998331069946,
+          1.0,
+          -0.13500000536441803
+        ],
+        "scale": [
+          0.1420000046491623,
+          0.04899996519088745,
+          0.05900001525878906,
+          0.1549999862909317,
+          0.05500000715255737,
+          0.09100000560283661,
+          0.11599999666213989,
+          0.06699997186660767,
+          0.09700000286102295
+        ]
+      }
+    },
+    "S1": {
+      "protocol_id": "CA-SUPCON-SUBJECT-V1",
+      "method": "S1",
+      "seed": 2026,
+      "threshold_source": "validation only; maximize balanced accuracy, tie by F1 then higher threshold",
+      "selected_threshold": 0.19,
+      "training_selection": {
+        "best_epoch": 1,
+        "best_validation_pr_auc": 0.5443015734756707,
+        "loss": "unweighted BCEWithLogitsLoss",
+        "sampling": "event_aware_1_to_1",
+        "sampler_audit": {
+          "hierarchy": "class -> event_or_nonfog_segment -> window",
+          "batch_size": 32,
+          "windows_per_class": 16,
+          "max_windows_per_group": 4,
+          "target_min_groups_per_class": 4,
+          "actual_groups": {
+            "0": 16,
+            "1": 9
+          },
+          "steps_per_epoch": 15
+        }
+      },
+      "validation": {
+        "threshold": 0.19,
+        "n": 85,
+        "n_normal": 59,
+        "n_fog": 26,
+        "accuracy": 0.6823529411764706,
+        "balanced_accuracy": 0.7604302477183833,
+        "precision": 0.49019607843137253,
+        "sensitivity": 0.9615384615384616,
+        "specificity": 0.559322033898305,
+        "f1": 0.6493506493506493,
+        "mcc": 0.4899023840894728,
+        "auroc": 0.7773794002607562,
+        "auprc": 0.5443015734756707,
+        "tn": 33,
+        "fp": 26,
+        "fn": 1,
+        "tp": 25,
+        "confusion_matrix": [
+          [
+            33,
+            26
+          ],
+          [
+            1,
+            25
+          ]
+        ]
+      },
+      "test": {
+        "threshold": 0.19,
+        "n": 106,
+        "n_normal": 71,
+        "n_fog": 35,
+        "accuracy": 0.3113207547169811,
+        "balanced_accuracy": 0.43521126760563383,
+        "precision": 0.2978723404255319,
+        "sensitivity": 0.8,
+        "specificity": 0.07042253521126761,
+        "f1": 0.43410852713178294,
+        "mcc": -0.1923260558454502,
+        "auroc": 0.3183098591549296,
+        "auprc": 0.26813320188078527,
+        "tn": 5,
+        "fp": 66,
+        "fn": 7,
+        "tp": 28,
+        "confusion_matrix": [
+          [
+            5,
+            66
+          ],
+          [
+            7,
+            28
+          ]
+        ]
+      },
+      "test_event": {
+        "event_definition": "record_id + original overlapping_event_ids",
+        "total_fog_events_with_pure_windows": 3,
+        "detected_fog_events": 3,
+        "fog_event_sensitivity": 1.0,
+        "mean_detection_latency_sec": 0.0,
+        "false_positive_episodes": 2,
+        "nonfog_exposure_hours_unique_union": 0.020277777777777777,
+        "false_alarms_per_hour": 98.63013698630138,
+        "false_positive_windows_per_hour": 3254.7945205479455,
+        "events": [
+          {
+            "event_id": "S08_seg000:fog_event:0",
+            "detected": true,
+            "latency_sec": 0.0,
+            "n_pure_fog_windows": 20
+          },
+          {
+            "event_id": "S08_seg002:fog_event:0",
+            "detected": true,
+            "latency_sec": 0.0,
+            "n_pure_fog_windows": 1
+          },
+          {
+            "event_id": "S08_seg003:fog_event:2",
+            "detected": true,
+            "latency_sec": 0.0,
+            "n_pure_fog_windows": 14
+          }
+        ]
+      },
+      "representation": {
+        "split": "test",
+        "feature": "TCN-M pooled h (not projection z)",
+        "fog_intra_class_distance": 24.517372131347656,
+        "nonfog_intra_class_distance": 19.73557472229004,
+        "class_center_distance": 11.702502250671387,
+        "between_to_within_ratio": 0.5288914335750915
+      },
+      "scaler": {
+        "definition": "median and IQR fitted on training windows only",
+        "center": [
+          0.14100000262260437,
+          0.9800000190734863,
+          0.32600000500679016,
+          -0.23600000143051147,
+          0.9350000023841858,
+          0.24199999868869781,
+          0.057999998331069946,
+          1.0,
+          -0.13500000536441803
+        ],
+        "scale": [
+          0.1420000046491623,
+          0.04899996519088745,
+          0.05900001525878906,
+          0.1549999862909317,
+          0.05500000715255737,
+          0.09100000560283661,
+          0.11599999666213989,
+          0.06699997186660767,
+          0.09700000286102295
+        ]
+      }
+    },
+    "S2": {
+      "protocol_id": "CA-SUPCON-SUBJECT-V1",
+      "method": "S2",
+      "seed": 2026,
+      "threshold_source": "validation only; maximize balanced accuracy, tie by F1 then higher threshold",
+      "selected_threshold": 0.27,
+      "training_selection": {
+        "encoder": {
+          "selection_split": "validation only",
+          "primary_metric": "linear-probe PR-AUC",
+          "tie_breaker": "linear-probe FoG F1, then lower temperature",
+          "candidates": [
+            {
+              "temperature": 0.1,
+              "encoder_epoch": 1,
+              "validation_pr_auc": 0.23836037479845934,
+              "validation_f1": 0.07142857142857142,
+              "validation_threshold": 0.5700000000000001,
+              "linear_probe": {
+                "best_epoch": 1,
+                "best_validation_pr_auc": 0.23836037479845934,
+                "sampling": "natural"
+              },
+              "sampler_audit": {
+                "hierarchy": "class -> event_or_nonfog_segment -> window",
+                "batch_size": 32,
+                "windows_per_class": 16,
+                "max_windows_per_group": 4,
+                "target_min_groups_per_class": 4,
+                "actual_groups": {
+                  "0": 16,
+                  "1": 9
+                },
+                "steps_per_epoch": 15
+              }
+            }
+          ],
+          "selected_temperature": 0.1,
+          "selected_encoder_epoch": 1
+        },
+        "frozen_encoder": true,
+        "projection_head_discarded": true,
+        "classifier": {
+          "best_epoch": 1,
+          "best_validation_pr_auc": 0.6385066009394411,
+          "sampling": "natural"
+        },
+        "loss": "unweighted BCEWithLogitsLoss"
+      },
+      "validation": {
+        "threshold": 0.27,
+        "n": 85,
+        "n_normal": 59,
+        "n_fog": 26,
+        "accuracy": 0.6470588235294118,
+        "balanced_accuracy": 0.7027379400260756,
+        "precision": 0.4583333333333333,
+        "sensitivity": 0.8461538461538461,
+        "specificity": 0.559322033898305,
+        "f1": 0.5945945945945946,
+        "mcc": 0.37683933103467465,
+        "auroc": 0.7542372881355933,
+        "auprc": 0.6385066009394411,
+        "tn": 33,
+        "fp": 26,
+        "fn": 4,
+        "tp": 22,
+        "confusion_matrix": [
+          [
+            33,
+            26
+          ],
+          [
+            4,
+            22
+          ]
+        ]
+      },
+      "test": {
+        "threshold": 0.27,
+        "n": 106,
+        "n_normal": 71,
+        "n_fog": 35,
+        "accuracy": 0.6132075471698113,
+        "balanced_accuracy": 0.6605633802816901,
+        "precision": 0.45161290322580644,
+        "sensitivity": 0.8,
+        "specificity": 0.5211267605633803,
+        "f1": 0.5773195876288659,
+        "mcc": 0.306490848754216,
+        "auroc": 0.6835010060362172,
+        "auprc": 0.5099362212244068,
+        "tn": 37,
+        "fp": 34,
+        "fn": 7,
+        "tp": 28,
+        "confusion_matrix": [
+          [
+            37,
+            34
+          ],
+          [
+            7,
+            28
+          ]
+        ]
+      },
+      "test_event": {
+        "event_definition": "record_id + original overlapping_event_ids",
+        "total_fog_events_with_pure_windows": 3,
+        "detected_fog_events": 2,
+        "fog_event_sensitivity": 0.6666666666666666,
+        "mean_detection_latency_sec": 0.0,
+        "false_positive_episodes": 11,
+        "nonfog_exposure_hours_unique_union": 0.020277777777777777,
+        "false_alarms_per_hour": 542.4657534246576,
+        "false_positive_windows_per_hour": 1676.7123287671234,
+        "events": [
+          {
+            "event_id": "S08_seg000:fog_event:0",
+            "detected": true,
+            "latency_sec": 0.0,
+            "n_pure_fog_windows": 20
+          },
+          {
+            "event_id": "S08_seg002:fog_event:0",
+            "detected": false,
+            "latency_sec": null,
+            "n_pure_fog_windows": 1
+          },
+          {
+            "event_id": "S08_seg003:fog_event:2",
+            "detected": true,
+            "latency_sec": 0.0,
+            "n_pure_fog_windows": 14
+          }
+        ]
+      },
+      "representation": {
+        "split": "test",
+        "feature": "TCN-M pooled h (not projection z)",
+        "fog_intra_class_distance": 24.956525802612305,
+        "nonfog_intra_class_distance": 20.37852668762207,
+        "class_center_distance": 12.734216690063477,
+        "between_to_within_ratio": 0.5617823732665382
+      },
+      "scaler": {
+        "definition": "median and IQR fitted on training windows only",
+        "center": [
+          0.14100000262260437,
+          0.9800000190734863,
+          0.32600000500679016,
+          -0.23600000143051147,
+          0.9350000023841858,
+          0.24199999868869781,
+          0.057999998331069946,
+          1.0,
+          -0.13500000536441803
+        ],
+        "scale": [
+          0.1420000046491623,
+          0.04899996519088745,
+          0.05900001525878906,
+          0.1549999862909317,
+          0.05500000715255737,
+          0.09100000560283661,
+          0.11599999666213989,
+          0.06699997186660767,
+          0.09700000286102295
+        ]
+      }
+    },
+    "S3": {
+      "protocol_id": "CA-SUPCON-SUBJECT-V1",
+      "method": "S3",
+      "seed": 2026,
+      "threshold_source": "validation only; maximize balanced accuracy, tie by F1 then higher threshold",
+      "selected_threshold": 0.49,
+      "training_selection": {
+        "encoder": {
+          "selection_split": "validation only",
+          "primary_metric": "linear-probe PR-AUC",
+          "tie_breaker": "linear-probe FoG F1, then lower temperature",
+          "candidates": [
+            {
+              "temperature": 0.1,
+              "encoder_epoch": 1,
+              "validation_pr_auc": 0.23836037479845934,
+              "validation_f1": 0.07142857142857142,
+              "validation_threshold": 0.5700000000000001,
+              "linear_probe": {
+                "best_epoch": 1,
+                "best_validation_pr_auc": 0.23836037479845934,
+                "sampling": "natural"
+              },
+              "sampler_audit": {
+                "hierarchy": "class -> event_or_nonfog_segment -> window",
+                "batch_size": 32,
+                "windows_per_class": 16,
+                "max_windows_per_group": 4,
+                "target_min_groups_per_class": 4,
+                "actual_groups": {
+                  "0": 16,
+                  "1": 9
+                },
+                "steps_per_epoch": 15
+              }
+            }
+          ],
+          "selected_temperature": 0.1,
+          "selected_encoder_epoch": 1
+        },
+        "frozen_encoder": true,
+        "projection_head_discarded": true,
+        "classifier": {
+          "best_epoch": 1,
+          "best_validation_pr_auc": 0.7393541590832753,
+          "sampling": "event_aware_1_to_1"
+        },
+        "loss": "unweighted BCEWithLogitsLoss"
+      },
+      "validation": {
+        "threshold": 0.49,
+        "n": 85,
+        "n_normal": 59,
+        "n_fog": 26,
+        "accuracy": 0.7764705882352941,
+        "balanced_accuracy": 0.7959582790091264,
+        "precision": 0.5945945945945946,
+        "sensitivity": 0.8461538461538461,
+        "specificity": 0.7457627118644068,
+        "f1": 0.6984126984126984,
+        "mcc": 0.5501127211888819,
+        "auroc": 0.8598435462842243,
+        "auprc": 0.7393541590832753,
+        "tn": 44,
+        "fp": 15,
+        "fn": 4,
+        "tp": 22,
+        "confusion_matrix": [
+          [
+            44,
+            15
+          ],
+          [
+            4,
+            22
+          ]
+        ]
+      },
+      "test": {
+        "threshold": 0.49,
+        "n": 106,
+        "n_normal": 71,
+        "n_fog": 35,
+        "accuracy": 0.6698113207547169,
+        "balanced_accuracy": 0.6448692152917506,
+        "precision": 0.5,
+        "sensitivity": 0.5714285714285714,
+        "specificity": 0.7183098591549296,
+        "f1": 0.5333333333333333,
+        "mcc": 0.281104201280092,
+        "auroc": 0.6903420523138832,
+        "auprc": 0.4533672702617728,
+        "tn": 51,
+        "fp": 20,
+        "fn": 15,
+        "tp": 20,
+        "confusion_matrix": [
+          [
+            51,
+            20
+          ],
+          [
+            15,
+            20
+          ]
+        ]
+      },
+      "test_event": {
+        "event_definition": "record_id + original overlapping_event_ids",
+        "total_fog_events_with_pure_windows": 3,
+        "detected_fog_events": 2,
+        "fog_event_sensitivity": 0.6666666666666666,
+        "mean_detection_latency_sec": 0.0,
+        "false_positive_episodes": 7,
+        "nonfog_exposure_hours_unique_union": 0.020277777777777777,
+        "false_alarms_per_hour": 345.2054794520548,
+        "false_positive_windows_per_hour": 986.3013698630137,
+        "events": [
+          {
+            "event_id": "S08_seg000:fog_event:0",
+            "detected": true,
+            "latency_sec": 0.0,
+            "n_pure_fog_windows": 20
+          },
+          {
+            "event_id": "S08_seg002:fog_event:0",
+            "detected": false,
+            "latency_sec": null,
+            "n_pure_fog_windows": 1
+          },
+          {
+            "event_id": "S08_seg003:fog_event:2",
+            "detected": true,
+            "latency_sec": 0.0,
+            "n_pure_fog_windows": 14
+          }
+        ]
+      },
+      "representation": {
+        "split": "test",
+        "feature": "TCN-M pooled h (not projection z)",
+        "fog_intra_class_distance": 24.956525802612305,
+        "nonfog_intra_class_distance": 20.37852668762207,
+        "class_center_distance": 12.734216690063477,
+        "between_to_within_ratio": 0.5617823732665382
+      },
+      "scaler": {
+        "definition": "median and IQR fitted on training windows only",
+        "center": [
+          0.14100000262260437,
+          0.9800000190734863,
+          0.32600000500679016,
+          -0.23600000143051147,
+          0.9350000023841858,
+          0.24199999868869781,
+          0.057999998331069946,
+          1.0,
+          -0.13500000536441803
+        ],
+        "scale": [
+          0.1420000046491623,
+          0.04899996519088745,
+          0.05900001525878906,
+          0.1549999862909317,
+          0.05500000715255737,
+          0.09100000560283661,
+          0.11599999666213989,
+          0.06699997186660767,
+          0.09700000286102295
+        ]
+      }
+    }
+  },
+  "completed_utc": "2026-08-06T10:27:29.934732+00:00"
+}

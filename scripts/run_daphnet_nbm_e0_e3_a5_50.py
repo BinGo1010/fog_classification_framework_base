@@ -1821,14 +1821,28 @@ def e2_gate(e1: dict[str, Any], e2: dict[str, Any]) -> dict[str, Any]:
     e2_by_run = {
         (row["subject_id"], int(row["seed"])): row for row in e2["test_rows"]
     }
-    differential = []
+    differential_by_subject: dict[str, list[float]] = {}
     for key in sorted(set(e1_by_run) & set(e2_by_run)):
+        subject = key[0]
+        if subject not in FORMAL_SUBJECTS:
+            continue
         left, right = e1_by_run[key], e2_by_run[key]
-        differential.append(
+        value = (
             (float(right["fog_p50"]) - float(left["fog_p50"]))
             - (float(right["nonfog_p50"]) - float(left["nonfog_p50"]))
         )
-    differential_gain = float(np.median(differential)) if differential else math.nan
+        if np.isfinite(value):
+            differential_by_subject.setdefault(subject, []).append(float(value))
+    differential_subject_medians = {
+        subject: float(np.median(values))
+        for subject, values in differential_by_subject.items()
+        if values
+    }
+    differential_gain = (
+        float(np.median(list(differential_subject_medians.values())))
+        if differential_subject_medians
+        else math.nan
+    )
     e1_shift = subject_medians(e1["shift_rows"], "shift_robust")
     e2_shift = subject_medians(e2["shift_rows"], "shift_robust")
     common_shift = sorted(set(e1_shift) & set(e2_shift))
@@ -1852,9 +1866,22 @@ def e2_gate(e1: dict[str, Any], e2: dict[str, Any]) -> dict[str, Any]:
         "auroc_improved_subjects": auroc_improved,
         "cliffs_delta_improved_subjects": delta_improved,
         "median_differential_fog_minus_nonfog_error_gain": differential_gain,
+        "differential_gain_subjects": len(differential_subject_medians),
+        "differential_gain_positive_subjects": sum(
+            value > 0.0 for value in differential_subject_medians.values()
+        ),
+        "differential_gain_by_formal_subject": differential_subject_medians,
+        "differential_gain_aggregation": (
+            "formal subjects only; median across seeds within subject, then median across subjects; "
+            "diagnostic and clean-control subjects excluded"
+        ),
         "nonfog_shift_ratio_vs_E1": shift_ratio,
         "maximum_allowed_shift_ratio": 1.10,
-        "mechanism_note": "FoG-vs-Non-FoG error asymmetry is also reported per run in fog_nonfog_reconstruction_gap.csv",
+        "mechanism_note": (
+            "FoG-vs-Non-FoG error asymmetry is also reported per run in "
+            "fog_nonfog_reconstruction_gap.csv; subjects without FoG remain in V1/Non-FoG "
+            "safety analyses but are excluded from this FoG-dependent gate"
+        ),
     }
 
 

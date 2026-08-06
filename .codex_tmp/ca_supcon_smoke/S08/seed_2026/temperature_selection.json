@@ -1,0 +1,33 @@
+{
+  "selection_split": "validation only",
+  "primary_metric": "linear-probe PR-AUC",
+  "tie_breaker": "linear-probe FoG F1, then lower temperature",
+  "candidates": [
+    {
+      "temperature": 0.1,
+      "encoder_epoch": 1,
+      "validation_pr_auc": 0.23836037479845934,
+      "validation_f1": 0.07142857142857142,
+      "validation_threshold": 0.5700000000000001,
+      "linear_probe": {
+        "best_epoch": 1,
+        "best_validation_pr_auc": 0.23836037479845934,
+        "sampling": "natural"
+      },
+      "sampler_audit": {
+        "hierarchy": "class -> event_or_nonfog_segment -> window",
+        "batch_size": 32,
+        "windows_per_class": 16,
+        "max_windows_per_group": 4,
+        "target_min_groups_per_class": 4,
+        "actual_groups": {
+          "0": 16,
+          "1": 9
+        },
+        "steps_per_epoch": 15
+      }
+    }
+  ],
+  "selected_temperature": 0.1,
+  "selected_encoder_epoch": 1
+}

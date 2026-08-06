@@ -1,0 +1,73 @@
+experiment:
+  id: CA-SUPCON-SUBJECT-V1
+  question: single-subject FoG class-imbalance mechanism validation
+  formal_subjects: [S01, S02, S05, S06, S07, S08, S09]
+  diagnostic_only_subjects: [S03]
+  excluded_clean_only_controls: [S04, S10]
+  seeds: [2026, 2027, 2028]
+
+data:
+  dataset: processed_CA_pure
+  manifest: ca_window_manifest.csv
+  window_samples: 128
+  sampling_rate_hz: 64
+  stride_samples: 64
+  label_rule:
+    fog: fog_samples_in_2s == 128
+    nonfog: fog_samples_in_2s == 0
+    excluded: 1 <= fog_samples_in_2s <= 127
+  split_source: frozen ca_split column
+  random_resplit: false
+  normalization: train-only channel-wise median/IQR RobustScaler
+
+model:
+  encoder: TCN-M
+  input_shape: [batch, 9, 128]
+  hidden_channels: 48
+  dilations: [1, 2, 4, 8]
+  pooled_feature_dim: 96
+  projection_head: [96, 128, 64]
+  projection_activation: GELU
+  projection_dropout: 0.20
+  projection_l2_normalization: true
+
+sampling:
+  batch_size: 32
+  balanced_windows_per_class: 16
+  hierarchy: class -> original FoG event or virtual 20-s Non-FoG segment -> window
+  minimum_groups_per_class_per_batch: 4
+  maximum_windows_per_group_per_batch: 4
+  validation_and_test: natural prevalence
+
+methods:
+  S0: natural sampling + unweighted BCE
+  S1: event-aware 1:1 sampling + unweighted BCE
+  S2: CA-SupCon encoder + frozen natural-ratio linear head
+  S3: same selected S2 encoder + reinitialized frozen balanced linear head
+  forbidden_first_round_additions: [NBM, GAN, SMOTE, domain adaptation, complex augmentation]
+
+optimization:
+  optimizer: AdamW
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  supervised_epochs: 50
+  supcon_epochs: 60
+  classifier_epochs: 50
+  early_stopping_patience: 10
+  early_stopping_metric: validation PR-AUC
+  temperatures: [0.07, 0.10, 0.20]
+  temperature_selection: validation linear-probe PR-AUC, then FoG F1
+  threshold_selection: validation balanced accuracy, then FoG F1, then higher threshold
+  test_used_for_selection: false
+
+server:
+  strategy: one independent subject per GPU, no cross-subject DDP
+  gpu_mapping:
+    0: S01
+    1: S02
+    2: S05
+    3: S06
+    4: S07
+    5: S08
+    6: S09
+

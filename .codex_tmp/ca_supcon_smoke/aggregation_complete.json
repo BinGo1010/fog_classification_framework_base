@@ -1,0 +1,12 @@
+{
+  "protocol_id": "CA-SUPCON-SUBJECT-V1",
+  "subjects": [
+    "S08"
+  ],
+  "seeds": [
+    2026
+  ],
+  "n_test_runs": 4,
+  "warnings": [],
+  "completed_utc": "2026-08-06T10:29:23.214834+00:00"
+}

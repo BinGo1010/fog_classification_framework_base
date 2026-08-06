@@ -106,6 +106,73 @@ def test_saved_run_round_trip_supports_cross_shard_aggregation(tmp_path: Path) -
     assert np.array_equal(loaded.predicted["test_fog"], predicted["test_fog"])
 
 
+def test_e2_gate_excludes_diagnostic_and_clean_controls_from_fog_gain() -> None:
+    e1_test = []
+    e2_test = []
+    reconstruction = []
+    e1_shift = []
+    e2_shift = []
+    for subject in runner.FORMAL_SUBJECTS:
+        for seed in runner.SEEDS:
+            e1_test.append(
+                {
+                    "subject_id": subject,
+                    "seed": seed,
+                    "auroc": 0.60,
+                    "cliffs_delta": 0.20,
+                    "fog_p50": 2.0,
+                    "nonfog_p50": 1.0,
+                }
+            )
+            e2_test.append(
+                {
+                    "subject_id": subject,
+                    "seed": seed,
+                    "auroc": 0.65,
+                    "cliffs_delta": 0.40,
+                    "fog_p50": 2.2,
+                    "nonfog_p50": 1.0,
+                }
+            )
+            reconstruction.append(
+                {
+                    "subject_id": subject,
+                    "seed": seed,
+                    "pearson_median": 0.80,
+                    "nrmse_median": 0.30,
+                    "nrmse_p90": 0.70,
+                }
+            )
+            e1_shift.append({"subject_id": subject, "seed": seed, "shift_robust": 1.0})
+            e2_shift.append({"subject_id": subject, "seed": seed, "shift_robust": 1.0})
+    for subject in (*runner.DIAGNOSTIC_SUBJECTS, *runner.CLEAN_CONTROLS):
+        for seed in runner.SEEDS:
+            e1_test.append(
+                {
+                    "subject_id": subject,
+                    "seed": seed,
+                    "auroc": np.nan,
+                    "cliffs_delta": np.nan,
+                    "fog_p50": np.nan,
+                    "nonfog_p50": np.nan,
+                }
+            )
+            e2_test.append(dict(e1_test[-1]))
+    gate = runner.e2_gate(
+        {"test_rows": e1_test, "shift_rows": e1_shift},
+        {
+            "test_rows": e2_test,
+            "shift_rows": e2_shift,
+            "reconstruction_rows": reconstruction,
+        },
+    )
+    assert gate["status"] == "PASS"
+    assert np.isclose(gate["median_differential_fog_minus_nonfog_error_gain"], 0.2)
+    assert gate["differential_gain_subjects"] == 7
+    assert gate["differential_gain_positive_subjects"] == 7
+    assert set(gate["differential_gain_by_formal_subject"]) == set(runner.FORMAL_SUBJECTS)
+
+
 def test_c1_mad_removes_channel_bias_and_uses_robust_scale() -> None:
     generator = np.random.default_rng(4)
     residual = generator.laplace(size=(20, 128, 9)).astype(np.float32)

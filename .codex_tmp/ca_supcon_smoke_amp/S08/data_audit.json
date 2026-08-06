@@ -1,0 +1,53 @@
+{
+  "protocol_id": "CA-SUPCON-SUBJECT-V1",
+  "subject_id": "S08",
+  "subject_scope": "formal_main7",
+  "manifest": "E:\\fog-merged\\dataset\\1.Daphnet Freezing of Gait Dataset\\processed_CA_pure\\ca_window_manifest.csv",
+  "dataset_protocol": {
+    "dataset_id": "daphnet_CA_pure",
+    "created_utc": "2026-08-06T10:15:32.246993+00:00",
+    "source_processed_ca": "E:\\fog-merged\\dataset\\1.Daphnet Freezing of Gait Dataset\\processed_CA",
+    "source_ca_window_manifest_sha256": "6fc11a18930089f3ffb41360f2169298a4f7f4990dc487751626d8ddd1274d00",
+    "sampling_rate_hz": 64,
+    "window_samples": 128,
+    "stride_samples": 64,
+    "pure_fog_rule": "fog_samples_in_2s == 128",
+    "pure_nonfog_rule": "fog_samples_in_2s == 0",
+    "mixed_boundary_rule": "remove windows with 1 <= fog_samples_in_2s <= 127",
+    "source_split_preserved": true,
+    "random_resplit": false,
+    "paired_ablation_ready": true
+  },
+  "split_frozen": true,
+  "random_resplit": false,
+  "scaler_fit_split": "train",
+  "splits": {
+    "train": {
+      "n_windows": 346,
+      "n_fog": 114,
+      "n_nonfog": 232,
+      "fog_fraction": 0.32947976878612717,
+      "n_fog_events": 9,
+      "n_nonfog_segments": 16,
+      "n_frozen_groups": 18
+    },
+    "validation": {
+      "n_windows": 85,
+      "n_fog": 26,
+      "n_nonfog": 59,
+      "fog_fraction": 0.3058823529411765,
+      "n_fog_events": 2,
+      "n_nonfog_segments": 3,
+      "n_frozen_groups": 3
+    },
+    "test": {
+      "n_windows": 106,
+      "n_fog": 35,
+      "n_nonfog": 71,
+      "fog_fraction": 0.330188679245283,
+      "n_fog_events": 3,
+      "n_nonfog_segments": 4,
+      "n_frozen_groups": 5
+    }
+  }
+}
