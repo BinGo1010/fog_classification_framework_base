@@ -135,6 +135,16 @@ def parse_seed_list(value: str) -> tuple[int, ...]:
     return seeds
 
 
+def parse_group_list(value: str) -> tuple[str, ...]:
+    groups = tuple(item.strip().upper() for item in value.split(",") if item.strip())
+    if not groups or len(groups) != len(set(groups)):
+        raise ValueError(f"invalid unique group list: {value}")
+    unknown = sorted(set(groups) - set(GROUPS))
+    if unknown:
+        raise ValueError(f"unknown residual-calibration groups: {unknown}")
+    return groups
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", required=True, choices=("train", "seal", "evaluate", "aggregate"))
@@ -159,6 +169,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fold", type=int, choices=FOLDS)
     parser.add_argument("--group", choices=GROUPS)
+    parser.add_argument(
+        "--groups",
+        default=",".join(GROUPS),
+        help="Comma-separated group set required by seal/aggregate (default: A,B,C,D).",
+    )
     parser.add_argument("--tcn-seed", type=int)
     parser.add_argument("--tcn-seeds", default="20260807,20260808,20260809")
     parser.add_argument("--device", default="auto")
@@ -181,6 +196,8 @@ def resolve_device(spec: str) -> torch.device:
 def require_job_args(args: argparse.Namespace) -> None:
     if args.fold is None or args.group is None or args.tcn_seed is None:
         raise ValueError(f"--fold, --group and --tcn-seed are required for {args.stage}")
+    if args.group not in parse_group_list(args.groups):
+        raise ValueError(f"job group {args.group} is not enabled by --groups={args.groups}")
 
 
 def job_id(fold: int, group: str, seed: int) -> str:
@@ -602,15 +619,18 @@ def run_train(args: argparse.Namespace, device: torch.device) -> None:
     )
 
 
-def expected_jobs(seeds: tuple[int, ...]) -> list[tuple[int, str, int]]:
-    return [(fold, group, seed) for fold in FOLDS for group in GROUPS for seed in seeds]
+def expected_jobs(
+    groups: tuple[str, ...], seeds: tuple[int, ...]
+) -> list[tuple[int, str, int]]:
+    return [(fold, group, seed) for fold in FOLDS for group in groups for seed in seeds]
 
 
 def run_seal(args: argparse.Namespace) -> None:
     seeds = parse_seed_list(args.tcn_seeds)
+    groups = parse_group_list(args.groups)
     output_root = args.output_root.resolve()
     entries = []
-    for fold, group, seed in expected_jobs(seeds):
+    for fold, group, seed in expected_jobs(groups, seeds):
         directory = job_directory(output_root, fold, group, seed)
         done = directory / "DONE_TRAIN.json"
         frozen_path = directory / "frozen_validation.json"
@@ -659,7 +679,7 @@ def run_seal(args: argparse.Namespace) -> None:
     barrier = {
         "status": "all_classifiers_and_thresholds_frozen",
         "created_utc": datetime.now(timezone.utc).isoformat(),
-        "groups": list(GROUPS),
+        "groups": list(groups),
         "folds": list(FOLDS),
         "tcn_seeds": list(seeds),
         "job_count": len(entries),
@@ -672,8 +692,8 @@ def run_seal(args: argparse.Namespace) -> None:
     write_json(
         output_root / "experiment_config.json",
         {
-            "experiment": "residual_calibration_window_centering_ABCD",
-            "groups": GROUP_CONFIG,
+            "experiment": "residual_calibration_window_centering_" + "".join(groups),
+            "groups": {group: GROUP_CONFIG[group] for group in groups},
             "input": "F=[r,abs(r),delta_t(r)] in [B,27,128]",
             "fixed_nbm_per_fold": True,
             "nbm_retrained": False,
@@ -684,7 +704,10 @@ def run_seal(args: argparse.Namespace) -> None:
             ),
             "roles": {str(key): value for key, value in ROLES.items()},
             "threshold": "roles 2/3 balanced accuracy; ties FoG F1 then higher threshold",
-            "test_gate": "all 36 checkpoints and thresholds frozen before any roles 0/1 access",
+            "test_gate": (
+                f"all {len(entries)} checkpoints and thresholds frozen before any "
+                "roles 0/1 access"
+            ),
         },
     )
     print(f"TRAINING BARRIER SEALED jobs={len(entries)}", flush=True)
@@ -863,12 +886,13 @@ def clip_rate_row(group: str, fold: Any, split: str, stats: dict[str, Any]) -> d
 
 def run_aggregate(args: argparse.Namespace) -> None:
     seeds = parse_seed_list(args.tcn_seeds)
+    groups = parse_group_list(args.groups)
     output_root = args.output_root.resolve()
     barrier_path = output_root / "TRAINING_BARRIER.json"
     if not barrier_path.exists():
         raise FileNotFoundError("cannot aggregate without TRAINING_BARRIER.json")
     results = []
-    for fold, group, seed in expected_jobs(seeds):
+    for fold, group, seed in expected_jobs(groups, seeds):
         directory = job_directory(output_root, fold, group, seed)
         metrics_path = directory / "metrics.json"
         done = directory / "DONE_TEST.json"
@@ -888,10 +912,10 @@ def run_aggregate(args: argparse.Namespace) -> None:
                 **{key: result["test"][key] for key in ("tn", "fp", "fn", "tp")},
             }
         )
-    write_csv(output_root / "run_metrics_36.csv", run_rows)
+    write_csv(output_root / f"run_metrics_{len(results)}.csv", run_rows)
 
     seed_macro_rows = []
-    for group in GROUPS:
+    for group in groups:
         for seed in seeds:
             subset = [
                 result for result in results
@@ -913,7 +937,7 @@ def run_aggregate(args: argparse.Namespace) -> None:
 
     summary_rows = []
     summary_json: dict[str, Any] = {}
-    for group in GROUPS:
+    for group in groups:
         group_rows = [row for row in seed_macro_rows if row["group"] == group]
         summary_json[group] = {}
         for key in METRIC_KEYS:
@@ -932,7 +956,7 @@ def run_aggregate(args: argparse.Namespace) -> None:
 
     subject_rows = []
     subject_summary_json: dict[str, Any] = {}
-    for group in GROUPS:
+    for group in groups:
         subject_summary_json[group] = {}
         for subject in SUBJECTS:
             seed_subject_rows = []
@@ -962,7 +986,7 @@ def run_aggregate(args: argparse.Namespace) -> None:
     write_csv(output_root / "subject_metrics_3seed_mean_std.csv", subject_rows)
 
     clip_by_fold_group: dict[tuple[str, int], dict[str, Any]] = {}
-    for group in GROUPS:
+    for group in groups:
         for fold in FOLDS:
             subset = [
                 result for result in results
@@ -973,7 +997,9 @@ def run_aggregate(args: argparse.Namespace) -> None:
                 raise AssertionError(f"clip statistics depend on TCN seed for {group}, fold {fold}")
             clip_by_fold_group[(group, fold)] = reference
     for fold in FOLDS:
-        if clip_by_fold_group[("A", fold)] != clip_by_fold_group[("B", fold)]:
+        if {"A", "B"}.issubset(groups) and (
+            clip_by_fold_group[("A", fold)] != clip_by_fold_group[("B", fold)]
+        ):
             raise AssertionError(f"A/B pre-centering clip rates differ in fold {fold}")
 
     split_names = (
@@ -1003,7 +1029,7 @@ def run_aggregate(args: argparse.Namespace) -> None:
                         }
                     )
     clip_group_summary: dict[str, Any] = {}
-    for group in GROUPS:
+    for group in groups:
         clip_group_summary[group] = {}
         for split in split_names:
             combined = combine_clip_statistics(
@@ -1026,7 +1052,7 @@ def run_aggregate(args: argparse.Namespace) -> None:
             "subject_metrics": subject_summary_json,
             "clip_rates": clip_group_summary,
             "run_count": len(results),
-            "groups": GROUP_CONFIG,
+            "groups": {group: GROUP_CONFIG[group] for group in groups},
             "tcn_seeds": list(seeds),
             "strict_global_test_barrier": True,
         },
@@ -1037,7 +1063,7 @@ def run_aggregate(args: argparse.Namespace) -> None:
             "status": "complete",
             "completed_utc": datetime.now(timezone.utc).isoformat(),
             "run_count": len(results),
-            "groups": list(GROUPS),
+            "groups": list(groups),
             "tcn_seeds": list(seeds),
         },
     )

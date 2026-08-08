@@ -9,6 +9,8 @@ from scripts.run_daphnet_residual_calibration_abcd import (
     barrier_job,
     build_abcd_features,
     combine_clip_statistics,
+    expected_jobs,
+    parse_group_list,
 )
 
 
@@ -88,3 +90,19 @@ def test_test_stage_rejects_missing_global_barrier() -> None:
     )
     with pytest.raises(FileNotFoundError, match="TRAINING_BARRIER.json missing"):
         barrier_job(args)
+
+
+def test_bc_group_subset_builds_exactly_eighteen_jobs() -> None:
+    groups = parse_group_list("B,C")
+    seeds = (20260807, 20260808, 20260809)
+    jobs = expected_jobs(groups, seeds)
+    assert groups == ("B", "C")
+    assert len(jobs) == 18
+    assert set(group for _, group, _ in jobs) == {"B", "C"}
+
+
+def test_group_subset_rejects_duplicates_and_unknown_names() -> None:
+    with pytest.raises(ValueError, match="unique group list"):
+        parse_group_list("B,B")
+    with pytest.raises(ValueError, match="unknown residual-calibration groups"):
+        parse_group_list("B,E")
