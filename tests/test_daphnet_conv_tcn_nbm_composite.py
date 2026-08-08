@@ -18,6 +18,18 @@ def test_composite_loss_is_near_zero_for_identical_nonconstant_signals() -> None
     assert float(components["total"]) < 1e-6
 
 
+def test_correlation_loss_has_finite_backward_for_constant_windows() -> None:
+    prediction = torch.zeros(4, 9, 128, requires_grad=True)
+    target = torch.zeros(4, 9, 128)
+    components = composite_reconstruction_loss(
+        prediction, target, CompositeLossConfig()
+    )
+    components["total"].backward()
+    assert torch.isfinite(components["total"])
+    assert prediction.grad is not None
+    assert torch.all(torch.isfinite(prediction.grad))
+
+
 def test_dynamic_augmentation_is_mutually_exclusive_and_resampled() -> None:
     clean = torch.ones(2000, 9, 128)
     config = DynamicAugmentationConfig()

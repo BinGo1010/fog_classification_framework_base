@@ -218,10 +218,23 @@ def composite_reconstruction_loss(
     prediction_centered = prediction - prediction.mean(dim=-1, keepdim=True)
     target_centered = target - target.mean(dim=-1, keepdim=True)
     numerator = torch.sum(prediction_centered * target_centered, dim=-1)
-    denominator = torch.sqrt(
-        torch.sum(prediction_centered.square(), dim=-1)
-        * torch.sum(target_centered.square(), dim=-1)
-    ).clamp_min(config.correlation_epsilon)
+    # Clamp each squared norm before sqrt. Clamping only after sqrt leaves the
+    # backward path through sqrt(0), which can create inf/NaN gradients for a
+    # constant prediction or target window even though the forward value is
+    # finite.
+    prediction_norm = torch.sqrt(
+        torch.sum(prediction_centered.square(), dim=-1).clamp_min(
+            config.correlation_epsilon
+        )
+    )
+    target_norm = torch.sqrt(
+        torch.sum(target_centered.square(), dim=-1).clamp_min(
+            config.correlation_epsilon
+        )
+    )
+    denominator = (prediction_norm * target_norm).clamp_min(
+        config.correlation_epsilon
+    )
     correlation = (numerator / denominator).clamp(-1.0, 1.0)
     correlation_loss = (1.0 - correlation).mean()
     prediction_difference = prediction[:, :, 1:] - prediction[:, :, :-1]
@@ -293,6 +306,16 @@ def train_nbm_composite(
             components = composite_reconstruction_loss(
                 model(corrupted), clean, loss_config
             )
+            if any(
+                not bool(torch.isfinite(value).item())
+                for value in components.values()
+            ):
+                values = {
+                    name: float(value.detach()) for name, value in components.items()
+                }
+                raise FloatingPointError(
+                    f"non-finite Conv-TCN NBM loss components: {values}"
+                )
             components["total"].backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             if not torch.isfinite(grad_norm):
