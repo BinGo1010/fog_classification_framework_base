@@ -658,11 +658,18 @@ def train_representation_tcn(
     max_epochs: int,
     patience: int,
     initial_state: dict[str, torch.Tensor],
+    reset_seed_after_loading: bool = False,
 ) -> tuple[nn.Module, dict[str, Any]]:
     set_seed(seed)
     input_channels = representation_channels(representation)
     model = RepresentationTCNM(input_channels).to(device)
     model.load_state_dict(initial_state)
+    if reset_seed_after_loading:
+        # Paired experiments with different input-channel counts consume a
+        # different number of random values during temporary model creation.
+        # Reset here so dropout and all subsequent stochastic operations start
+        # from the same seed as well as using the same DataLoader generator.
+        set_seed(seed)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     n_pos = int(np.sum(train_y == 1))
     n_neg = int(np.sum(train_y == 0))
