@@ -261,14 +261,24 @@ def load_frozen_nbm(
     payload = torch.load(checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(payload["model_state"])
     model.eval()
+    training = frozen["training"]
+    if "best_validation_loss" in training:
+        best_validation_loss = float(training["best_validation_loss"])
+        best_validation_metric = str(
+            training.get("selection_metric", "role5_validation_loss")
+        )
+    else:
+        best_validation_loss = float(training["best_validation_huber"])
+        best_validation_metric = "role5_validation_SmoothL1"
     manifest = {
         "fold": fold,
         "checkpoint": str(checkpoint.resolve()),
         "checkpoint_sha256": sha256_file(checkpoint),
         "frozen_json": str(frozen_path.resolve()),
         "frozen_json_sha256": sha256_file(frozen_path),
-        "best_epoch": int(frozen["training"]["best_epoch"]),
-        "best_validation_huber": float(frozen["training"]["best_validation_huber"]),
+        "best_epoch": int(training["best_epoch"]),
+        "best_validation_loss": best_validation_loss,
+        "best_validation_metric": best_validation_metric,
         "calibration_role": 5,
         "scaler_role": 4,
     }
