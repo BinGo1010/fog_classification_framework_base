@@ -228,9 +228,27 @@ def raw_features(scaler: RobustScaler, raw: np.ndarray) -> np.ndarray:
     bct = centered_scaled_bct(scaler, raw)
     if bct.shape[1:] != (9, 128):
         raise AssertionError(f"unexpected RAW tensor shape: {bct.shape}")
-    maximum_axis_mean = float(np.max(np.abs(bct.mean(axis=2))))
-    if maximum_axis_mean > 2e-6:
-        raise AssertionError(f"RAW per-window/per-axis centering failed: {maximum_axis_mean}")
+    if not np.all(np.isfinite(bct)):
+        raise FloatingPointError("RAW tensor contains NaN or infinity after scaling/centering")
+    # ``bct`` is intentionally float32 because it is the tensor sent to the
+    # classifier.  Summing 128 potentially large scaled values in float32 can
+    # leave a small apparent mean (observed around 1.6e-5) even though the
+    # window mean was subtracted correctly.  Recheck with float64 accumulation
+    # and use a scale-aware float32 tolerance so this audit catches genuine
+    # centering failures without rejecting ordinary round-off.
+    axis_means = np.mean(bct, axis=2, dtype=np.float64)
+    maximum_axis_mean = float(np.max(np.abs(axis_means)))
+    maximum_signal = float(np.max(np.abs(bct)))
+    centering_tolerance = max(
+        1e-5,
+        64.0 * float(np.finfo(np.float32).eps) * max(1.0, maximum_signal),
+    )
+    if maximum_axis_mean > centering_tolerance:
+        raise AssertionError(
+            "RAW per-window/per-axis centering failed: "
+            f"max_mean={maximum_axis_mean}, tolerance={centering_tolerance}, "
+            f"max_signal={maximum_signal}"
+        )
     return np.ascontiguousarray(bct.transpose(0, 2, 1), dtype=np.float32)
 
 

@@ -119,3 +119,6 @@ python -m pytest tests/test_daphnet_nbm300_c_vs_raw_ablation.py -q
 
 python scripts/launch_daphnet_nbm300_c_vs_raw_ablation_7gpu.py --dry-run
 ```
+
+Raw中心化审计使用float64重新累计均值，并采用与float32输入幅值相关的容差；
+该检查不会把约`1e-5`量级的正常舍入误差误判为中心化失败。
