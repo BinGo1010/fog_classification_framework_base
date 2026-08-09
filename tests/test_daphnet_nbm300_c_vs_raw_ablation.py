@@ -19,7 +19,13 @@ def test_raw_features_are_role4_scaled_then_window_axis_centered() -> None:
     expected -= expected.mean(axis=1, keepdims=True)
     assert actual.shape == (2, 128, 9)
     np.testing.assert_allclose(actual, expected, atol=1e-5)
-    np.testing.assert_allclose(actual.mean(axis=1), 0.0, atol=1e-5)
+    maximum_mean = float(np.max(np.abs(np.mean(actual, axis=1, dtype=np.float64))))
+    maximum_signal = float(np.max(np.abs(actual)))
+    tolerance = max(
+        1e-5,
+        64.0 * float(np.finfo(np.float32).eps) * max(1.0, maximum_signal),
+    )
+    assert maximum_mean <= tolerance
 
 
 def test_raw_features_accept_float32_centering_roundoff_at_large_scale() -> None:

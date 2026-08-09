@@ -2,7 +2,7 @@
 """Strict paired FULL-C versus RAW TCN ablation on processed_NBM.
 
 FULL_C
-    role-4 RobustScaler -> per-window/per-axis centering -> frozen Conv-TCN NBM
+    role-4 RobustScaler -> per-window/per-axis centering -> selected frozen NBM
     -> e=X-Xhat -> scheme-C r -> [r,abs(r),delta(r)] -> TCN [B,27,128].
 
 RAW
@@ -59,6 +59,11 @@ from scripts.run_daphnet_residual_calibration_abcd import (
     reconstruction_error,
     sha256_file,
 )
+from scripts.run_daphnet_s01_nonfog_gru_reconstruction_tcnm import (
+    GRUReconstructionNBM,
+    prepare_nbm_windows,
+    reconstruct as reconstruct_gru,
+)
 
 FOLDS = (0, 1, 2)
 METHODS = ("FULL_C", "RAW")
@@ -107,6 +112,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fold", type=int, choices=FOLDS)
     parser.add_argument("--method", choices=METHODS)
+    parser.add_argument("--nbm-kind", choices=("conv_tcn", "gru"), default="conv_tcn")
     parser.add_argument("--nbm-seed", type=int)
     parser.add_argument("--tcn-seed", type=int)
     parser.add_argument("--nbm-seeds", default="0,52,161")
@@ -173,11 +179,16 @@ def load_records_rows(data_dir: Path, fold: int) -> tuple[dict[str, Any], Any]:
     return records, rows
 
 
-def load_scaler_only(source_root: Path, fold: int) -> tuple[RobustScaler, dict[str, Any], dict[str, Any]]:
+def load_scaler_only(
+    source_root: Path,
+    fold: int,
+    nbm_kind: str,
+) -> tuple[RobustScaler, dict[str, Any], dict[str, Any]]:
     """Load only the role-4 scaler; do not instantiate NBM or read b/sigma."""
     fold_dir = source_root.resolve() / f"fold_{fold}"
     frozen_path = fold_dir / "nbm_frozen.json"
-    checkpoint = fold_dir / "checkpoints" / "conv_tcn_nbm_best.pt"
+    checkpoint_name = "conv_tcn_nbm_best.pt" if nbm_kind == "conv_tcn" else "gru_nbm_best.pt"
+    checkpoint = fold_dir / "checkpoints" / checkpoint_name
     if not frozen_path.exists() or not checkpoint.exists():
         raise FileNotFoundError(f"frozen NBM/scaler artifacts missing: {fold_dir}")
     frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
@@ -189,6 +200,7 @@ def load_scaler_only(source_root: Path, fold: int) -> tuple[RobustScaler, dict[s
     )
     manifest = {
         "fold": fold,
+        "nbm_kind": nbm_kind,
         "scaler_fit_role": int(frozen["scaler_fit_role"]),
         "scaler_unique_raw_points": int(frozen["scaler_unique_raw_points"]),
         "scaler_sha256": stable_json_hash(payload),
@@ -226,6 +238,11 @@ def validate_nbm_contract(frozen: dict[str, Any], args: argparse.Namespace) -> d
             args.nbm_seed is not None
             and int(training["seed"]) == args.nbm_seed
         ),
+        "architecture": (
+            str(training["architecture"]["name"]).startswith("conv_tcn")
+            if args.nbm_kind == "conv_tcn"
+            else str(training["architecture"]["name"]).startswith("gru_reconstruction")
+        ),
     }
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
@@ -239,7 +256,38 @@ def validate_nbm_contract(frozen: dict[str, Any], args: argparse.Namespace) -> d
         "checkpoint_rule": "lowest unaugmented role-5 validation SmoothL1",
         "all_checks_passed": True,
         "seed": args.nbm_seed,
+        "nbm_kind": args.nbm_kind,
     }
+
+
+def load_frozen_gru_nbm(
+    source_root: Path,
+    fold: int,
+    device: torch.device,
+) -> tuple[GRUReconstructionNBM, RobustScaler, np.ndarray, np.ndarray, dict[str, Any]]:
+    scaler, artifact, frozen = load_scaler_only(source_root, fold, "gru")
+    training = frozen["training"]
+    if training["architecture"]["name"] != "gru_reconstruction_nbm_v1":
+        raise AssertionError("unexpected frozen GRU-NBM architecture")
+    model = GRUReconstructionNBM(channels=9, hidden=64, bottleneck=16).to(device)
+    checkpoint = Path(artifact["nbm_checkpoint"])
+    payload = torch.load(checkpoint, map_location=device, weights_only=False)
+    model.load_state_dict(payload["model_state"])
+    model.eval()
+    calibration = frozen["calibration"]
+    bias = np.asarray(calibration["bias"], dtype=np.float32)
+    sigma = np.asarray(calibration["sigma"], dtype=np.float32)
+    if bias.shape != (9,) or sigma.shape != (9,) or np.any(sigma < 0.05):
+        raise AssertionError("invalid frozen GRU-NBM role-5 calibration")
+    manifest = {
+        **artifact,
+        "best_epoch": int(training["best_epoch"]),
+        "best_validation_loss": float(training["best_validation_huber"]),
+        "best_validation_metric": "role5_validation_SmoothL1",
+        "calibration_role": 5,
+        "scaler_role": 4,
+    }
+    return model, scaler, bias, sigma, manifest
 
 
 def raw_features(scaler: RobustScaler, raw: np.ndarray) -> np.ndarray:
@@ -279,6 +327,7 @@ def make_features(
     device: torch.device,
     nbm_source_root: Path,
     fold: int,
+    nbm_kind: str,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     if method == "RAW":
         values = raw_features(scaler, raw)
@@ -288,13 +337,23 @@ def make_features(
             "uses_nbm": False,
             "uses_role5_b_sigma": False,
             "uses_residual": False,
+            "removed_nbm_kind": nbm_kind,
         }
-    nbm, full_scaler, bias, sigma, nbm_manifest = load_frozen_nbm(
-        nbm_source_root, fold, device
-    )
+    if nbm_kind == "conv_tcn":
+        nbm, full_scaler, bias, sigma, nbm_manifest = load_frozen_nbm(
+            nbm_source_root, fold, device
+        )
+        error = reconstruction_error(nbm, full_scaler, raw, device)
+    else:
+        nbm, full_scaler, bias, sigma, nbm_manifest = load_frozen_gru_nbm(
+            nbm_source_root, fold, device
+        )
+        scaled = prepare_nbm_windows(full_scaler, raw, center=True)
+        reconstruction = reconstruct_gru(nbm, scaled, device)
+        error_ntc = (scaled - reconstruction).astype(np.float32, copy=False)
+        error = np.ascontiguousarray(error_ntc.transpose(0, 2, 1))
     if stable_json_hash(full_scaler.as_dict()) != stable_json_hash(scaler.as_dict()):
         raise AssertionError("FULL_C and RAW scalers differ")
-    error = reconstruction_error(nbm, full_scaler, raw, device)
     values, clip_stats = build_abcd_features(error, labels, "C", bias, sigma)
     del nbm, error
     if device.type == "cuda":
@@ -306,6 +365,7 @@ def make_features(
         "uses_role5_b_sigma": True,
         "uses_bias_b": False,
         "uses_sigma": True,
+        "nbm_kind": nbm_kind,
         "nbm": nbm_manifest,
         "clip_statistics": clip_stats,
     }
@@ -340,16 +400,16 @@ def run_train(args: argparse.Namespace, device: torch.device) -> None:
     role67 = rows.take_role(6, 7)
     role23 = rows.take_role(2, 3)
     scaler, artifact_manifest, frozen_nbm = load_scaler_only(
-        args.nbm_source_root, args.fold
+        args.nbm_source_root, args.fold, args.nbm_kind
     )
     nbm_contract = validate_nbm_contract(frozen_nbm, args)
     train_x, train_feature = make_features(
         args.method, scaler, raw_windows(records, role67), role67.label,
-        device, args.nbm_source_root, args.fold,
+        device, args.nbm_source_root, args.fold, args.nbm_kind,
     )
     validation_x, validation_feature = make_features(
         args.method, scaler, raw_windows(records, role23), role23.label,
-        device, args.nbm_source_root, args.fold,
+        device, args.nbm_source_root, args.fold, args.nbm_kind,
     )
     initial_state, initialization = paired_initialization(args.tcn_seed, args.method)
     representation = "r_abs_delta" if args.method == "FULL_C" else "r"
@@ -376,6 +436,7 @@ def run_train(args: argparse.Namespace, device: torch.device) -> None:
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "fold": args.fold,
         "method": args.method,
+        "nbm_kind": args.nbm_kind,
         "nbm_seed": args.nbm_seed,
         "tcn_seed": args.tcn_seed,
         "input_shape": train_feature["shape"],
@@ -440,6 +501,7 @@ def run_seal(args: argparse.Namespace) -> None:
         entries.append({
             "job_id": frozen["job_id"], "fold": fold, "method": method, "tcn_seed": seed,
             "nbm_seed": frozen["nbm_seed"],
+            "nbm_kind": frozen["nbm_kind"],
             "threshold": frozen["threshold"], "checkpoint_sha256": frozen["checkpoint_sha256"],
             "pair_id": frozen["initialization"]["pair_id"],
             "scaler_sha256": frozen["role4_scaler_artifact"]["scaler_sha256"],
@@ -461,6 +523,10 @@ def run_seal(args: argparse.Namespace) -> None:
                 raise AssertionError(f"fold {fold}, seed {seed} NBM/TCN seeds are not paired")
             if len({item["nbm_checkpoint_sha256"] for item in paired}) != 1:
                 raise AssertionError(f"fold {fold}, seed {seed} methods do not share one NBM")
+            if len({item["nbm_kind"] for item in paired}) != 1:
+                raise AssertionError(f"fold {fold}, seed {seed} NBM backbone mismatch")
+    if len({item["nbm_kind"] for item in entries}) != 1:
+        raise AssertionError("one experiment cannot mix NBM backbone kinds")
     if any(item["tcn_max_epochs"] != args.tcn_max_epochs for item in entries):
         raise AssertionError("TCN maximum epoch mismatch")
     if any(item["tcn_patience"] != args.tcn_patience for item in entries):
@@ -481,11 +547,12 @@ def run_seal(args: argparse.Namespace) -> None:
     }
     write_json(root / "TRAINING_BARRIER.json", barrier)
     write_json(root / "experiment_config.json", {
-        "experiment": "strict_paired_ConvTCN_NBM_schemeC_vs_centered_scaled_RAW_TCN",
+        "experiment": f"strict_paired_{entries[0]['nbm_kind']}_NBM_schemeC_vs_centered_scaled_RAW_TCN",
         "full": "role4 scaler + window-axis centering + NBM + scheme C [r,abs(r),delta] [B,27,128]",
         "ablation": "role4 scaler + window-axis centering + RAW [B,9,128]",
         "nbm": "max_epoch=300, patience=20, SmoothL1, lr=1e-3, augmentation=40% clean/40% Gaussian(std=.04)/20% mask",
         "paired_seeds": list(seeds),
+        "nbm_kind": entries[0]["nbm_kind"],
         "seed_policy": "exact seeds; no hidden fold offset",
         "tcn": f"max_epoch={args.tcn_max_epochs}, patience={args.tcn_patience}, paired seed/loader order",
         "roles": {str(key): value for key, value in ROLES.items()},
@@ -504,6 +571,8 @@ def sealed_job(args: argparse.Namespace) -> dict[str, Any]:
     matches = [item for item in barrier["jobs"] if item["job_id"] == target]
     if len(matches) != 1:
         raise AssertionError(f"job not sealed: {target}")
+    if matches[0]["nbm_kind"] != args.nbm_kind:
+        raise AssertionError("requested NBM backbone differs from the sealed experiment")
     return matches[0]
 
 
@@ -535,12 +604,14 @@ def run_evaluate(args: argparse.Namespace, device: torch.device) -> None:
     # The permanent test roles are first requested only after the global barrier.
     records, rows = load_records_rows(args.data_dir, args.fold)
     test_rows = rows.take_role(0, 1)
-    scaler, artifact_manifest, _ = load_scaler_only(args.nbm_source_root, args.fold)
+    scaler, artifact_manifest, _ = load_scaler_only(
+        args.nbm_source_root, args.fold, args.nbm_kind
+    )
     if artifact_manifest["scaler_sha256"] != sealed["scaler_sha256"]:
         raise AssertionError("sealed role-4 scaler changed")
     test_x, test_feature = make_features(
         args.method, scaler, raw_windows(records, test_rows), test_rows.label,
-        device, args.nbm_source_root, args.fold,
+        device, args.nbm_source_root, args.fold, args.nbm_kind,
     )
     input_channels = 27 if args.method == "FULL_C" else 9
     model = RepresentationTCNM(input_channels).to(device)
@@ -558,6 +629,7 @@ def run_evaluate(args: argparse.Namespace, device: torch.device) -> None:
         "job_id": sealed["job_id"], "completed_utc": datetime.now(timezone.utc).isoformat(),
         "fold": args.fold, "method": args.method, "tcn_seed": args.tcn_seed,
         "nbm_seed": args.nbm_seed,
+        "nbm_kind": args.nbm_kind,
         "threshold": threshold, "threshold_source_roles": [2, 3],
         "strict_global_test_barrier_verified": True, "test_roles": [0, 1],
         "test": metrics, "test_by_subject": by_subject,
@@ -617,7 +689,7 @@ def run_aggregate(args: argparse.Namespace) -> None:
             raise FileNotFoundError(f"test incomplete: {job_id(fold, method, seed)}")
         results.append(json.loads((directory / "metrics.json").read_text(encoding="utf-8")))
     run_rows = [{
-        "fold": r["fold"], "method": r["method"],
+        "fold": r["fold"], "method": r["method"], "nbm_kind": r["nbm_kind"],
         "nbm_seed": r["nbm_seed"], "tcn_seed": r["tcn_seed"],
         "threshold": r["threshold"],
         **{key: r["test"][key] for key in METRIC_KEYS},
@@ -677,6 +749,7 @@ def run_aggregate(args: argparse.Namespace) -> None:
         "subject_metrics": subject_json,
         "definition": "within each seed macro-average 3 folds; mean±population SD across 3 seeds",
         "strict_global_test_barrier": True,
+        "nbm_kind": results[0]["nbm_kind"],
         "run_count": len(results),
     }
     write_json(root / "summary.json", final)
