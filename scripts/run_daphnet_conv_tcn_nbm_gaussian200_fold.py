@@ -155,7 +155,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fold", type=int, choices=FOLDS, required=True)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--seed", type=int, default=20260807)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--seed-mode",
+        choices=("fold_offset", "exact"),
+        default="fold_offset",
+        help=(
+            "fold_offset uses seed+fold for backward compatibility; exact uses "
+            "the recorded --seed unchanged in every fold."
+        ),
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--nbm-max-epochs", type=int, default=200)
     parser.add_argument("--nbm-patience", type=int, default=20)
@@ -345,12 +354,14 @@ def run_fold(args: argparse.Namespace, device: torch.device) -> None:
         reconstruction = probe_model(probe)
     if latent.shape != (2, 16, 32) or reconstruction.shape != probe.shape:
         raise AssertionError("Conv-TCN NBM shape preflight failed")
+    effective_seed = args.seed if args.seed_mode == "exact" else args.seed + args.fold
     config = {
-        "experiment": "conv_tcn_nbm200_gru_matched_augmentation_for_C",
+        "experiment": "conv_tcn_nbm_gru_matched_augmentation_for_C",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "fold": args.fold,
         "base_seed": args.seed,
-        "effective_seed": args.seed + args.fold,
+        "seed_mode": args.seed_mode,
+        "effective_seed": effective_seed,
         "device": str(device),
         "subjects": list(SUBJECTS),
         "excluded_subjects": ["S04", "S10"],
@@ -394,7 +405,7 @@ def run_fold(args: argparse.Namespace, device: torch.device) -> None:
         role5_x,
         fold_dir,
         device,
-        args.seed + args.fold,
+        effective_seed,
         args.num_workers,
         args.nbm_max_epochs,
         args.nbm_patience,
@@ -422,6 +433,9 @@ def run_fold(args: argparse.Namespace, device: torch.device) -> None:
         "status": "frozen",
         "completed_utc": datetime.now(timezone.utc).isoformat(),
         "fold": args.fold,
+        "base_seed": args.seed,
+        "seed_mode": args.seed_mode,
+        "effective_seed": effective_seed,
         "checkpoint": str(checkpoint.resolve()),
         "checkpoint_sha256": sha256_file(checkpoint),
         "best_epoch": training["best_epoch"],

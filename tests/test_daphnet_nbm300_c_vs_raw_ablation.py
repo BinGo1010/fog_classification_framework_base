@@ -35,8 +35,8 @@ def test_raw_features_accept_float32_centering_roundoff_at_large_scale() -> None
 
 
 def test_paired_initialization_shares_all_compatible_weights() -> None:
-    raw_state, raw_meta = paired_initialization(20260807, "RAW")
-    full_state, full_meta = paired_initialization(20260807, "FULL_C")
+    raw_state, raw_meta = paired_initialization(52, "RAW")
+    full_state, full_meta = paired_initialization(52, "FULL_C")
     assert raw_meta["pair_id"] == full_meta["pair_id"]
     for name, raw_tensor in raw_state.items():
         full_tensor = full_state[name]

@@ -8,5 +8,6 @@ python scripts/launch_daphnet_nbm300_c_vs_raw_ablation_7gpu.py \
   --nbm-patience 20 \
   --tcn-max-epochs 10 \
   --tcn-patience 2 \
-  --tcn-seeds 20260807,20260808,20260809 \
+  --nbm-seeds 0,52,161 \
+  --tcn-seeds 0,52,161 \
   "$@"

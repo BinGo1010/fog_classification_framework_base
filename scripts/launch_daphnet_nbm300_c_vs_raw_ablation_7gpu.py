@@ -39,11 +39,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=REPO_ROOT
         / "outputs"
-        / "daphnet_conv_tcn_nbm300_C_vs_raw_tcn_ep10pat2_3seed_seed20260807",
+        / "daphnet_conv_tcn_nbm300_C_vs_raw_tcn_ep10pat2_seedset_0_52_161",
     )
     parser.add_argument("--gpu-ids", default="0,1,2,3,4,5,6")
-    parser.add_argument("--tcn-seeds", default="20260807,20260808,20260809")
-    parser.add_argument("--nbm-seed", type=int, default=20260807)
+    parser.add_argument("--nbm-seeds", default="0,52,161")
+    parser.add_argument("--tcn-seeds", default="0,52,161")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--nbm-max-epochs", type=int, default=300)
     parser.add_argument("--nbm-patience", type=int, default=20)
@@ -60,13 +60,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def nbm_command(args: argparse.Namespace, fold: int) -> list[str]:
+def nbm_command(args: argparse.Namespace, fold: int, seed: int) -> list[str]:
     command = [
         args.python, str(NBM_WORKER),
         "--data-dir", str(args.data_dir.resolve()),
-        "--output-root", str((args.output_root.resolve() / "nbm_source")),
+        "--output-root", str((args.output_root.resolve() / "nbm_source" / f"seed_{seed}")),
         "--fold", str(fold), "--device", "cuda",
-        "--seed", str(args.nbm_seed), "--num-workers", str(args.num_workers),
+        "--seed", str(seed), "--seed-mode", "exact",
+        "--num-workers", str(args.num_workers),
         "--nbm-max-epochs", str(args.nbm_max_epochs),
         "--nbm-patience", str(args.nbm_patience),
         "--nbm-learning-rate", "0.001",
@@ -81,11 +82,12 @@ def nbm_command(args: argparse.Namespace, fold: int) -> list[str]:
     return command
 
 
-def common_pair_args(args: argparse.Namespace) -> list[str]:
+def common_pair_args(args: argparse.Namespace, nbm_source_root: Path) -> list[str]:
     values = [
         "--data-dir", str(args.data_dir.resolve()),
-        "--nbm-source-root", str((args.output_root.resolve() / "nbm_source")),
+        "--nbm-source-root", str(nbm_source_root.resolve()),
         "--output-root", str(args.output_root.resolve()),
+        "--nbm-seeds", args.nbm_seeds,
         "--tcn-seeds", args.tcn_seeds,
         "--num-workers", str(args.num_workers),
         "--tcn-max-epochs", str(args.tcn_max_epochs),
@@ -101,15 +103,20 @@ def common_pair_args(args: argparse.Namespace) -> list[str]:
 def pair_command(
     args: argparse.Namespace, stage: str, fold: int, method: str, seed: int
 ) -> list[str]:
+    source = args.output_root.resolve() / "nbm_source" / f"seed_{seed}"
     return [
         args.python, str(PAIR_WORKER), "--stage", stage,
-        *common_pair_args(args), "--fold", str(fold), "--method", method,
-        "--tcn-seed", str(seed), "--device", "cuda",
+        *common_pair_args(args, source), "--fold", str(fold), "--method", method,
+        "--nbm-seed", str(seed), "--tcn-seed", str(seed), "--device", "cuda",
     ]
 
 
 def singleton_command(args: argparse.Namespace, stage: str) -> list[str]:
-    return [args.python, str(PAIR_WORKER), "--stage", stage, *common_pair_args(args)]
+    source = args.output_root.resolve() / "nbm_source"
+    return [
+        args.python, str(PAIR_WORKER), "--stage", stage,
+        *common_pair_args(args, source),
+    ]
 
 
 def validate_gpu_ids(value: str, check_hardware: bool) -> list[str]:
@@ -128,19 +135,24 @@ def validate_fixed_contract(args: argparse.Namespace) -> None:
         raise ValueError("this experiment requires NBM max_epoch=300 and patience=20")
     if args.tcn_max_epochs != 10 or args.tcn_patience != 2:
         raise ValueError("this experiment requires TCN max_epoch=10 and patience=2")
-    if len(parse_seed_list(args.tcn_seeds)) != 3:
-        raise ValueError("strict comparison requires exactly three TCN seeds")
+    required = (0, 52, 161)
+    nbm_seeds = parse_seed_list(args.nbm_seeds)
+    tcn_seeds = parse_seed_list(args.tcn_seeds)
+    if nbm_seeds != required or tcn_seeds != required:
+        raise ValueError("this experiment requires paired NBM/TCN seeds 0,52,161")
 
 
 def main() -> None:
     args = parse_args()
     validate_fixed_contract(args)
+    nbm_seeds = parse_seed_list(args.nbm_seeds)
     seeds = parse_seed_list(args.tcn_seeds)
     gpu_ids = validate_gpu_ids(args.gpu_ids, check_hardware=not args.dry_run)
     root = args.output_root.resolve()
     nbm_jobs = [{
-        "id": f"fold{fold}_nbm300", "command": nbm_command(args, fold)
-    } for fold in FOLDS]
+        "id": f"fold{fold}_nbm300_seed{seed}",
+        "command": nbm_command(args, fold, seed),
+    } for fold in FOLDS for seed in nbm_seeds]
     specs = [(fold, method, seed) for fold in FOLDS for method in METHODS for seed in seeds]
     train_jobs = [{
         "id": f"fold{fold}_{method}_seed{seed}",
@@ -153,7 +165,9 @@ def main() -> None:
     plan = {
         "strategy": "7-GPU dynamic queue; NBM barrier then 18-train global test barrier",
         "gpu_ids": gpu_ids,
-        "folds": list(FOLDS), "methods": list(METHODS), "tcn_seeds": list(seeds),
+        "folds": list(FOLDS), "methods": list(METHODS),
+        "nbm_seeds": list(nbm_seeds), "tcn_seeds": list(seeds),
+        "seed_pairing": "repeat s uses exact NBM seed s and exact TCN seed s",
         "nbm_jobs": len(nbm_jobs), "classifier_train_jobs": len(train_jobs),
         "post_barrier_test_jobs": len(evaluate_jobs),
         "nbm_contract": {
@@ -194,9 +208,12 @@ def main() -> None:
             return
     if args.phase in ("full", "train"):
         for fold in FOLDS:
-            required = root / "nbm_source" / f"fold_{fold}" / "DONE_NBM.json"
-            if not required.exists():
-                raise FileNotFoundError(f"NBM fold not frozen: {required}")
+            for seed in nbm_seeds:
+                required = (
+                    root / "nbm_source" / f"seed_{seed}" / f"fold_{fold}" / "DONE_NBM.json"
+                )
+                if not required.exists():
+                    raise FileNotFoundError(f"NBM fold/seed not frozen: {required}")
         run_pool("train", train_jobs, gpu_ids, root)
         subprocess.run(singleton_command(args, "seal"), cwd=REPO_ROOT, env=environment, check=True)
         if args.phase == "train":

@@ -62,6 +62,7 @@ from scripts.run_daphnet_residual_calibration_abcd import (
 
 FOLDS = (0, 1, 2)
 METHODS = ("FULL_C", "RAW")
+REQUIRED_SEEDS = (0, 52, 161)
 METRIC_KEYS = (
     "accuracy",
     "balanced_accuracy",
@@ -94,7 +95,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=REPO_ROOT
         / "outputs"
-        / "daphnet_conv_tcn_nbm300_C_vs_raw_tcn_ep10pat2_3seed_seed20260807"
+        / "daphnet_conv_tcn_nbm300_C_vs_raw_tcn_ep10pat2_seedset_0_52_161"
         / "nbm_source",
     )
     parser.add_argument(
@@ -102,12 +103,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=REPO_ROOT
         / "outputs"
-        / "daphnet_conv_tcn_nbm300_C_vs_raw_tcn_ep10pat2_3seed_seed20260807",
+        / "daphnet_conv_tcn_nbm300_C_vs_raw_tcn_ep10pat2_seedset_0_52_161",
     )
     parser.add_argument("--fold", type=int, choices=FOLDS)
     parser.add_argument("--method", choices=METHODS)
+    parser.add_argument("--nbm-seed", type=int)
     parser.add_argument("--tcn-seed", type=int)
-    parser.add_argument("--tcn-seeds", default="20260807,20260808,20260809")
+    parser.add_argument("--nbm-seeds", default="0,52,161")
+    parser.add_argument("--tcn-seeds", default="0,52,161")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--tcn-max-epochs", type=int, default=10)
@@ -128,8 +131,19 @@ def resolve_device(value: str) -> torch.device:
 
 
 def require_job_args(args: argparse.Namespace) -> None:
-    if args.fold is None or args.method is None or args.tcn_seed is None:
-        raise ValueError(f"--fold, --method and --tcn-seed are required for {args.stage}")
+    if (
+        args.fold is None
+        or args.method is None
+        or args.nbm_seed is None
+        or args.tcn_seed is None
+    ):
+        raise ValueError(
+            f"--fold, --method, --nbm-seed and --tcn-seed are required for {args.stage}"
+        )
+    if args.nbm_seed != args.tcn_seed:
+        raise ValueError("strict paired repeats require NBM seed == TCN seed")
+    if args.nbm_seed not in REQUIRED_SEEDS:
+        raise ValueError(f"seed must be one of {REQUIRED_SEEDS}")
 
 
 def job_id(fold: int, method: str, seed: int) -> str:
@@ -208,6 +222,10 @@ def validate_nbm_contract(frozen: dict[str, Any], args: argparse.Namespace) -> d
             frozen.get("best_checkpoint_restored_before_calibration", False)
         ),
         "validation_unaugmented": frozen.get("validation_mask_or_noise") is False,
+        "exact_seed": (
+            args.nbm_seed is not None
+            and int(training["seed"]) == args.nbm_seed
+        ),
     }
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
@@ -220,6 +238,7 @@ def validate_nbm_contract(frozen: dict[str, Any], args: argparse.Namespace) -> d
         "augmentation": expected_aug,
         "checkpoint_rule": "lowest unaugmented role-5 validation SmoothL1",
         "all_checks_passed": True,
+        "seed": args.nbm_seed,
     }
 
 
@@ -357,6 +376,7 @@ def run_train(args: argparse.Namespace, device: torch.device) -> None:
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "fold": args.fold,
         "method": args.method,
+        "nbm_seed": args.nbm_seed,
         "tcn_seed": args.tcn_seed,
         "input_shape": train_feature["shape"],
         "feature": train_feature,
@@ -398,7 +418,12 @@ def run_train(args: argparse.Namespace, device: torch.device) -> None:
 
 
 def run_seal(args: argparse.Namespace) -> None:
+    nbm_seeds = parse_csv_ints(args.nbm_seeds)
     seeds = parse_csv_ints(args.tcn_seeds)
+    if nbm_seeds != seeds:
+        raise ValueError("strict paired repeats require identical NBM and TCN seed lists")
+    if seeds != REQUIRED_SEEDS:
+        raise ValueError(f"this experiment requires seeds {REQUIRED_SEEDS}")
     root = args.output_root.resolve()
     entries = []
     for fold, method, seed in expected_jobs(seeds):
@@ -414,6 +439,7 @@ def run_seal(args: argparse.Namespace) -> None:
             raise AssertionError(f"classifier checkpoint changed: {frozen['job_id']}")
         entries.append({
             "job_id": frozen["job_id"], "fold": fold, "method": method, "tcn_seed": seed,
+            "nbm_seed": frozen["nbm_seed"],
             "threshold": frozen["threshold"], "checkpoint_sha256": frozen["checkpoint_sha256"],
             "pair_id": frozen["initialization"]["pair_id"],
             "scaler_sha256": frozen["role4_scaler_artifact"]["scaler_sha256"],
@@ -424,13 +450,17 @@ def run_seal(args: argparse.Namespace) -> None:
         })
     for fold in FOLDS:
         same_fold = [item for item in entries if item["fold"] == fold]
-        for key in ("scaler_sha256", "nbm_checkpoint_sha256", "pos_weight"):
+        for key in ("scaler_sha256", "pos_weight"):
             if len({item[key] for item in same_fold}) != 1:
                 raise AssertionError(f"fold {fold} mismatch: {key}")
         for seed in seeds:
             paired = [item for item in same_fold if item["tcn_seed"] == seed]
             if len(paired) != 2 or len({item["pair_id"] for item in paired}) != 1:
                 raise AssertionError(f"fold {fold}, seed {seed} is not a valid paired initialization")
+            if len({item["nbm_seed"] for item in paired}) != 1 or paired[0]["nbm_seed"] != seed:
+                raise AssertionError(f"fold {fold}, seed {seed} NBM/TCN seeds are not paired")
+            if len({item["nbm_checkpoint_sha256"] for item in paired}) != 1:
+                raise AssertionError(f"fold {fold}, seed {seed} methods do not share one NBM")
     if any(item["tcn_max_epochs"] != args.tcn_max_epochs for item in entries):
         raise AssertionError("TCN maximum epoch mismatch")
     if any(item["tcn_patience"] != args.tcn_patience for item in entries):
@@ -442,7 +472,8 @@ def run_seal(args: argparse.Namespace) -> None:
     barrier = {
         "status": "all_FULL_C_and_RAW_classifiers_and_thresholds_frozen",
         "created_utc": datetime.now(timezone.utc).isoformat(),
-        "folds": list(FOLDS), "methods": list(METHODS), "tcn_seeds": list(seeds),
+        "folds": list(FOLDS), "methods": list(METHODS),
+        "nbm_seeds": list(nbm_seeds), "tcn_seeds": list(seeds),
         "job_count": len(entries),
         "strict_test_gate": "roles 0/1 may be accessed only after this global barrier",
         "source_audit": source_audit,
@@ -454,6 +485,8 @@ def run_seal(args: argparse.Namespace) -> None:
         "full": "role4 scaler + window-axis centering + NBM + scheme C [r,abs(r),delta] [B,27,128]",
         "ablation": "role4 scaler + window-axis centering + RAW [B,9,128]",
         "nbm": "max_epoch=300, patience=20, SmoothL1, lr=1e-3, augmentation=40% clean/40% Gaussian(std=.04)/20% mask",
+        "paired_seeds": list(seeds),
+        "seed_policy": "exact seeds; no hidden fold offset",
         "tcn": f"max_epoch={args.tcn_max_epochs}, patience={args.tcn_patience}, paired seed/loader order",
         "roles": {str(key): value for key, value in ROLES.items()},
         "threshold": "roles 2/3 balanced accuracy; ties FoG F1 then higher threshold",
@@ -524,6 +557,7 @@ def run_evaluate(args: argparse.Namespace, device: torch.device) -> None:
     result = {
         "job_id": sealed["job_id"], "completed_utc": datetime.now(timezone.utc).isoformat(),
         "fold": args.fold, "method": args.method, "tcn_seed": args.tcn_seed,
+        "nbm_seed": args.nbm_seed,
         "threshold": threshold, "threshold_source_roles": [2, 3],
         "strict_global_test_barrier_verified": True, "test_roles": [0, 1],
         "test": metrics, "test_by_subject": by_subject,
@@ -567,7 +601,12 @@ def mean_std(values: Iterable[float]) -> dict[str, Any]:
 
 
 def run_aggregate(args: argparse.Namespace) -> None:
+    nbm_seeds = parse_csv_ints(args.nbm_seeds)
     seeds = parse_csv_ints(args.tcn_seeds)
+    if nbm_seeds != seeds:
+        raise ValueError("strict paired repeats require identical NBM and TCN seed lists")
+    if seeds != REQUIRED_SEEDS:
+        raise ValueError(f"this experiment requires seeds {REQUIRED_SEEDS}")
     root = args.output_root.resolve()
     if not (root / "TRAINING_BARRIER.json").exists():
         raise FileNotFoundError("cannot aggregate without global barrier")
@@ -578,7 +617,8 @@ def run_aggregate(args: argparse.Namespace) -> None:
             raise FileNotFoundError(f"test incomplete: {job_id(fold, method, seed)}")
         results.append(json.loads((directory / "metrics.json").read_text(encoding="utf-8")))
     run_rows = [{
-        "fold": r["fold"], "method": r["method"], "tcn_seed": r["tcn_seed"],
+        "fold": r["fold"], "method": r["method"],
+        "nbm_seed": r["nbm_seed"], "tcn_seed": r["tcn_seed"],
         "threshold": r["threshold"],
         **{key: r["test"][key] for key in METRIC_KEYS},
         **{key: r["test"][key] for key in ("tn", "fp", "fn", "tp")},
@@ -642,7 +682,8 @@ def run_aggregate(args: argparse.Namespace) -> None:
     write_json(root / "summary.json", final)
     write_json(root / "DONE.json", {
         "status": "complete", "completed_utc": datetime.now(timezone.utc).isoformat(),
-        "run_count": len(results), "methods": list(METHODS), "tcn_seeds": list(seeds),
+        "run_count": len(results), "methods": list(METHODS),
+        "nbm_seeds": list(seeds), "tcn_seeds": list(seeds),
     })
     print(json.dumps(final["primary_metrics"], ensure_ascii=False, indent=2), flush=True)
 

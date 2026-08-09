@@ -36,7 +36,8 @@ Raw组不执行NBM推理，不使用重构信号，不生成残差，也不使�
 - 分类器训练：角色6/7。
 - 分类器验证、早停和阈值：角色2/3。
 - 永久测试：角色0/1；全部18个分类器和阈值封存后才允许读取。
-- TCN种子：`20260807, 20260808, 20260809`。
+- NBM和TCN使用三个严格配对种子：`0, 52, 161`。
+- 每个种子在每一折中原样使用，不再执行`seed + fold`隐式偏移。
 - TCN：最大10 epoch，patience 2，AdamW，lr `1e-3`，weight decay `1e-4`。
 - 分类损失：`BCEWithLogitsLoss(pos_weight=N_role6/N_role7)`。
 - NBM：最大300 epoch，patience 20，纯SmoothL1，AdamW，lr `1e-3`。
@@ -65,7 +66,8 @@ python scripts/launch_daphnet_nbm300_c_vs_raw_ablation_7gpu.py \
   --nbm-patience 20 \
   --tcn-max-epochs 10 \
   --tcn-patience 2 \
-  --tcn-seeds 20260807,20260808,20260809
+  --nbm-seeds 0,52,161 \
+  --tcn-seeds 0,52,161
 ```
 
 如服务器拥有8张卡，可将GPU列表改为`0,1,2,3,4,5,6,7`；任务数和实验定义不变，只提高并发数。
@@ -73,7 +75,7 @@ python scripts/launch_daphnet_nbm300_c_vs_raw_ablation_7gpu.py \
 ## 分阶段恢复
 
 ```bash
-# 只训练3折NBM
+# 只训练3折×3种子，共9个NBM
 python scripts/launch_daphnet_nbm300_c_vs_raw_ablation_7gpu.py --gpu-ids 0,1,2,3,4,5,6 --phase nbm
 
 # 训练18个TCN并建立全局测试屏障
@@ -90,12 +92,12 @@ python scripts/launch_daphnet_nbm300_c_vs_raw_ablation_7gpu.py --gpu-ids 0,1,2,3
 默认输出目录：
 
 ```text
-outputs/daphnet_conv_tcn_nbm300_C_vs_raw_tcn_ep10pat2_3seed_seed20260807/
+outputs/daphnet_conv_tcn_nbm300_C_vs_raw_tcn_ep10pat2_seedset_0_52_161/
 ```
 
 主要文件：
 
-- `nbm_source/fold_*/`：3折NBM最佳权重、训练曲线和角色5校准。
+- `nbm_source/seed_{0,52,161}/fold_*/`：9次NBM的最佳权重、训练曲线和角色5校准。
 - `TRAINING_BARRIER.json`：18个分类器、阈值和配对条件全部冻结的证明。
 - `run_metrics_18.csv`：每折、每方法、每种子的测试指标和混淆矩阵元素。
 - `method_summary_3seed_mean_std.csv`：两组总体均值±标准差。
