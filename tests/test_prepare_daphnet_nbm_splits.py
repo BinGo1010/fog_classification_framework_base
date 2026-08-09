@@ -119,6 +119,33 @@ def test_purity_requires_all_128_labels_to_agree() -> None:
         splits.purity_from_fog_samples(splits.WINDOW + 1)
 
 
+def test_event_end_index_normalization_accepts_inclusive_and_exclusive_inputs() -> None:
+    common = {
+        "dataset_id": "daphnet",
+        "record_id": "S01_seg000",
+        "subject_id": "S01",
+        "run_id": "R01",
+        "segment_id": "0",
+        "event_id": "0",
+        "start_index": "10",
+        "start_time_sec": str(10 / splits.FS),
+        "duration_sec": "2.0",
+    }
+    inclusive, inclusive_audit = splits.normalize_fog_event_rows(
+        [{**common, "end_index": "137", "end_time_sec": str(137 / splits.FS)}]
+    )
+    exclusive, exclusive_audit = splits.normalize_fog_event_rows(
+        [{**common, "end_index": "138", "end_time_sec": str(138 / splits.FS)}]
+    )
+
+    assert inclusive_audit["pass"] is True
+    assert exclusive_audit["pass"] is True
+    assert inclusive[0]["end_index"] == 137
+    assert exclusive[0]["end_index"] == 137
+    assert inclusive[0]["duration_sec"] == pytest.approx(2.0)
+    assert exclusive[0]["duration_sec"] == pytest.approx(2.0)
+
+
 def test_clean_partition_has_at_most_60_second_cores_and_one_connector_per_cut() -> None:
     starts = [index * splits.STRIDE for index in range(120)]
 

@@ -612,8 +612,19 @@ def corrupt(clean: torch.Tensor, generator: torch.Generator) -> tuple[torch.Tens
     masked_indices = torch.nonzero(modes >= 0.8, as_tuple=False).flatten().tolist()
     for index in masked_indices:
         length = int(torch.randint(4, 9, (1,), device=clean.device, generator=generator))
+        time_samples = int(clean.shape[1])
+        if time_samples < length:
+            raise ValueError(
+                f"time-mask length {length} exceeds input length {time_samples}"
+            )
         start = int(
-            torch.randint(0, WINDOW - length + 1, (1,), device=clean.device, generator=generator)
+            torch.randint(
+                0,
+                time_samples - length + 1,
+                (1,),
+                device=clean.device,
+                generator=generator,
+            )
         )
         output[index, start : start + length, :] = 0.0
     counts = np.asarray(

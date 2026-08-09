@@ -25,13 +25,16 @@ from cnbr_fog.data import DaphnetDataset
 from scripts.run_daphnet_processed_nbm_centered_residual_tcn import (
     ROLES,
     SUBJECTS,
-    audit_protocol,
     fit_scaler_unique_role4_points,
     load_fold_rows,
-    raw_windows,
     save_figure_bundle,
     write_csv,
     write_json,
+)
+from scripts.run_daphnet_nbm300_c_vs_raw_ablation import (
+    audit_protocol_dynamic,
+    parse_csv_ints,
+    raw_windows_dynamic,
 )
 from scripts.run_daphnet_residual_calibration_abcd import sha256_file
 from scripts.run_daphnet_s01_nonfog_gru_reconstruction_tcnm import (
@@ -42,7 +45,6 @@ from scripts.run_daphnet_s01_nonfog_gru_reconstruction_tcnm import (
 )
 
 FOLDS = (0, 1, 2)
-REQUIRED_SEEDS = (0, 52, 161)
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,7 +64,11 @@ def parse_args() -> argparse.Namespace:
         / "seed_0",
     )
     parser.add_argument("--fold", type=int, choices=FOLDS, required=True)
-    parser.add_argument("--seed", type=int, choices=REQUIRED_SEEDS, required=True)
+    parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--required-seeds", default="0,52,161")
+    parser.add_argument("--sampling-rate-hz", type=int, default=64)
+    parser.add_argument("--window-samples", type=int, default=128)
+    parser.add_argument("--stride-samples", type=int, default=64)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--nbm-max-epochs", type=int, default=300)
@@ -82,20 +88,36 @@ def resolve_device(value: str) -> torch.device:
     return device
 
 
-def architecture(hidden: int, bottleneck: int) -> dict[str, Any]:
+def architecture(hidden: int, bottleneck: int, window_samples: int = 128) -> dict[str, Any]:
     model = GRUReconstructionNBM(channels=9, hidden=hidden, bottleneck=bottleneck)
     return {
         "name": "gru_reconstruction_nbm_v1",
-        "input_shape": ["B", 128, 9],
+        "input_shape": ["B", window_samples, 9],
         "encoder": f"one-layer unidirectional GRU(9,{hidden})",
+        "encoder_gru": {
+            "input_size": 9,
+            "hidden_size": hidden,
+            "layers": 1,
+            "bidirectional": False,
+        },
         "encoder_summary": "last hidden state",
         "bottleneck": f"Linear({hidden},{bottleneck})",
         "latent_shape": ["B", bottleneck],
         "decoder_initial_state": f"Linear({bottleneck},{hidden})",
-        "decoder": f"one-layer unidirectional GRU(9,{hidden}) with 128-step all-zero input",
+        "decoder": (
+            f"one-layer unidirectional GRU(9,{hidden}) with "
+            f"{window_samples}-step all-zero input"
+        ),
+        "decoder_gru": {
+            "input_size": 9,
+            "hidden_size": hidden,
+            "layers": 1,
+            "bidirectional": False,
+            "input": "all-zero sequence",
+        },
         "output": f"Linear({hidden},9), no output activation",
         "skip_connections": False,
-        "output_shape": ["B", 128, 9],
+        "output_shape": ["B", window_samples, 9],
         "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
     }
 
@@ -115,6 +137,9 @@ def plot_training(fold_dir: Path, run: dict[str, Any]) -> None:
 
 
 def run(args: argparse.Namespace, device: torch.device) -> None:
+    required_seeds = parse_csv_ints(args.required_seeds)
+    if args.seed not in required_seeds:
+        raise ValueError(f"seed must be one of {required_seeds}")
     if args.nbm_max_epochs != 300 or args.nbm_patience != 20:
         raise ValueError("this comparison requires GRU-NBM max_epoch=300 and patience=20")
     if args.nbm_hidden != 64 or args.nbm_bottleneck != 16:
@@ -129,20 +154,35 @@ def run(args: argparse.Namespace, device: torch.device) -> None:
     dataset = DaphnetDataset.load(data_dir)
     records = {record.record_id: record for record in dataset.records}
     rows_by_fold = {fold: load_fold_rows(data_dir, fold) for fold in FOLDS}
-    source_audit = audit_protocol(data_dir, rows_by_fold, records)
+    source_audit = audit_protocol_dynamic(
+        data_dir,
+        rows_by_fold,
+        args.sampling_rate_hz,
+        args.window_samples,
+        args.stride_samples,
+    )
     rows = rows_by_fold[args.fold]
     role4 = rows.take_role(4)
     role5 = rows.take_role(5)
     scaler, unique_points = fit_scaler_unique_role4_points(records, role4)
-    role4_x = prepare_nbm_windows(scaler, raw_windows(records, role4), center=True)
-    role5_x = prepare_nbm_windows(scaler, raw_windows(records, role5), center=True)
-    model_config = architecture(args.nbm_hidden, args.nbm_bottleneck)
+    role4_x = prepare_nbm_windows(
+        scaler, raw_windows_dynamic(records, role4, args.window_samples), center=True
+    )
+    role5_x = prepare_nbm_windows(
+        scaler, raw_windows_dynamic(records, role5, args.window_samples), center=True
+    )
+    model_config = architecture(
+        args.nbm_hidden, args.nbm_bottleneck, args.window_samples
+    )
     config = {
         "experiment": "GRU_NBM300_schemeC_source",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "fold": args.fold,
         "seed": args.seed,
         "seed_policy": "exact seed; no fold offset",
+        "sampling_rate_hz": args.sampling_rate_hz,
+        "window_samples": args.window_samples,
+        "stride_samples": args.stride_samples,
         "device": str(device),
         "subjects": list(SUBJECTS),
         "excluded_subjects": ["S04", "S10"],

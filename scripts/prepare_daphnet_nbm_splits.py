@@ -2,8 +2,10 @@
 
 The canonical continuous records are preserved.  Window candidates are always
 anchored to the beginning of each record on a 1 s grid.  A 2 s candidate is
-retained only when all 128 labels agree; mixed candidates are audited and
-removed before any allocation.
+retained only when all labels agree; mixed candidates are audited and removed
+before any allocation.  The sample count is inferred from the source manifest,
+so the same protocol supports both the canonical 64 Hz records (128/64 samples)
+and the FIR-downsampled 32 Hz records (64/32 samples).
 
 Allocation is deterministic and within subject.  Complete FoG event clusters
 and at-most-60-second clean Non-FoG blocks are the indivisible allocation
@@ -48,6 +50,7 @@ import prepare_daphnet_ca_splits as ca  # noqa: E402
 
 DATASET_ID = "daphnet_NBM"
 FS = 64
+SOURCE_FS = 64
 WINDOW = 128
 STRIDE = 64
 OUTER_FOLDS = 3
@@ -61,13 +64,23 @@ MAX_AGGREGATE_RATIO_ERROR_PERCENTAGE_POINTS = 1.25
 # an indivisible singleton cluster.
 EVENT_CLUSTER_GAP = 0
 
-EXPECTED_SOURCE_INVENTORY = {
-    "candidate_windows": 17_790,
-    "pure_nonfog_windows": 15_593,
-    "pure_fog_windows": 1_301,
-    "mixed_windows": 896,
-    "summary_rows": 35,
+EXPECTED_SOURCE_INVENTORIES = {
+    64: {
+        "candidate_windows": 17_790,
+        "pure_nonfog_windows": 15_593,
+        "pure_fog_windows": 1_301,
+        "mixed_windows": 896,
+        "summary_rows": 35,
+    },
+    32: {
+        "candidate_windows": 17_790,
+        "pure_nonfog_windows": 15_596,
+        "pure_fog_windows": 1_307,
+        "mixed_windows": 887,
+        "summary_rows": 35,
+    },
 }
+EXPECTED_SOURCE_INVENTORY = dict(EXPECTED_SOURCE_INVENTORIES[FS])
 
 CLASS_NONFOG = "NONFOG"
 CLASS_FOG = "FOG"
@@ -132,6 +145,54 @@ SOURCE_SUMMARY_AUDIT = "nbm_source_summary_audit.csv"
 QUALITY_REPORT = "nbm_quality_report.json"
 PROTOCOL = "nbm_protocol.json"
 ROLE_CODES_JSON = "nbm_role_codes.json"
+
+
+def configure_sampling(
+    sampling_rate_hz: int,
+    *,
+    source_sampling_rate_hz: int | None = None,
+    source_dataset_id: str = "daphnet",
+) -> None:
+    """Configure the module-wide temporal grid before any split work."""
+
+    global DATASET_ID, FS, SOURCE_FS, WINDOW, STRIDE, MAX_CLEAN_BLOCK_SAMPLES
+    global EXPECTED_SOURCE_INVENTORY
+
+    rate = int(sampling_rate_hz)
+    source_rate = rate if source_sampling_rate_hz is None else int(source_sampling_rate_hz)
+    if rate <= 0 or source_rate <= 0:
+        raise ValueError("sampling rates must be positive")
+    if source_rate % rate != 0:
+        raise ValueError(
+            "source sampling rate must be an integer multiple of the processed rate"
+        )
+    if rate not in EXPECTED_SOURCE_INVENTORIES:
+        raise ValueError(
+            f"unsupported sampling rate {rate}; expected one of "
+            f"{sorted(EXPECTED_SOURCE_INVENTORIES)}"
+        )
+    FS = rate
+    SOURCE_FS = source_rate
+    WINDOW = 2 * FS
+    STRIDE = FS
+    MAX_CLEAN_BLOCK_SAMPLES = MAX_CLEAN_BLOCK_SECONDS * FS
+    EXPECTED_SOURCE_INVENTORY = dict(EXPECTED_SOURCE_INVENTORIES[FS])
+    DATASET_ID = (
+        "daphnet_NBM"
+        if source_dataset_id == "daphnet" and FS == 64
+        else f"{source_dataset_id}_NBM"
+    )
+
+
+def source_offset_for_processed_index(index: int) -> int:
+    """Map a processed-record sample boundary to its source-file coordinate."""
+
+    numerator = int(index) * SOURCE_FS
+    if numerator % FS != 0:
+        raise ValueError(
+            f"processed index {index} has no exact source coordinate at {SOURCE_FS}/{FS} Hz"
+        )
+    return numerator // FS
 
 
 @dataclass(frozen=True)
@@ -219,7 +280,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Compute allocation and quality results without writing processed_NBM.",
+        help="Compute allocation and quality results without writing the output dataset.",
     )
     return parser.parse_args()
 
@@ -251,6 +312,55 @@ def consecutive_start_runs(starts: Sequence[int]) -> list[list[int]]:
             current = [start]
     output.append(current)
     return output
+
+
+def normalize_fog_event_rows(
+    rows: Sequence[dict[str, str]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Normalize event ``end_index`` to the canonical inclusive convention."""
+
+    normalized: list[dict[str, Any]] = []
+    convention_counts: Counter[str] = Counter()
+    problems: list[dict[str, Any]] = []
+    for raw in rows:
+        row: dict[str, Any] = dict(raw)
+        start = int(raw["start_index"])
+        end = int(raw["end_index"])
+        duration_samples = int(round(float(raw["duration_sec"]) * FS))
+        if end - start + 1 == duration_samples:
+            convention = "inclusive"
+            inclusive_end = end
+        elif end - start == duration_samples:
+            convention = "exclusive_normalized_to_inclusive"
+            inclusive_end = end - 1
+        else:
+            problems.append(
+                {
+                    "record_id": raw.get("record_id", ""),
+                    "event_id": raw.get("event_id", ""),
+                    "start_index": start,
+                    "end_index": end,
+                    "duration_samples": duration_samples,
+                }
+            )
+            continue
+        convention_counts[convention] += 1
+        row["start_index"] = start
+        row["end_index"] = inclusive_end
+        row["start_time_sec"] = start / FS
+        row["end_time_sec"] = inclusive_end / FS
+        row["duration_sec"] = duration_samples / FS
+        normalized.append(row)
+    audit = {
+        "pass": not problems and len(normalized) == len(rows),
+        "input_event_count": len(rows),
+        "normalized_event_count": len(normalized),
+        "input_convention_counts": dict(sorted(convention_counts.items())),
+        "output_end_index_convention": "inclusive_last_fog_sample",
+        "problem_count": len(problems),
+        "examples": problems[:20],
+    }
+    return normalized, audit
 
 
 def partition_clean_start_run(starts: Sequence[int]) -> tuple[list[tuple[int, ...]], list[int]]:
@@ -333,11 +443,18 @@ def source_provenance_audit(
         record_id = str(row["record_id"])
         start = int(row["source_start_row"])
         end_inclusive = int(row["source_end_row"])
-        expected = end_inclusive - start + 1
+        expected_source = end_inclusive - start + 1
         record = record_lookup.get(record_id)
         actual = -1 if record is None else len(record.y)
         declared = int(row["n_samples"])
-        if start < 0 or expected != declared or expected != actual:
+        declared_source = int(row.get("source_n_samples", declared))
+        expected_processed = ((declared_source - 1) * FS) // SOURCE_FS + 1
+        if (
+            start < 0
+            or expected_source != declared_source
+            or expected_processed != declared
+            or declared != actual
+        ):
             problems.append(
                 {
                     "kind": "record_interval_length",
@@ -345,9 +462,11 @@ def source_provenance_audit(
                     "source_file": row["source_file"],
                     "source_start_row": start,
                     "source_end_row": end_inclusive,
-                    "interval_samples": expected,
-                    "manifest_samples": declared,
-                    "npz_samples": actual,
+                    "source_interval_samples": expected_source,
+                    "manifest_source_samples": declared_source,
+                    "expected_processed_samples": expected_processed,
+                    "manifest_processed_samples": declared,
+                    "npz_processed_samples": actual,
                 }
             )
         by_source[str(row["source_file"])].append(
@@ -371,13 +490,18 @@ def source_provenance_audit(
         row = manifest_lookup[candidate.record_id]
         record_start = int(row["source_start_row"])
         record_end_exclusive = int(row["source_end_row"]) + 1
-        absolute_start = candidate.source_start_row + candidate.start_index
-        absolute_end = candidate.source_start_row + candidate.end_index_exclusive
+        absolute_start = candidate.source_start_row + source_offset_for_processed_index(
+            candidate.start_index
+        )
+        absolute_end = candidate.source_start_row + source_offset_for_processed_index(
+            candidate.end_index_exclusive
+        )
+        expected_source_window = source_offset_for_processed_index(WINDOW)
         if (
             candidate.source_start_row != record_start
             or absolute_start < record_start
             or absolute_end > record_end_exclusive
-            or absolute_end - absolute_start != WINDOW
+            or absolute_end - absolute_start != expected_source_window
         ):
             problems.append(
                 {
@@ -1071,6 +1195,12 @@ def core_group_role(
 
 
 def candidate_base_row(candidate: CandidateWindow) -> dict[str, Any]:
+    source_start = candidate.source_start_row + source_offset_for_processed_index(
+        candidate.start_index
+    )
+    source_end = candidate.source_start_row + source_offset_for_processed_index(
+        candidate.end_index_exclusive
+    )
     return {
         "window_id": candidate.window_id,
         "subject_id": candidate.subject_id,
@@ -1082,8 +1212,8 @@ def candidate_base_row(candidate: CandidateWindow) -> dict[str, Any]:
         "end_index_exclusive": candidate.end_index_exclusive,
         "start_time_sec": candidate.start_index / FS,
         "end_time_sec": candidate.end_index_exclusive / FS,
-        "source_start_row": candidate.source_start_row + candidate.start_index,
-        "source_end_row_exclusive": candidate.source_start_row + candidate.end_index_exclusive,
+        "source_start_row": source_start,
+        "source_end_row_exclusive": source_end,
         "fog_samples_in_2s": candidate.fog_samples_in_2s,
         "full_2s_fog_fraction": candidate.fog_samples_in_2s / WINDOW,
         "purity_label": candidate.purity_label,
@@ -1091,8 +1221,11 @@ def candidate_base_row(candidate: CandidateWindow) -> dict[str, Any]:
         "y_binary": candidate.y_binary,
         "window_samples": WINDOW,
         "stride_samples": STRIDE,
-        "window_alignment": "record_start_stride64",
-        "label_rule": "PURE_FOG iff 128/128 FOG; PURE_NONFOG iff 0/128 FOG",
+        "window_alignment": f"record_start_stride{STRIDE}",
+        "label_rule": (
+            f"PURE_FOG iff {WINDOW}/{WINDOW} FOG; "
+            f"PURE_NONFOG iff 0/{WINDOW} FOG"
+        ),
     }
 
 
@@ -1362,30 +1495,47 @@ def reference_summary_audit(
         actual_event_durations = [float(row["duration_sec"]) for row in selected_events]
         text = str(source.get("individual_event_durations_sec", "")).strip()
         summary_event_durations = [float(value.strip()) for value in text.split(";") if value.strip()]
+        manifest_source_samples = int(
+            metadata.get("source_n_samples", metadata["n_samples"])
+        )
+        expected_processed_samples = (
+            ((manifest_source_samples - 1) * FS) // SOURCE_FS + 1
+        )
+        resampling_tolerance_sec = 0.0 if FS == SOURCE_FS else 1.0 / FS
+        event_total_tolerance_sec = resampling_tolerance_sec * max(
+            1, len(selected_events)
+        )
+        summary_fog_duration_from_samples = int(source["fog_samples"]) / SOURCE_FS
+        processed_fog_duration_from_samples = int(np.sum(record.y == 1)) / FS
         checks = {
             "subject_match": str(source["subject_id"]) == str(metadata["subject_id"]),
             "source_file_match": str(source["source_file"]) == str(metadata["source_file"]),
             "run_id_match": str(source["run_id"]) == str(metadata["run_id"]),
             "segment_id_match": int(source["segment_id"]) == int(metadata["segment_id"]),
             "segment_samples_match": (
-                int(source["segment_samples"]) == len(record.y) == int(metadata["n_samples"])
+                int(source["segment_samples"]) == manifest_source_samples
+                and len(record.y) == int(metadata["n_samples"])
+                and len(record.y) == expected_processed_samples
             ),
             "segment_duration_match": abs(
-                float(source["segment_duration_sec"]) - len(record.y) / FS
+                float(source["segment_duration_sec"])
+                - manifest_source_samples / SOURCE_FS
             ) <= 1e-6,
-            "fog_samples_match": int(source["fog_samples"]) == int(np.sum(record.y == 1)),
+            "fog_samples_match": abs(
+                summary_fog_duration_from_samples - processed_fog_duration_from_samples
+            ) <= event_total_tolerance_sec + 1e-12,
             "fog_event_count_match": int(source["manifest_fog_event_count"]) == len(selected_events),
             "fog_total_duration_match": abs(
                 float(source["fog_total_duration_sec"]) - sum(actual_event_durations)
-            ) <= 1e-6,
+            ) <= event_total_tolerance_sec + 1e-12,
             "fog_total_duration_from_samples_match": abs(
                 float(source["fog_total_duration_sec"])
-                - int(np.sum(record.y == 1)) / FS
-            ) <= 1e-6,
+                - processed_fog_duration_from_samples
+            ) <= event_total_tolerance_sec + 1e-12,
             "individual_event_durations_match": (
                 len(summary_event_durations) == len(actual_event_durations)
                 and all(
-                    abs(left - right) <= 1e-6
+                    abs(left - right) <= resampling_tolerance_sec + 1e-12
                     for left, right in zip(summary_event_durations, actual_event_durations)
                 )
             ),
@@ -1395,10 +1545,15 @@ def reference_summary_audit(
                 "record_id": record_id,
                 "subject_id": record.subject_id,
                 "summary_segment_samples": int(source["segment_samples"]),
+                "manifest_source_n_samples": manifest_source_samples,
                 "manifest_n_samples": int(metadata["n_samples"]),
                 "npz_n_samples": len(record.y),
                 "summary_fog_samples": int(source["fog_samples"]),
                 "npz_fog_samples": int(np.sum(record.y == 1)),
+                "summary_fog_duration_from_samples_sec": summary_fog_duration_from_samples,
+                "npz_fog_duration_from_samples_sec": processed_fog_duration_from_samples,
+                "resampling_tolerance_sec_per_event": resampling_tolerance_sec,
+                "event_total_tolerance_sec": event_total_tolerance_sec,
                 "summary_fog_event_count": int(source["manifest_fog_event_count"]),
                 "manifest_fog_event_count": len(selected_events),
                 **checks,
@@ -1591,7 +1746,7 @@ def build_pool_count_report(
     }
     inventory = quality["confirmed_source_inventory"]
     lines = [
-        "# Daphnet processed_NBM 池样本数报告",
+        f"# Daphnet {DATASET_ID} 池样本数报告",
         "",
         "## 严格窗口库存",
         "",
@@ -2148,6 +2303,14 @@ def save_indices(
 def copy_canonical_layout(source: Path, build: Path) -> None:
     for name in ("manifest.csv", "fog_events.csv", "loso_folds.csv", "preprocessing_report.json"):
         shutil.copy2(source / name, build / name)
+    for name in (
+        "fir_kaiser65_cutoff14hz.csv",
+        "record_resampling_audit.csv",
+        "README_32Hz.md",
+    ):
+        path = source / name
+        if path.exists():
+            shutil.copy2(path, build / name)
     shutil.copytree(source / "records", build / "records")
 
 
@@ -2164,9 +2327,31 @@ def main() -> None:
         raise FileExistsError(f"Refusing to overwrite existing output: {output}")
 
     manifest_rows = base.read_csv(source / "manifest.csv")
+    if not manifest_rows:
+        raise ValueError(f"empty source manifest: {source / 'manifest.csv'}")
+    sampling_rates = {int(row["sampling_rate_hz"]) for row in manifest_rows}
+    source_sampling_rates = {
+        int(row.get("source_sampling_rate_hz", row["sampling_rate_hz"]))
+        for row in manifest_rows
+    }
+    if len(sampling_rates) != 1 or len(source_sampling_rates) != 1:
+        raise ValueError(
+            "all records must use one processed rate and one source sampling rate"
+        )
+    source_schema = json.loads((source / "schema.json").read_text(encoding="utf-8"))
+    configure_sampling(
+        next(iter(sampling_rates)),
+        source_sampling_rate_hz=next(iter(source_sampling_rates)),
+        source_dataset_id=str(source_schema.get("dataset_id", "daphnet")),
+    )
     manifest = {row["record_id"]: row for row in manifest_rows}
     records = base.load_records(source, manifest_rows)
-    events, events_by_record = ca.prepare_events(base.read_csv(source / "fog_events.csv"))
+    normalized_event_rows, event_input_audit = normalize_fog_event_rows(
+        base.read_csv(source / "fog_events.csv")
+    )
+    if not event_input_audit["pass"]:
+        raise RuntimeError(json.dumps(event_input_audit, ensure_ascii=False, indent=2))
+    events, events_by_record = ca.prepare_events(normalized_event_rows)
     summary_rows = base.read_csv(summary_path)
     summary_audit, source_summary_pass = reference_summary_audit(
         summary_rows, manifest_rows, records, events
@@ -2214,8 +2399,11 @@ def main() -> None:
         split_summary,
     )
     quality["fold_label_alignment_audit"] = fold_alignment_quality
+    quality["fog_event_input_convention_audit"] = event_input_audit
     quality["overall_pass"] = bool(
-        quality["overall_pass"] and fold_alignment_quality["pass"]
+        quality["overall_pass"]
+        and fold_alignment_quality["pass"]
+        and event_input_audit["pass"]
     )
     pool_count_report = build_pool_count_report(split_summary, quality)
     payload = {
@@ -2233,6 +2421,7 @@ def main() -> None:
     build = output.with_name(f"{output.name}.__building_{os.getpid()}")
     build.mkdir(parents=True, exist_ok=False)
     copy_canonical_layout(source, build)
+    base.write_csv(build / "fog_events.csv", normalized_event_rows)
     shutil.copy2(summary_path, build / SOURCE_SUMMARY_COPY)
 
     group_lookup = {group.group_id: group for group in groups}
@@ -2256,7 +2445,6 @@ def main() -> None:
     if not quality["overall_pass"]:
         raise RuntimeError(json.dumps(payload, ensure_ascii=False, indent=2))
 
-    source_schema = json.loads((source / "schema.json").read_text(encoding="utf-8"))
     source_schema["nbm_split"] = {
         "window_manifest": WINDOW_MANIFEST,
         "group_manifest": GROUP_MANIFEST,
@@ -2280,9 +2468,9 @@ def main() -> None:
         "window_samples": WINDOW,
         "stride_samples": STRIDE,
         "outer_folds": OUTER_FOLDS,
-        "pure_fog_definition": "fog_samples_in_2s == 128",
+        "pure_fog_definition": f"fog_samples_in_2s == {WINDOW}",
         "pure_nonfog_definition": "fog_samples_in_2s == 0",
-        "mixed_window_policy": "exclude 1..127 FOG samples",
+        "mixed_window_policy": f"exclude 1..{WINDOW - 1} FOG samples",
         "allocation_scope": "within subject",
         "permanent_test_fraction_per_class": 0.20,
         "target_fractions_of_full_class_inventory": FULL_INVENTORY_TARGETS,
@@ -2295,6 +2483,8 @@ def main() -> None:
         "source_processed": str(source),
         "source_manifest_sha256": base.sha256(source / "manifest.csv"),
         "source_fog_events_sha256": base.sha256(source / "fog_events.csv"),
+        "source_fog_event_end_index_convention_audit": event_input_audit,
+        "output_fog_event_end_index_convention": "inclusive_last_fog_sample",
         "user_summary_source": str(summary_path),
         "user_summary_copied_as": SOURCE_SUMMARY_COPY,
         "user_summary_sha256": base.sha256(summary_path),
@@ -2303,15 +2493,15 @@ def main() -> None:
         "sampling_rate_hz": FS,
         "window_samples": WINDOW,
         "stride_samples": STRIDE,
-        "window_anchor": "start at sample 0 of each record, then +64 samples",
+        "window_anchor": f"start at sample 0 of each record, then +{STRIDE} samples",
         "source_inventory_before_cross_pool_boundary_exclusions": quality[
             "confirmed_source_inventory"
         ],
         "signal_validity_or_flatline_filter_applied": False,
         "extra_fog_guard_applied": False,
-        "pure_fog_rule": "all 128 samples are FOG",
-        "pure_nonfog_rule": "all 128 samples are Non-FoG",
-        "mixed_rule": "exclude every window with 1..127 FOG samples",
+        "pure_fog_rule": f"all {WINDOW} samples are FOG",
+        "pure_nonfog_rule": f"all {WINDOW} samples are Non-FoG",
+        "mixed_rule": f"exclude every window with 1..{WINDOW - 1} FOG samples",
         "scope": "split independently within every subject",
         "permanent_test": "freeze approximately 20% of retained windows in each class by whole groups",
         "development_folds": "assign remaining groups to three folds by retained window count; rotate one validation fold",
@@ -2350,11 +2540,12 @@ def main() -> None:
     }
     base.write_json(build / PROTOCOL, protocol)
     (build / "README_NBM.md").write_text(
-        "# Daphnet processed_NBM\n\n"
+        f"# Daphnet {DATASET_ID}\n\n"
         "This directory preserves the canonical continuous records and adds a strict-purity, "
         "within-subject split for the NBM and downstream classifier.\n\n"
-        "- Window: 2 s (128 samples), anchored to each record, stride 1 s (64 samples).\n"
-        "- PURE_FOG: 128/128 samples are FoG. PURE_NONFOG: 0/128 samples are FoG.\n"
+        f"- Window: 2 s ({WINDOW} samples), anchored to each record, stride 1 s ({STRIDE} samples).\n"
+        f"- PURE_FOG: {WINDOW}/{WINDOW} samples are FoG. "
+        f"PURE_NONFOG: 0/{WINDOW} samples are FoG.\n"
         "- Mixed candidates are excluded and listed in `nbm_excluded_window_audit.csv`.\n"
         "- A fixed class-wise approximately 20% permanent test pool is shared by all folds.\n"
         "- The remaining groups form three rotating folds; one validates and two train.\n"

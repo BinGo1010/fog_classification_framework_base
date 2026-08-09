@@ -15,3 +15,30 @@ def test_retained_gru_nbm_architecture_and_shapes() -> None:
     assert config["skip_connections"] is False
     assert config["input_shape"] == ["B", 128, 9]
     assert config["output_shape"] == ["B", 128, 9]
+
+
+def test_retained_gru_nbm_accepts_32hz_two_second_windows() -> None:
+    """Only T changes from 128 to 64; all trainable GRU dimensions stay fixed."""
+    model = GRUReconstructionNBM(channels=9, hidden=64, bottleneck=16)
+    x = torch.zeros(3, 64, 9)
+    with torch.no_grad():
+        prediction = model(x)
+    assert prediction.shape == x.shape
+
+    config = architecture(64, 16, window_samples=64)
+    assert config["input_shape"] == ["B", 64, 9]
+    assert config["output_shape"] == ["B", 64, 9]
+    assert config["latent_shape"] == ["B", 16]
+    assert config["encoder_gru"] == {
+        "input_size": 9,
+        "hidden_size": 64,
+        "layers": 1,
+        "bidirectional": False,
+    }
+    assert config["decoder_gru"] == {
+        "input_size": 9,
+        "hidden_size": 64,
+        "layers": 1,
+        "bidirectional": False,
+        "input": "all-zero sequence",
+    }
