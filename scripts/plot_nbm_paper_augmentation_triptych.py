@@ -11,6 +11,7 @@ from pathlib import Path
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import Rectangle
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FS = 64
@@ -275,6 +276,32 @@ def main() -> None:
                 color="#777D82",
                 zorder=3,
             )
+        if panel["condition"] == "Time mask":
+            ax.add_patch(
+                Rectangle(
+                    (0.67, 0.77),
+                    0.09,
+                    0.07,
+                    transform=ax.transAxes,
+                    facecolor=COLORS["mask"],
+                    edgecolor=COLORS["mask"],
+                    linewidth=0.8,
+                    alpha=0.16,
+                    clip_on=False,
+                    zorder=3,
+                )
+            )
+            ax.text(
+                0.78,
+                0.805,
+                "Masked interval",
+                transform=ax.transAxes,
+                ha="left",
+                va="center",
+                fontsize=6.2,
+                color=COLORS["mask"],
+                zorder=3,
+            )
 
     axes[-1].set_xlabel("Time (s)", fontsize=7)
 
@@ -310,6 +337,7 @@ def main() -> None:
         "s09_mask_duration_ms": 1000.0 * mask_length / FS,
         "legend_used": False,
         "reference_annotation": "Original signal, shown at upper right of augmented panels",
+        "mask_annotation": "Masked interval, shown in red at upper right of the time-mask panel",
         "shared_y_axis": True,
         "amplitude_normalization": False,
         "figure_height_inches": args.figure_height,
@@ -347,7 +375,7 @@ def main() -> None:
 
 - Automated preflight: 13 PASS, 1 reviewed WARN, 0 FAIL.
 - Reviewed warning: random-number generation is intentional because panel b illustrates additive Gaussian augmentation; all underlying IMU traces are real dataset signals.
-- Visual inspection: passed at the final 3.5-inch width; method titles, axes, mask span, and original-signal annotations are readable without overlap.
+- Visual inspection: passed at the final 3.5-inch width; method titles, axes, mask span, original-signal annotations, and the red masked-interval key are readable without overlap.
 - Legend strategy: no legend object is present; the gray dashed reference is labeled directly at the upper right of the two augmented panels.
 - Axis integrity: all panels share one y-axis scale; no panel-specific amplitude normalization was applied.
 - Signal integrity: no smoothing, interpolation, or selective point removal was applied.
