@@ -188,7 +188,7 @@ def main() -> None:
             "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans", "sans-serif"],
             "svg.fonttype": "none",
             "pdf.fonttype": 42,
-            "font.size": 7,
+            "font.size": 9,
             "axes.spines.right": False,
             "axes.spines.top": False,
             "axes.linewidth": 0.8,
@@ -246,18 +246,34 @@ def main() -> None:
         ax.set_xlim(0.0, 2.0)
         ax.set_ylim(-y_limit, y_limit)
         ax.set_xticks((0.0, 1.0, 2.0))
-        ax.tick_params(labelsize=6.5, length=3, pad=2, labelbottom=True)
+        ax.tick_params(labelsize=8.5, length=3, pad=2, labelbottom=True)
         ax.set_title(
             str(panel["condition"]),
-            fontsize=10,
+            fontsize=12,
             fontweight="bold",
             color=color,
             pad=5,
+            x=0.50,
         )
+        if panel["condition"] == "Time mask":
+            ax.add_patch(
+                Rectangle(
+                    (0.58, 0.70),
+                    0.41,
+                    0.27,
+                    transform=ax.transAxes,
+                    facecolor="white",
+                    edgecolor="none",
+                    alpha=0.94,
+                    clip_on=False,
+                    zorder=2.8,
+                )
+            )
         if panel["condition"] != "Original":
+            reference_y = 0.90
             ax.plot(
-                [0.67, 0.76],
-                [0.90, 0.90],
+                [0.62, 0.71],
+                [reference_y, reference_y],
                 transform=ax.transAxes,
                 color=COLORS["reference"],
                 linewidth=0.9,
@@ -266,22 +282,22 @@ def main() -> None:
                 zorder=3,
             )
             ax.text(
-                0.78,
-                0.90,
+                0.73,
+                reference_y,
                 "Original signal",
                 transform=ax.transAxes,
                 ha="left",
                 va="center",
-                fontsize=6.2,
+                fontsize=8.2,
                 color="#777D82",
                 zorder=3,
             )
         if panel["condition"] == "Time mask":
             ax.add_patch(
                 Rectangle(
-                    (0.67, 0.77),
+                    (0.62, 0.76),
                     0.09,
-                    0.07,
+                    0.025,
                     transform=ax.transAxes,
                     facecolor=COLORS["mask"],
                     edgecolor=COLORS["mask"],
@@ -292,18 +308,18 @@ def main() -> None:
                 )
             )
             ax.text(
-                0.78,
-                0.805,
+                0.73,
+                0.7725,
                 "Masked interval",
                 transform=ax.transAxes,
                 ha="left",
                 va="center",
-                fontsize=6.2,
+                fontsize=8.2,
                 color=COLORS["mask"],
                 zorder=3,
             )
 
-    axes[-1].set_xlabel("Time (s)", fontsize=7)
+    axes[-1].set_xlabel("Time (s)", fontsize=9)
 
     stem = output_dir / "nbm_augmentation_vertical_s03_s02_s09"
     fig.savefig(stem.with_suffix(".png"), dpi=600, bbox_inches="tight", facecolor="white")

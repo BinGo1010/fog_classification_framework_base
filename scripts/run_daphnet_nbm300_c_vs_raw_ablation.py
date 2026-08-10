@@ -61,6 +61,11 @@ from scripts.run_daphnet_s01_nonfog_gru_reconstruction_tcnm import (
     prepare_nbm_windows,
     reconstruct as reconstruct_gru,
 )
+from scripts.run_daphnet_gru_v2_nbm300_fold import (
+    ARCHITECTURE_NAME as GRU_V2_ARCHITECTURE_NAME,
+    PhaseConditionedGRUNBM,
+    reconstruct_gru_v2,
+)
 from scripts.run_daphnet_transformer_nbm300_fold import (
     PatchTransformerNBM,
     reconstruct_transformer,
@@ -114,7 +119,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--method", choices=METHODS)
     parser.add_argument(
         "--nbm-kind",
-        choices=("conv_tcn", "gru", "transformer"),
+        choices=("conv_tcn", "gru", "gru_v2", "transformer"),
         default="conv_tcn",
     )
     parser.add_argument("--nbm-seed", type=int)
@@ -251,6 +256,7 @@ def load_scaler_only(
     checkpoint_names = {
         "conv_tcn": "conv_tcn_nbm_best.pt",
         "gru": "gru_nbm_best.pt",
+        "gru_v2": "gru_v2_nbm_best.pt",
         "transformer": "transformer_nbm_best.pt",
     }
     checkpoint_name = checkpoint_names[nbm_kind]
@@ -309,8 +315,29 @@ def validate_nbm_contract(frozen: dict[str, Any], args: argparse.Namespace) -> d
             {
                 "conv_tcn": "conv_tcn",
                 "gru": "gru_reconstruction",
+                "gru_v2": GRU_V2_ARCHITECTURE_NAME,
                 "transformer": "transformer_patch_autoencoder",
             }[args.nbm_kind]
+        ),
+        "gru_v2_architecture_details": (
+            args.nbm_kind != "gru_v2"
+            or (
+                architecture.get("name") == GRU_V2_ARCHITECTURE_NAME
+                and architecture.get("input_shape") == ["B", 128, 9]
+                and architecture.get("encoder", {}).get("layers") == 1
+                and architecture.get("encoder", {}).get("hidden_per_direction")
+                == 96
+                and architecture.get("bottleneck_shape") == ["B", 16]
+                and architecture.get("decoder", {}).get("layers") == 2
+                and architecture.get("decoder", {}).get("hidden") == 96
+                and architecture.get("decoder_conditioning", {}).get(
+                    "raw_or_encoder_token_connection"
+                )
+                is False
+                and architecture.get("encoder_decoder_skip_connections") is False
+                and architecture.get("teacher_forcing") is False
+                and int(architecture.get("parameter_count", -1)) == 172_697
+            )
         ),
         "transformer_architecture_details": (
             args.nbm_kind != "transformer"
@@ -375,6 +402,48 @@ def load_frozen_gru_nbm(
         "best_validation_metric": "role5_validation_SmoothL1",
         "calibration_role": 5,
         "scaler_role": 4,
+    }
+    return model, scaler, bias, sigma, manifest
+
+
+def load_frozen_gru_v2_nbm(
+    source_root: Path,
+    fold: int,
+    device: torch.device,
+) -> tuple[
+    PhaseConditionedGRUNBM,
+    RobustScaler,
+    np.ndarray,
+    np.ndarray,
+    dict[str, Any],
+]:
+    scaler, artifact, frozen = load_scaler_only(source_root, fold, "gru_v2")
+    training = frozen["training"]
+    architecture = training["architecture"]
+    if architecture["name"] != GRU_V2_ARCHITECTURE_NAME:
+        raise AssertionError("unexpected frozen GRU-v2 NBM architecture")
+    if int(architecture.get("parameter_count", -1)) != 172_697:
+        raise AssertionError("unexpected frozen GRU-v2 NBM parameter count")
+    model = PhaseConditionedGRUNBM().to(device)
+    checkpoint = Path(artifact["nbm_checkpoint"])
+    payload = torch.load(checkpoint, map_location=device, weights_only=False)
+    if payload.get("architecture") != architecture:
+        raise AssertionError("GRU-v2 checkpoint/frozen architecture mismatch")
+    model.load_state_dict(payload["model_state"])
+    model.eval()
+    calibration = frozen["calibration"]
+    bias = np.asarray(calibration["bias"], dtype=np.float32)
+    sigma = np.asarray(calibration["sigma"], dtype=np.float32)
+    if bias.shape != (9,) or sigma.shape != (9,) or np.any(sigma < 0.05):
+        raise AssertionError("invalid frozen GRU-v2 NBM role-5 calibration")
+    manifest = {
+        **artifact,
+        "best_epoch": int(training["best_epoch"]),
+        "best_validation_loss": float(training["best_validation_huber"]),
+        "best_validation_metric": "role5_validation_SmoothL1",
+        "calibration_role": 5,
+        "scaler_role": 4,
+        "architecture": architecture,
     }
     return model, scaler, bias, sigma, manifest
 
@@ -549,6 +618,14 @@ def make_features(
         )
         scaled = prepare_nbm_windows(full_scaler, raw, center=True)
         reconstruction = reconstruct_gru(nbm, scaled, device)
+        error_ntc = (scaled - reconstruction).astype(np.float32, copy=False)
+        error = np.ascontiguousarray(error_ntc.transpose(0, 2, 1))
+    elif nbm_kind == "gru_v2":
+        nbm, full_scaler, bias, sigma, nbm_manifest = load_frozen_gru_v2_nbm(
+            nbm_source_root, fold, device
+        )
+        scaled = prepare_nbm_windows(full_scaler, raw, center=True)
+        reconstruction = reconstruct_gru_v2(nbm, scaled, device)
         error_ntc = (scaled - reconstruction).astype(np.float32, copy=False)
         error = np.ascontiguousarray(error_ntc.transpose(0, 2, 1))
     else:
@@ -837,6 +914,11 @@ def run_evaluate(args: argparse.Namespace, device: torch.device) -> None:
     )
     if artifact_manifest["scaler_sha256"] != sealed["scaler_sha256"]:
         raise AssertionError("sealed role-4 scaler changed")
+    if (
+        artifact_manifest["nbm_checkpoint_sha256"]
+        != sealed["nbm_checkpoint_sha256"]
+    ):
+        raise AssertionError("sealed NBM checkpoint changed")
     test_x, test_feature = make_features(
         args.method, scaler,
         raw_windows_dynamic(records, test_rows, args.window_samples),
