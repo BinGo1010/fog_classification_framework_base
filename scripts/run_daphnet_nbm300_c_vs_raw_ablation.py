@@ -61,6 +61,10 @@ from scripts.run_daphnet_s01_nonfog_gru_reconstruction_tcnm import (
     prepare_nbm_windows,
     reconstruct as reconstruct_gru,
 )
+from scripts.run_daphnet_transformer_nbm300_fold import (
+    PatchTransformerNBM,
+    reconstruct_transformer,
+)
 
 FOLDS = (0, 1, 2)
 METHODS = ("FULL_C", "RAW")
@@ -108,7 +112,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fold", type=int, choices=FOLDS)
     parser.add_argument("--method", choices=METHODS)
-    parser.add_argument("--nbm-kind", choices=("conv_tcn", "gru"), default="conv_tcn")
+    parser.add_argument(
+        "--nbm-kind",
+        choices=("conv_tcn", "gru", "transformer"),
+        default="conv_tcn",
+    )
     parser.add_argument("--nbm-seed", type=int)
     parser.add_argument("--tcn-seed", type=int)
     parser.add_argument("--nbm-seeds", default="0,52,161")
@@ -240,7 +248,12 @@ def load_scaler_only(
     """Load only the role-4 scaler; do not instantiate NBM or read b/sigma."""
     fold_dir = source_root.resolve() / f"fold_{fold}"
     frozen_path = fold_dir / "nbm_frozen.json"
-    checkpoint_name = "conv_tcn_nbm_best.pt" if nbm_kind == "conv_tcn" else "gru_nbm_best.pt"
+    checkpoint_names = {
+        "conv_tcn": "conv_tcn_nbm_best.pt",
+        "gru": "gru_nbm_best.pt",
+        "transformer": "transformer_nbm_best.pt",
+    }
+    checkpoint_name = checkpoint_names[nbm_kind]
     checkpoint = fold_dir / "checkpoints" / checkpoint_name
     if not frozen_path.exists() or not checkpoint.exists():
         raise FileNotFoundError(f"frozen NBM/scaler artifacts missing: {fold_dir}")
@@ -268,6 +281,7 @@ def load_scaler_only(
 def validate_nbm_contract(frozen: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     training = frozen["training"]
     augmentation = training["augmentation"]
+    architecture = training["architecture"]
     expected_aug = {
         "clean_probability": 0.40,
         "gaussian_probability": 0.40,
@@ -291,10 +305,32 @@ def validate_nbm_contract(frozen: dict[str, Any], args: argparse.Namespace) -> d
             args.nbm_seed is not None
             and int(training["seed"]) == args.nbm_seed
         ),
-        "architecture": (
-            str(training["architecture"]["name"]).startswith("conv_tcn")
-            if args.nbm_kind == "conv_tcn"
-            else str(training["architecture"]["name"]).startswith("gru_reconstruction")
+        "architecture": str(architecture["name"]).startswith(
+            {
+                "conv_tcn": "conv_tcn",
+                "gru": "gru_reconstruction",
+                "transformer": "transformer_patch_autoencoder",
+            }[args.nbm_kind]
+        ),
+        "transformer_architecture_details": (
+            args.nbm_kind != "transformer"
+            or (
+                architecture.get("input_shape") == ["B", 9, 128]
+                and architecture.get("patchify", {}).get("patch_size") == 8
+                and architecture.get("patchify", {}).get("token_shape")
+                == ["B", 16, 72]
+                and architecture.get("encoder", {}).get("layers") == 4
+                and architecture.get("encoder", {}).get("d_model") == 192
+                and architecture.get("encoder", {}).get("heads") == 6
+                and architecture.get("encoder", {}).get("ffn") == 576
+                and architecture.get("bottleneck_shape") == ["B", 8, 64]
+                and architecture.get("decoder", {}).get("layers") == 2
+                and architecture.get("decoder", {}).get("d_model") == 192
+                and architecture.get("decoder", {}).get("heads") == 6
+                and architecture.get("decoder", {}).get("ffn") == 576
+                and architecture.get("encoder_decoder_skip_connections") is False
+                and int(architecture.get("parameter_count", -1)) == 2_329_736
+            )
         ),
     }
     failed = [name for name, passed in checks.items() if not passed]
@@ -332,6 +368,38 @@ def load_frozen_gru_nbm(
     sigma = np.asarray(calibration["sigma"], dtype=np.float32)
     if bias.shape != (9,) or sigma.shape != (9,) or np.any(sigma < 0.05):
         raise AssertionError("invalid frozen GRU-NBM role-5 calibration")
+    manifest = {
+        **artifact,
+        "best_epoch": int(training["best_epoch"]),
+        "best_validation_loss": float(training["best_validation_huber"]),
+        "best_validation_metric": "role5_validation_SmoothL1",
+        "calibration_role": 5,
+        "scaler_role": 4,
+    }
+    return model, scaler, bias, sigma, manifest
+
+
+def load_frozen_transformer_nbm(
+    source_root: Path,
+    fold: int,
+    device: torch.device,
+) -> tuple[PatchTransformerNBM, RobustScaler, np.ndarray, np.ndarray, dict[str, Any]]:
+    scaler, artifact, frozen = load_scaler_only(source_root, fold, "transformer")
+    training = frozen["training"]
+    architecture = training["architecture"]
+    if architecture["name"] != "transformer_patch_autoencoder_nbm_v1":
+        raise AssertionError("unexpected frozen Transformer-NBM architecture")
+    dropout = float(architecture.get("dropout", 0.10))
+    model = PatchTransformerNBM(dropout=dropout).to(device)
+    checkpoint = Path(artifact["nbm_checkpoint"])
+    payload = torch.load(checkpoint, map_location=device, weights_only=False)
+    model.load_state_dict(payload["model_state"])
+    model.eval()
+    calibration = frozen["calibration"]
+    bias = np.asarray(calibration["bias"], dtype=np.float32)
+    sigma = np.asarray(calibration["sigma"], dtype=np.float32)
+    if bias.shape != (9,) or sigma.shape != (9,) or np.any(sigma < 0.05):
+        raise AssertionError("invalid frozen Transformer-NBM role-5 calibration")
     manifest = {
         **artifact,
         "best_epoch": int(training["best_epoch"]),
@@ -475,7 +543,7 @@ def make_features(
             nbm_source_root, fold, device
         )
         error = reconstruction_error(nbm, full_scaler, raw, device)
-    else:
+    elif nbm_kind == "gru":
         nbm, full_scaler, bias, sigma, nbm_manifest = load_frozen_gru_nbm(
             nbm_source_root, fold, device
         )
@@ -483,6 +551,15 @@ def make_features(
         reconstruction = reconstruct_gru(nbm, scaled, device)
         error_ntc = (scaled - reconstruction).astype(np.float32, copy=False)
         error = np.ascontiguousarray(error_ntc.transpose(0, 2, 1))
+    else:
+        if window_samples != 128:
+            raise ValueError("Transformer-NBM v1 is fixed to 128 samples")
+        nbm, full_scaler, bias, sigma, nbm_manifest = load_frozen_transformer_nbm(
+            nbm_source_root, fold, device
+        )
+        scaled = centered_scaled_bct(full_scaler, raw)
+        reconstruction = reconstruct_transformer(nbm, scaled, device)
+        error = (scaled - reconstruction).astype(np.float32, copy=False)
     if stable_json_hash(full_scaler.as_dict()) != stable_json_hash(scaler.as_dict()):
         raise AssertionError("FULL_C and RAW scalers differ")
     values, clip_stats = build_scheme_c_features(
