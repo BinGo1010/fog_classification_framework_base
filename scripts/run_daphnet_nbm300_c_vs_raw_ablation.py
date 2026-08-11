@@ -66,6 +66,11 @@ from scripts.run_daphnet_gru_v2_nbm300_fold import (
     PhaseConditionedGRUNBM,
     reconstruct_gru_v2,
 )
+from scripts.run_daphnet_tcn_v2_nbm300_fold import (
+    ARCHITECTURE_NAME as TCN_V2_ARCHITECTURE_NAME,
+    GlobalBottleneckTCNNBM,
+    reconstruct_tcn_v2,
+)
 from scripts.run_daphnet_transformer_nbm300_fold import (
     PatchTransformerNBM,
     reconstruct_transformer,
@@ -119,7 +124,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--method", choices=METHODS)
     parser.add_argument(
         "--nbm-kind",
-        choices=("conv_tcn", "gru", "gru_v2", "transformer"),
+        choices=("conv_tcn", "gru", "gru_v2", "tcn_v2", "transformer"),
         default="conv_tcn",
     )
     parser.add_argument("--nbm-seed", type=int)
@@ -245,6 +250,120 @@ def audit_protocol_dynamic(
     }
 
 
+def build_test_data_manifest(
+    data_dir: Path,
+    rows_by_fold: dict[int, Any],
+) -> dict[str, Any]:
+    """Bind the permanent-test rows and underlying record bytes to the seal."""
+    data_dir = data_dir.resolve()
+    fold_manifests: dict[str, dict[str, Any]] = {}
+    referenced_records: set[str] = set()
+    fold_hashes: set[str] = set()
+    for fold, rows in sorted(rows_by_fold.items()):
+        indices = np.flatnonzero(np.isin(rows.role, [0, 1]))
+        entries = [
+            {
+                "subject_id": str(rows.subject_id[index]),
+                "record_id": str(rows.record_id[index]),
+                "window_id": str(rows.window_id[index]),
+                "start": int(rows.start[index]),
+                "end": int(rows.end[index]),
+                "role": int(rows.role[index]),
+                "label": int(rows.label[index]),
+            }
+            for index in indices
+        ]
+        entries.sort(
+            key=lambda item: (
+                item["subject_id"],
+                item["record_id"],
+                item["start"],
+                item["end"],
+                item["window_id"],
+            )
+        )
+        window_sha256 = stable_json_hash(entries)
+        fold_hashes.add(window_sha256)
+        fold_manifests[str(fold)] = {
+            "window_count": len(entries),
+            "window_manifest_sha256": window_sha256,
+        }
+        referenced_records.update(item["record_id"] for item in entries)
+    if len(fold_hashes) != 1:
+        raise AssertionError("permanent role-0/1 manifests differ across folds")
+
+    record_files = []
+    for record_id in sorted(referenced_records):
+        path = data_dir / "records" / f"{record_id}.npz"
+        if not path.is_file():
+            raise FileNotFoundError(f"permanent-test record file missing: {path}")
+        record_files.append(
+            {
+                "record_id": record_id,
+                "relative_path": path.relative_to(data_dir).as_posix(),
+                "size_bytes": int(path.stat().st_size),
+                "sha256": sha256_file(path),
+            }
+        )
+    core = {
+        "schema": "permanent_test_data_manifest.v1",
+        "definition": (
+            "canonical role0/1 subject,record,start,end,role,label,window_id plus "
+            "SHA256 of every referenced record npz"
+        ),
+        "protocol_sha256": sha256_file(data_dir / "nbm_protocol.json"),
+        "quality_report_sha256": sha256_file(
+            data_dir / "nbm_quality_report.json"
+        ),
+        "folds": fold_manifests,
+        "record_files": record_files,
+    }
+    return {**core, "sha256": stable_json_hash(core)}
+
+
+def barrier_identity_payload(barrier: dict[str, Any]) -> dict[str, Any]:
+    """Canonical fields protected by barrier_id; timestamps are excluded."""
+    return {
+        "barrier_schema": barrier["barrier_schema"],
+        "status": barrier["status"],
+        "folds": barrier["folds"],
+        "methods": barrier["methods"],
+        "nbm_seeds": barrier["nbm_seeds"],
+        "tcn_seeds": barrier["tcn_seeds"],
+        "job_count": barrier["job_count"],
+        "strict_test_gate": barrier["strict_test_gate"],
+        "source_audit": barrier["source_audit"],
+        "test_data_manifest_sha256": barrier["test_data_manifest"]["sha256"],
+        "jobs": barrier["jobs"],
+    }
+
+
+def load_and_validate_barrier(path: Path) -> dict[str, Any]:
+    barrier = json.loads(path.read_text(encoding="utf-8"))
+    schema = barrier.get("barrier_schema")
+    if schema == "strict_test_barrier.v2":
+        expected = stable_json_hash(barrier_identity_payload(barrier))
+        if barrier.get("barrier_id") != expected:
+            raise AssertionError("TRAINING_BARRIER identity hash mismatch")
+    elif schema is not None or "barrier_id" in barrier:
+        raise AssertionError(f"unsupported TRAINING_BARRIER schema: {schema}")
+    return barrier
+
+
+def require_strict_barrier_for_tcn_v2(
+    barrier: dict[str, Any],
+    nbm_kind: str,
+) -> None:
+    if (
+        nbm_kind == "tcn_v2"
+        and barrier.get("barrier_schema") != "strict_test_barrier.v2"
+    ):
+        raise RuntimeError(
+            "TCN-v2 requires strict_test_barrier.v2; rerun classifier train/seal "
+            "or use a clean output-root"
+        )
+
+
 def load_scaler_only(
     source_root: Path,
     fold: int,
@@ -257,6 +376,7 @@ def load_scaler_only(
         "conv_tcn": "conv_tcn_nbm_best.pt",
         "gru": "gru_nbm_best.pt",
         "gru_v2": "gru_v2_nbm_best.pt",
+        "tcn_v2": "tcn_v2_nbm_best.pt",
         "transformer": "transformer_nbm_best.pt",
     }
     checkpoint_name = checkpoint_names[nbm_kind]
@@ -316,6 +436,7 @@ def validate_nbm_contract(frozen: dict[str, Any], args: argparse.Namespace) -> d
                 "conv_tcn": "conv_tcn",
                 "gru": "gru_reconstruction",
                 "gru_v2": GRU_V2_ARCHITECTURE_NAME,
+                "tcn_v2": TCN_V2_ARCHITECTURE_NAME,
                 "transformer": "transformer_patch_autoencoder",
             }[args.nbm_kind]
         ),
@@ -337,6 +458,27 @@ def validate_nbm_contract(frozen: dict[str, Any], args: argparse.Namespace) -> d
                 and architecture.get("encoder_decoder_skip_connections") is False
                 and architecture.get("teacher_forcing") is False
                 and int(architecture.get("parameter_count", -1)) == 172_697
+            )
+        ),
+        "tcn_v2_architecture_details": (
+            args.nbm_kind != "tcn_v2"
+            or (
+                architecture.get("name") == TCN_V2_ARCHITECTURE_NAME
+                and architecture.get("input_shape") == ["B", 9, 128]
+                and architecture.get("bottleneck_shape") == ["B", 16]
+                and architecture.get("output_shape") == ["B", 9, 128]
+                and architecture.get("decoder_conditioning", {}).get(
+                    "raw_or_encoder_temporal_connection"
+                )
+                is False
+                and architecture.get("decoder_conditioning", {}).get(
+                    "time_code_trainable"
+                )
+                is False
+                and architecture.get("encoder_decoder_skip_connections") is False
+                and architecture.get("teacher_forcing") is False
+                and float(architecture.get("dropout", -1.0)) == 0.10
+                and int(architecture.get("parameter_count", -1)) == 186_065
             )
         ),
         "transformer_architecture_details": (
@@ -436,6 +578,71 @@ def load_frozen_gru_v2_nbm(
     sigma = np.asarray(calibration["sigma"], dtype=np.float32)
     if bias.shape != (9,) or sigma.shape != (9,) or np.any(sigma < 0.05):
         raise AssertionError("invalid frozen GRU-v2 NBM role-5 calibration")
+    manifest = {
+        **artifact,
+        "best_epoch": int(training["best_epoch"]),
+        "best_validation_loss": float(training["best_validation_huber"]),
+        "best_validation_metric": "role5_validation_SmoothL1",
+        "calibration_role": 5,
+        "scaler_role": 4,
+        "architecture": architecture,
+    }
+    return model, scaler, bias, sigma, manifest
+
+
+def load_frozen_tcn_v2_nbm(
+    source_root: Path,
+    fold: int,
+    device: torch.device,
+) -> tuple[
+    GlobalBottleneckTCNNBM,
+    RobustScaler,
+    np.ndarray,
+    np.ndarray,
+    dict[str, Any],
+]:
+    scaler, artifact, frozen = load_scaler_only(source_root, fold, "tcn_v2")
+    training = frozen["training"]
+    architecture = training["architecture"]
+    if architecture.get("name") != TCN_V2_ARCHITECTURE_NAME:
+        raise AssertionError("unexpected frozen TCN-v2 NBM architecture")
+    if int(architecture.get("parameter_count", -1)) != 186_065:
+        raise AssertionError("unexpected frozen TCN-v2 NBM parameter count")
+    if architecture.get("bottleneck_shape") != ["B", 16]:
+        raise AssertionError("unexpected frozen TCN-v2 NBM bottleneck")
+    model = GlobalBottleneckTCNNBM(
+        dropout=float(architecture.get("dropout", 0.10))
+    ).to(device)
+    checkpoint = Path(artifact["nbm_checkpoint"])
+    payload = torch.load(checkpoint, map_location=device, weights_only=False)
+    if payload.get("architecture") != architecture:
+        raise AssertionError("TCN-v2 checkpoint/frozen architecture mismatch")
+    if payload.get("augmentation") != training.get("augmentation"):
+        raise AssertionError("TCN-v2 checkpoint/frozen augmentation mismatch")
+    if int(payload.get("seed", -1)) != int(training["seed"]):
+        raise AssertionError("TCN-v2 checkpoint/frozen seed mismatch")
+    if int(payload.get("epoch", -1)) != int(training["best_epoch"]):
+        raise AssertionError("TCN-v2 checkpoint/frozen best epoch mismatch")
+    if not np.isclose(
+        float(payload.get("validation_huber", np.nan)),
+        float(training["best_validation_huber"]),
+        rtol=1e-7,
+        atol=1e-10,
+    ):
+        raise AssertionError("TCN-v2 checkpoint/frozen validation loss mismatch")
+    model.load_state_dict(payload["model_state"], strict=True)
+    model.eval()
+    calibration = frozen["calibration"]
+    bias = np.asarray(calibration["bias"], dtype=np.float32)
+    sigma = np.asarray(calibration["sigma"], dtype=np.float32)
+    if (
+        bias.shape != (9,)
+        or sigma.shape != (9,)
+        or not np.all(np.isfinite(bias))
+        or not np.all(np.isfinite(sigma))
+        or np.any(sigma < 0.05)
+    ):
+        raise AssertionError("invalid frozen TCN-v2 NBM role-5 calibration")
     manifest = {
         **artifact,
         "best_epoch": int(training["best_epoch"]),
@@ -628,7 +835,16 @@ def make_features(
         reconstruction = reconstruct_gru_v2(nbm, scaled, device)
         error_ntc = (scaled - reconstruction).astype(np.float32, copy=False)
         error = np.ascontiguousarray(error_ntc.transpose(0, 2, 1))
-    else:
+    elif nbm_kind == "tcn_v2":
+        if window_samples != 128:
+            raise ValueError("TCN-v2 NBM is fixed to 128 samples")
+        nbm, full_scaler, bias, sigma, nbm_manifest = load_frozen_tcn_v2_nbm(
+            nbm_source_root, fold, device
+        )
+        scaled = centered_scaled_bct(full_scaler, raw)
+        reconstruction = reconstruct_tcn_v2(nbm, scaled, device)
+        error = (scaled - reconstruction).astype(np.float32, copy=False)
+    elif nbm_kind == "transformer":
         if window_samples != 128:
             raise ValueError("Transformer-NBM v1 is fixed to 128 samples")
         nbm, full_scaler, bias, sigma, nbm_manifest = load_frozen_transformer_nbm(
@@ -637,6 +853,8 @@ def make_features(
         scaled = centered_scaled_bct(full_scaler, raw)
         reconstruction = reconstruct_transformer(nbm, scaled, device)
         error = (scaled - reconstruction).astype(np.float32, copy=False)
+    else:
+        raise ValueError(f"unsupported NBM kind: {nbm_kind}")
     if stable_json_hash(full_scaler.as_dict()) != stable_json_hash(scaler.as_dict()):
         raise AssertionError("FULL_C and RAW scalers differ")
     values, clip_stats = build_scheme_c_features(
@@ -831,7 +1049,11 @@ def run_seal(args: argparse.Namespace) -> None:
         args.window_samples,
         args.stride_samples,
     )
+    test_data_manifest = build_test_data_manifest(
+        args.data_dir.resolve(), rows_by_fold
+    )
     barrier = {
+        "barrier_schema": "strict_test_barrier.v2",
         "status": "all_FULL_C_and_RAW_classifiers_and_thresholds_frozen",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "folds": list(FOLDS), "methods": list(METHODS),
@@ -839,8 +1061,10 @@ def run_seal(args: argparse.Namespace) -> None:
         "job_count": len(entries),
         "strict_test_gate": "roles 0/1 may be accessed only after this global barrier",
         "source_audit": source_audit,
+        "test_data_manifest": test_data_manifest,
         "jobs": entries,
     }
+    barrier["barrier_id"] = stable_json_hash(barrier_identity_payload(barrier))
     write_json(root / "TRAINING_BARRIER.json", barrier)
     write_json(root / "experiment_config.json", {
         "experiment": f"strict_paired_{entries[0]['nbm_kind']}_NBM_schemeC_vs_centered_scaled_RAW_TCN",
@@ -863,6 +1087,9 @@ def run_seal(args: argparse.Namespace) -> None:
         "roles": {str(key): value for key, value in ROLES.items()},
         "threshold": "roles 2/3 balanced accuracy; ties FoG F1 then higher threshold",
         "global_test_barrier_jobs": len(entries),
+        "barrier_schema": barrier["barrier_schema"],
+        "barrier_id": barrier["barrier_id"],
+        "test_data_manifest_sha256": test_data_manifest["sha256"],
     })
     print(f"GLOBAL TRAINING BARRIER SEALED jobs={len(entries)}", flush=True)
 
@@ -871,14 +1098,21 @@ def sealed_job(args: argparse.Namespace) -> dict[str, Any]:
     barrier_path = args.output_root.resolve() / "TRAINING_BARRIER.json"
     if not barrier_path.exists():
         raise FileNotFoundError("TRAINING_BARRIER.json missing; roles 0/1 access forbidden")
-    barrier = json.loads(barrier_path.read_text(encoding="utf-8"))
+    barrier = load_and_validate_barrier(barrier_path)
+    require_strict_barrier_for_tcn_v2(barrier, args.nbm_kind)
     target = job_id(args.fold, args.method, args.tcn_seed)
     matches = [item for item in barrier["jobs"] if item["job_id"] == target]
     if len(matches) != 1:
         raise AssertionError(f"job not sealed: {target}")
     if matches[0]["nbm_kind"] != args.nbm_kind:
         raise AssertionError("requested NBM backbone differs from the sealed experiment")
-    return matches[0]
+    sealed = dict(matches[0])
+    sealed["barrier_schema"] = barrier.get("barrier_schema", "legacy.v1")
+    sealed["barrier_id"] = barrier.get("barrier_id", sha256_file(barrier_path))
+    sealed["test_data_manifest_sha256"] = (
+        barrier.get("test_data_manifest", {}).get("sha256")
+    )
+    return sealed
 
 
 def load_history(path: Path) -> list[dict[str, Any]]:
@@ -891,12 +1125,80 @@ def load_history(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def validate_completed_test_artifacts(
+    directory: Path,
+    sealed: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a completed result only when it belongs to the current seal."""
+    done_path = directory / "DONE_TEST.json"
+    metrics_path = directory / "metrics.json"
+    predictions_path = directory / "test_predictions.csv"
+    probabilities_path = directory / "test_probabilities.npz"
+    required = (done_path, metrics_path, predictions_path, probabilities_path)
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"incomplete sealed test artifacts: {missing}")
+    done = json.loads(done_path.read_text(encoding="utf-8"))
+    result = json.loads(metrics_path.read_text(encoding="utf-8"))
+    if done.get("status") != "complete" or done.get("job_id") != sealed["job_id"]:
+        raise AssertionError("DONE_TEST does not identify the sealed job")
+    if result.get("job_id") != sealed["job_id"]:
+        raise AssertionError("metrics do not identify the sealed job")
+    if sealed["barrier_schema"] == "strict_test_barrier.v2":
+        expected_fields = {
+            "barrier_id": sealed["barrier_id"],
+            "test_data_manifest_sha256": sealed["test_data_manifest_sha256"],
+            "tcn_checkpoint_sha256": sealed["checkpoint_sha256"],
+            "nbm_checkpoint_sha256": sealed["nbm_checkpoint_sha256"],
+            "scaler_sha256": sealed["scaler_sha256"],
+        }
+        for optional_key in (
+            "nbm_frozen_sha256",
+            "done_nbm_sha256",
+            "frozen_validation_sha256",
+            "scientific_data_sha256",
+            "feature_contract_sha256",
+        ):
+            if optional_key in sealed:
+                expected_fields[optional_key] = sealed[optional_key]
+        for key, expected in expected_fields.items():
+            if result.get(key) != expected or done.get(key) != expected:
+                raise AssertionError(
+                    f"completed test artifact does not match current seal: {key}"
+                )
+        if float(result.get("threshold", np.nan)) != float(sealed["threshold"]):
+            raise AssertionError("completed test threshold does not match current seal")
+        artifact_hashes = {
+            "metrics_sha256": sha256_file(metrics_path),
+            "predictions_sha256": sha256_file(predictions_path),
+            "probabilities_sha256": sha256_file(probabilities_path),
+        }
+        for key, actual in artifact_hashes.items():
+            if done.get(key) != actual:
+                raise AssertionError(f"completed test file hash mismatch: {key}")
+    return result
+
+
 def run_evaluate(args: argparse.Namespace, device: torch.device) -> None:
     require_job_args(args)
     sealed = sealed_job(args)
     directory = job_dir(args.output_root.resolve(), args.fold, args.method, args.tcn_seed)
     done_path = directory / "DONE_TEST.json"
+    current_test_manifest = None
+    if sealed["barrier_schema"] == "strict_test_barrier.v2":
+        rows_by_fold = {
+            fold: load_fold_rows(args.data_dir.resolve(), fold) for fold in FOLDS
+        }
+        current_test_manifest = build_test_data_manifest(
+            args.data_dir.resolve(), rows_by_fold
+        )
+        if (
+            current_test_manifest["sha256"]
+            != sealed["test_data_manifest_sha256"]
+        ):
+            raise AssertionError("permanent-test data changed after the global seal")
     if done_path.exists() and not args.overwrite:
+        validate_completed_test_artifacts(directory, sealed)
         print(f"SKIP completed test job: {done_path}", flush=True)
         return
     checkpoint = directory / "checkpoints" / "tcn.pt"
@@ -944,10 +1246,15 @@ def run_evaluate(args: argparse.Namespace, device: torch.device) -> None:
         "nbm_kind": args.nbm_kind,
         "threshold": threshold, "threshold_source_roles": [2, 3],
         "strict_global_test_barrier_verified": True, "test_roles": [0, 1],
+        "barrier_schema": sealed["barrier_schema"],
+        "barrier_id": sealed["barrier_id"],
+        "test_data_manifest_sha256": sealed["test_data_manifest_sha256"],
         "test": metrics, "test_by_subject": by_subject,
         "test_feature": test_feature,
         "test_feature_diagnostics": residual_diagnostics(test_x, test_true),
         "tcn_checkpoint_sha256": sealed["checkpoint_sha256"],
+        "nbm_checkpoint_sha256": sealed["nbm_checkpoint_sha256"],
+        "scaler_sha256": sealed["scaler_sha256"],
     }
     write_json(directory / "metrics.json", result)
     write_csv(directory / "test_predictions.csv", [{
@@ -968,9 +1275,20 @@ def run_evaluate(args: argparse.Namespace, device: torch.device) -> None:
         directory, args.method,
         {**frozen["training"], "history": history}, metrics["confusion_matrix"],
     )
+    metrics_path = directory / "metrics.json"
+    predictions_path = directory / "test_predictions.csv"
+    probabilities_path = directory / "test_probabilities.npz"
     write_json(done_path, {
         "status": "complete", "completed_utc": datetime.now(timezone.utc).isoformat(),
         "job_id": sealed["job_id"], "test": metrics,
+        "barrier_id": sealed["barrier_id"],
+        "test_data_manifest_sha256": sealed["test_data_manifest_sha256"],
+        "tcn_checkpoint_sha256": sealed["checkpoint_sha256"],
+        "nbm_checkpoint_sha256": sealed["nbm_checkpoint_sha256"],
+        "scaler_sha256": sealed["scaler_sha256"],
+        "metrics_sha256": sha256_file(metrics_path),
+        "predictions_sha256": sha256_file(predictions_path),
+        "probabilities_sha256": sha256_file(probabilities_path),
     })
     print(
         f"TEST COMPLETE {sealed['job_id']} acc={metrics['accuracy']:.6f} "
@@ -993,14 +1311,49 @@ def run_aggregate(args: argparse.Namespace) -> None:
     if seeds != required_seeds:
         raise ValueError(f"this experiment requires seeds {required_seeds}")
     root = args.output_root.resolve()
-    if not (root / "TRAINING_BARRIER.json").exists():
+    barrier_path = root / "TRAINING_BARRIER.json"
+    if not barrier_path.exists():
         raise FileNotFoundError("cannot aggregate without global barrier")
+    barrier = load_and_validate_barrier(barrier_path)
+    require_strict_barrier_for_tcn_v2(barrier, args.nbm_kind)
+    barrier_schema = barrier.get("barrier_schema", "legacy.v1")
+    barrier_id = barrier.get("barrier_id", sha256_file(barrier_path))
+    test_data_manifest_sha256 = barrier.get("test_data_manifest", {}).get(
+        "sha256"
+    )
+    if barrier_schema == "strict_test_barrier.v2":
+        rows_by_fold = {
+            fold: load_fold_rows(args.data_dir.resolve(), fold) for fold in FOLDS
+        }
+        current_test_manifest = build_test_data_manifest(
+            args.data_dir.resolve(), rows_by_fold
+        )
+        if current_test_manifest["sha256"] != test_data_manifest_sha256:
+            raise AssertionError("permanent-test data changed after the global seal")
+    barrier_jobs = {item["job_id"]: item for item in barrier["jobs"]}
     results = []
     for fold, method, seed in expected_jobs(seeds):
         directory = job_dir(root, fold, method, seed)
+        target = job_id(fold, method, seed)
+        if target not in barrier_jobs:
+            raise AssertionError(f"job absent from global barrier: {target}")
         if not (directory / "DONE_TEST.json").exists():
             raise FileNotFoundError(f"test incomplete: {job_id(fold, method, seed)}")
-        results.append(json.loads((directory / "metrics.json").read_text(encoding="utf-8")))
+        sealed = {
+            **barrier_jobs[target],
+            "barrier_schema": barrier_schema,
+            "barrier_id": barrier_id,
+            "test_data_manifest_sha256": test_data_manifest_sha256,
+        }
+        result = validate_completed_test_artifacts(directory, sealed)
+        if (
+            int(result["fold"]) != fold
+            or result["method"] != method
+            or int(result["tcn_seed"]) != seed
+            or result["nbm_kind"] != args.nbm_kind
+        ):
+            raise AssertionError(f"test result identity mismatch: {target}")
+        results.append(result)
     run_rows = [{
         "fold": r["fold"], "method": r["method"], "nbm_kind": r["nbm_kind"],
         "nbm_seed": r["nbm_seed"], "tcn_seed": r["tcn_seed"],
@@ -1065,6 +1418,9 @@ def run_aggregate(args: argparse.Namespace) -> None:
             f"{len(seeds)} seeds"
         ),
         "strict_global_test_barrier": True,
+        "barrier_schema": barrier_schema,
+        "barrier_id": barrier_id,
+        "test_data_manifest_sha256": test_data_manifest_sha256,
         "nbm_kind": results[0]["nbm_kind"],
         "run_count": len(results),
     }

@@ -22,6 +22,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from cnbr_fog.data import DaphnetDataset
+from cnbr_fog.resume import atomic_json_dump
+from cnbr_fog.scientific_fingerprint import processed_nbm_scientific_manifest
 from scripts.run_daphnet_processed_nbm_centered_residual_tcn import (
     ROLES,
     SUBJECTS,
@@ -29,7 +31,6 @@ from scripts.run_daphnet_processed_nbm_centered_residual_tcn import (
     load_fold_rows,
     save_figure_bundle,
     write_csv,
-    write_json,
 )
 from scripts.run_daphnet_nbm300_c_vs_raw_ablation import (
     audit_protocol_dynamic,
@@ -45,6 +46,60 @@ from scripts.run_daphnet_s01_nonfog_gru_reconstruction_tcnm import (
 )
 
 FOLDS = (0, 1, 2)
+
+
+def validate_existing_nbm(
+    fold_dir: Path,
+    args: argparse.Namespace,
+    scientific_data_sha256: str,
+) -> None:
+    done_path = fold_dir / "DONE_NBM.json"
+    frozen_path = fold_dir / "nbm_frozen.json"
+    scaler_path = fold_dir / "scaler_role4.json"
+    checkpoint = fold_dir / "checkpoints" / "gru_nbm_best.pt"
+    for path in (done_path, frozen_path, scaler_path, checkpoint):
+        if not path.is_file():
+            raise FileNotFoundError(f"incomplete GRU-v1 NBM artifacts: {path}")
+    done = json.loads(done_path.read_text(encoding="utf-8"))
+    frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+    scaler = json.loads(scaler_path.read_text(encoding="utf-8"))
+    training = frozen["training"]
+    expected = {
+        "status": "frozen",
+        "fold": args.fold,
+        "seed": args.seed,
+        "maximum_epochs": 300,
+        "patience": 20,
+        "scientific_data_sha256": scientific_data_sha256,
+    }
+    for key, value in expected.items():
+        if done.get(key) != value:
+            raise AssertionError(f"stale GRU-v1 DONE_NBM {key}: {done.get(key)!r}")
+    if training.get("seed") != args.seed:
+        raise AssertionError("GRU-v1 frozen training seed mismatch")
+    if frozen.get("scientific_data_sha256") != scientific_data_sha256:
+        raise AssertionError("GRU-v1 frozen scientific dataset changed")
+    if scaler.get("fold") != args.fold or scaler.get("seed") != args.seed:
+        raise AssertionError("GRU-v1 role-4 scaler identity mismatch")
+    if scaler.get("scientific_data_sha256") != scientific_data_sha256:
+        raise AssertionError("GRU-v1 role-4 scaler scientific dataset changed")
+    if scaler.get("scaler_fit_role") != 4 or scaler.get("scaler") != frozen["scaler"]:
+        raise AssertionError("GRU-v1 role-4 scaler/frozen scaler mismatch")
+    actual_checkpoint_sha256 = sha256_file(checkpoint)
+    if done.get("checkpoint_sha256") != actual_checkpoint_sha256:
+        raise AssertionError("GRU-v1 checkpoint hash mismatch")
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if payload.get("seed") != args.seed:
+        raise AssertionError("GRU-v1 checkpoint seed mismatch")
+    if int(payload.get("epoch", -1)) != int(training["best_epoch"]):
+        raise AssertionError("GRU-v1 checkpoint best epoch mismatch")
+    if not np.isclose(
+        float(payload.get("validation_huber", np.nan)),
+        float(training["best_validation_huber"]),
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise AssertionError("GRU-v1 checkpoint validation loss mismatch")
 
 
 def parse_args() -> argparse.Namespace:
@@ -146,11 +201,13 @@ def run(args: argparse.Namespace, device: torch.device) -> None:
         raise ValueError("the retained GRU architecture requires hidden=64 and bottleneck=16")
     fold_dir = args.output_root.resolve() / f"fold_{args.fold}"
     done_path = fold_dir / "DONE_NBM.json"
+    data_dir = args.data_dir.resolve()
+    scientific_data = processed_nbm_scientific_manifest(data_dir)
     if done_path.exists() and not args.overwrite:
+        validate_existing_nbm(fold_dir, args, scientific_data["sha256"])
         print(f"SKIP completed GRU-NBM fold/seed: {done_path}", flush=True)
         return
     fold_dir.mkdir(parents=True, exist_ok=True)
-    data_dir = args.data_dir.resolve()
     dataset = DaphnetDataset.load(data_dir)
     records = {record.record_id: record for record in dataset.records}
     rows_by_fold = {fold: load_fold_rows(data_dir, fold) for fold in FOLDS}
@@ -165,6 +222,19 @@ def run(args: argparse.Namespace, device: torch.device) -> None:
     role4 = rows.take_role(4)
     role5 = rows.take_role(5)
     scaler, unique_points = fit_scaler_unique_role4_points(records, role4)
+    # Keep a role-4-only artifact so the RAW arm can load the identical
+    # RobustScaler without parsing a file that also contains role-5 b/sigma.
+    atomic_json_dump(
+        {
+            "fold": args.fold,
+            "seed": args.seed,
+            "scaler_fit_role": 4,
+            "scaler_unique_raw_points": unique_points,
+            "scaler": scaler.as_dict(),
+            "scientific_data_sha256": scientific_data["sha256"],
+        },
+        fold_dir / "scaler_role4.json",
+    )
     role4_x = prepare_nbm_windows(
         scaler, raw_windows_dynamic(records, role4, args.window_samples), center=True
     )
@@ -208,8 +278,9 @@ def run(args: argparse.Namespace, device: torch.device) -> None:
         },
         "classifier_or_test_roles_accessed": False,
         "source_audit": source_audit,
+        "scientific_data_sha256": scientific_data["sha256"],
     }
-    write_json(fold_dir / "config.json", config)
+    atomic_json_dump(config, fold_dir / "config.json")
     model, run_payload = train_nbm(
         "gru_nbm_best",
         role4_x,
@@ -255,8 +326,9 @@ def run(args: argparse.Namespace, device: torch.device) -> None:
         "training": training,
         "calibration": calibration,
         "classifier_or_test_roles_accessed": False,
+        "scientific_data_sha256": scientific_data["sha256"],
     }
-    write_json(fold_dir / "nbm_frozen.json", frozen)
+    atomic_json_dump(frozen, fold_dir / "nbm_frozen.json")
     write_csv(fold_dir / "logs" / "gru_nbm_history.csv", run_payload["history"])
     done = {
         "status": "frozen",
@@ -272,8 +344,9 @@ def run(args: argparse.Namespace, device: torch.device) -> None:
         "maximum_epochs": 300,
         "patience": 20,
         "classifier_or_test_roles_accessed": False,
+        "scientific_data_sha256": scientific_data["sha256"],
     }
-    write_json(done_path, done)
+    atomic_json_dump(done, done_path)
     print(json.dumps(done, ensure_ascii=False, indent=2), flush=True)
 
 

@@ -1,12 +1,25 @@
+import json
+from types import SimpleNamespace
+
 import numpy as np
+import pytest
 import torch
 
 from scripts.run_daphnet_nbm300_c_vs_raw_ablation import (
+    barrier_identity_payload,
+    build_test_data_manifest,
     build_scheme_c_features,
+    load_and_validate_barrier,
     paired_initialization,
     raw_features,
+    require_strict_barrier_for_tcn_v2,
+    stable_json_hash,
+    validate_completed_test_artifacts,
 )
-from scripts.run_daphnet_residual_calibration_abcd import build_abcd_features
+from scripts.run_daphnet_residual_calibration_abcd import (
+    build_abcd_features,
+    sha256_file,
+)
 from scripts.run_daphnet_s01_nonfog_gru_reconstruction_tcnm import RobustScaler
 
 
@@ -92,3 +105,111 @@ def test_dynamic_scheme_c_matches_original_128_sample_implementation() -> None:
     expected, _ = build_abcd_features(error, labels, "C", bias, sigma)
     actual, _ = build_scheme_c_features(error, labels, sigma, window_samples=128)
     np.testing.assert_array_equal(actual, expected)
+
+
+def _test_rows() -> SimpleNamespace:
+    return SimpleNamespace(
+        subject_id=np.asarray(["S01", "S01"]),
+        record_id=np.asarray(["S01_seg000", "S01_seg000"]),
+        window_id=np.asarray(["w0", "w1"]),
+        start=np.asarray([0, 128]),
+        end=np.asarray([128, 256]),
+        role=np.asarray([0, 1]),
+        label=np.asarray([0, 1]),
+    )
+
+
+def test_permanent_test_manifest_binds_rows_and_record_bytes(tmp_path) -> None:
+    (tmp_path / "records").mkdir()
+    (tmp_path / "records" / "S01_seg000.npz").write_bytes(b"record-v1")
+    (tmp_path / "nbm_protocol.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "nbm_quality_report.json").write_text("{}", encoding="utf-8")
+    rows_by_fold = {fold: _test_rows() for fold in (0, 1, 2)}
+    first = build_test_data_manifest(tmp_path, rows_by_fold)
+    (tmp_path / "records" / "S01_seg000.npz").write_bytes(b"record-v2")
+    second = build_test_data_manifest(tmp_path, rows_by_fold)
+    assert first["sha256"] != second["sha256"]
+    assert first["folds"]["0"]["window_count"] == 2
+
+
+def test_barrier_identity_rejects_mutated_sealed_job(tmp_path) -> None:
+    barrier = {
+        "barrier_schema": "strict_test_barrier.v2",
+        "status": "sealed",
+        "folds": [0, 1, 2],
+        "methods": ["FULL_C", "RAW"],
+        "nbm_seeds": [0],
+        "tcn_seeds": [0],
+        "job_count": 1,
+        "strict_test_gate": "sealed",
+        "source_audit": {"protocol_sha256": "p"},
+        "test_data_manifest": {"sha256": "d"},
+        "jobs": [{"job_id": "fold0_methodRAW_seed0", "threshold": 0.5}],
+    }
+    barrier["barrier_id"] = stable_json_hash(barrier_identity_payload(barrier))
+    path = tmp_path / "TRAINING_BARRIER.json"
+    path.write_text(json.dumps(barrier), encoding="utf-8")
+    assert load_and_validate_barrier(path)["barrier_id"] == barrier["barrier_id"]
+    barrier["jobs"][0]["threshold"] = 0.4
+    path.write_text(json.dumps(barrier), encoding="utf-8")
+    with pytest.raises(AssertionError, match="identity hash"):
+        load_and_validate_barrier(path)
+
+
+def test_tcn_v2_rejects_schema_less_legacy_barrier() -> None:
+    legacy = {"status": "sealed", "jobs": []}
+    with pytest.raises(RuntimeError, match="strict_test_barrier.v2"):
+        require_strict_barrier_for_tcn_v2(legacy, "tcn_v2")
+    require_strict_barrier_for_tcn_v2(legacy, "conv_tcn")
+
+
+def test_completed_test_artifacts_must_match_current_barrier(tmp_path) -> None:
+    sealed = {
+        "job_id": "fold0_methodRAW_seed0",
+        "barrier_schema": "strict_test_barrier.v2",
+        "barrier_id": "barrier-a",
+        "test_data_manifest_sha256": "data-a",
+        "checkpoint_sha256": "tcn-a",
+        "nbm_checkpoint_sha256": "nbm-a",
+        "scaler_sha256": "scaler-a",
+        "threshold": 0.5,
+    }
+    result = {
+        "job_id": sealed["job_id"],
+        "threshold": 0.5,
+        "barrier_id": "barrier-a",
+        "test_data_manifest_sha256": "data-a",
+        "tcn_checkpoint_sha256": "tcn-a",
+        "nbm_checkpoint_sha256": "nbm-a",
+        "scaler_sha256": "scaler-a",
+    }
+    metrics = tmp_path / "metrics.json"
+    predictions = tmp_path / "test_predictions.csv"
+    probabilities = tmp_path / "test_probabilities.npz"
+    metrics.write_text(json.dumps(result), encoding="utf-8")
+    predictions.write_text("y_true,y_pred\n0,0\n", encoding="utf-8")
+    probabilities.write_bytes(b"npz-placeholder")
+    done = {
+        "status": "complete",
+        "job_id": sealed["job_id"],
+        **{
+            key: result[key]
+            for key in (
+                "barrier_id",
+                "test_data_manifest_sha256",
+                "tcn_checkpoint_sha256",
+                "nbm_checkpoint_sha256",
+                "scaler_sha256",
+            )
+        },
+        "metrics_sha256": sha256_file(metrics),
+        "predictions_sha256": sha256_file(predictions),
+        "probabilities_sha256": sha256_file(probabilities),
+    }
+    (tmp_path / "DONE_TEST.json").write_text(
+        json.dumps(done), encoding="utf-8"
+    )
+    assert validate_completed_test_artifacts(tmp_path, sealed) == result
+    changed_seal = {**sealed, "barrier_id": "barrier-b"}
+    with pytest.raises(AssertionError, match="barrier_id"):
+        validate_completed_test_artifacts(tmp_path, changed_seal)
