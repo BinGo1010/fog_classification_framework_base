@@ -206,6 +206,21 @@ def test_scientific_manifest_changes_when_record_or_split_bytes_change(
     assert after_files[key]["sha256"] != before_files[key]["sha256"]
 
 
+def test_scientific_manifest_uses_platform_independent_relative_path_order(
+    tmp_path: Path,
+) -> None:
+    _minimal_processed_nbm(tmp_path)
+    # WindowsPath ordering case-folds while Linux Path ordering is
+    # case-sensitive.  The manifest must use the same explicit string key on
+    # both platforms so an identical server copy retains one dataset hash.
+    (tmp_path / "records" / "a.bin").write_bytes(b"lower")
+    (tmp_path / "records" / "Z.bin").write_bytes(b"upper")
+    manifest = processed_nbm_scientific_manifest(tmp_path)
+    relative_paths = [item["relative_path"] for item in manifest["files"]]
+    record_paths = [path for path in relative_paths if path.startswith("records/")]
+    assert record_paths == sorted(record_paths)
+
+
 def test_raw_role4_scaler_rejects_wrong_scientific_hash(tmp_path: Path) -> None:
     fold_dir = tmp_path / "fold_0"
     fold_dir.mkdir()

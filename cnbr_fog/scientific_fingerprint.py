@@ -41,8 +41,14 @@ def processed_nbm_scientific_manifest(root: str | Path) -> dict[str, Any]:
         root / "nbm_quality_report.json",
     )
     paths = [*fixed]
-    paths.extend(sorted((root / "records").glob("**/*")))
-    paths.extend(sorted((root / "split_indices").glob("**/*")))
+    # Sort by the relative POSIX spelling, not by platform-specific Path
+    # ordering.  Linux is case-sensitive while Windows Path ordering is not;
+    # a canonical key keeps otherwise identical server/local copies stable.
+    relative_key = lambda path: path.relative_to(root).as_posix()
+    paths.extend(sorted((root / "records").glob("**/*"), key=relative_key))
+    paths.extend(
+        sorted((root / "split_indices").glob("**/*"), key=relative_key)
+    )
     paths = [path for path in paths if path.is_file()]
     missing = [str(path) for path in fixed if not path.is_file()]
     if missing:
