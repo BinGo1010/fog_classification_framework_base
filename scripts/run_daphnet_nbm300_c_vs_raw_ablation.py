@@ -71,6 +71,12 @@ from scripts.run_daphnet_tcn_v2_nbm300_fold import (
     GlobalBottleneckTCNNBM,
     reconstruct_tcn_v2,
 )
+from scripts.run_daphnet_restcn_attention_pool_nbm300_fold import (
+    ARCHITECTURE_NAME as TCN_ATTN_Z16_ARCHITECTURE_NAME,
+    CHECKPOINT_NAME as TCN_ATTN_Z16_CHECKPOINT_NAME,
+    ResTCNSingleQueryAttentionPoolNBM,
+    reconstruct_attention_pool_nbm,
+)
 from scripts.run_daphnet_transformer_nbm300_fold import (
     PatchTransformerNBM,
     reconstruct_transformer,
@@ -124,7 +130,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--method", choices=METHODS)
     parser.add_argument(
         "--nbm-kind",
-        choices=("conv_tcn", "gru", "gru_v2", "tcn_v2", "transformer"),
+        choices=(
+            "conv_tcn",
+            "gru",
+            "gru_v2",
+            "tcn_v2",
+            "tcn_attn_z16",
+            "transformer",
+        ),
         default="conv_tcn",
     )
     parser.add_argument("--nbm-seed", type=int)
@@ -355,11 +368,11 @@ def require_strict_barrier_for_tcn_v2(
     nbm_kind: str,
 ) -> None:
     if (
-        nbm_kind == "tcn_v2"
+        nbm_kind in ("tcn_v2", "tcn_attn_z16")
         and barrier.get("barrier_schema") != "strict_test_barrier.v2"
     ):
         raise RuntimeError(
-            "TCN-v2 requires strict_test_barrier.v2; rerun classifier train/seal "
+            f"{nbm_kind} requires strict_test_barrier.v2; rerun classifier train/seal "
             "or use a clean output-root"
         )
 
@@ -377,6 +390,7 @@ def load_scaler_only(
         "gru": "gru_nbm_best.pt",
         "gru_v2": "gru_v2_nbm_best.pt",
         "tcn_v2": "tcn_v2_nbm_best.pt",
+        "tcn_attn_z16": TCN_ATTN_Z16_CHECKPOINT_NAME,
         "transformer": "transformer_nbm_best.pt",
     }
     checkpoint_name = checkpoint_names[nbm_kind]
@@ -437,6 +451,7 @@ def validate_nbm_contract(frozen: dict[str, Any], args: argparse.Namespace) -> d
                 "gru": "gru_reconstruction",
                 "gru_v2": GRU_V2_ARCHITECTURE_NAME,
                 "tcn_v2": TCN_V2_ARCHITECTURE_NAME,
+                "tcn_attn_z16": TCN_ATTN_Z16_ARCHITECTURE_NAME,
                 "transformer": "transformer_patch_autoencoder",
             }[args.nbm_kind]
         ),
@@ -479,6 +494,41 @@ def validate_nbm_contract(frozen: dict[str, Any], args: argparse.Namespace) -> d
                 and architecture.get("teacher_forcing") is False
                 and float(architecture.get("dropout", -1.0)) == 0.10
                 and int(architecture.get("parameter_count", -1)) == 186_065
+            )
+        ),
+        "tcn_attn_z16_architecture_details": (
+            args.nbm_kind != "tcn_attn_z16"
+            or (
+                architecture.get("name") == TCN_ATTN_Z16_ARCHITECTURE_NAME
+                and architecture.get("input_shape") == ["B", 9, 128]
+                and architecture.get("encoder_token_shape") == ["B", 32, 48]
+                and architecture.get("attention_pool", {}).get("query_shape")
+                == [1, 1, 48]
+                and architecture.get("attention_pool", {}).get("heads") == 4
+                and architecture.get("attention_pool", {}).get("embed_dim") == 48
+                and architecture.get("attention_pool", {}).get(
+                    "position_code_trainable"
+                )
+                is False
+                and architecture.get("attention_pool", {}).get(
+                    "raw_or_encoder_token_residual_bypass"
+                )
+                is False
+                and architecture.get("bottleneck_shape") == ["B", 16]
+                and architecture.get("output_shape") == ["B", 9, 128]
+                and architecture.get("decoder_conditioning", {}).get(
+                    "raw_or_encoder_temporal_connection"
+                )
+                is False
+                and architecture.get("decoder_conditioning", {}).get(
+                    "time_code_trainable"
+                )
+                is False
+                and architecture.get("encoder_decoder_skip_connections") is False
+                and architecture.get("input_output_global_residual") is False
+                and architecture.get("teacher_forcing") is False
+                and float(architecture.get("dropout", -1.0)) == 0.10
+                and int(architecture.get("parameter_count", -1)) == 171_905
             )
         ),
         "transformer_architecture_details": (
@@ -643,6 +693,85 @@ def load_frozen_tcn_v2_nbm(
         or np.any(sigma < 0.05)
     ):
         raise AssertionError("invalid frozen TCN-v2 NBM role-5 calibration")
+    manifest = {
+        **artifact,
+        "best_epoch": int(training["best_epoch"]),
+        "best_validation_loss": float(training["best_validation_huber"]),
+        "best_validation_metric": "role5_validation_SmoothL1",
+        "calibration_role": 5,
+        "scaler_role": 4,
+        "architecture": architecture,
+    }
+    return model, scaler, bias, sigma, manifest
+
+
+def load_frozen_tcn_attention_z16_nbm(
+    source_root: Path,
+    fold: int,
+    device: torch.device,
+) -> tuple[
+    ResTCNSingleQueryAttentionPoolNBM,
+    RobustScaler,
+    np.ndarray,
+    np.ndarray,
+    dict[str, Any],
+]:
+    scaler, artifact, frozen = load_scaler_only(
+        source_root, fold, "tcn_attn_z16"
+    )
+    training = frozen["training"]
+    architecture = training["architecture"]
+    if architecture.get("name") != TCN_ATTN_Z16_ARCHITECTURE_NAME:
+        raise AssertionError("unexpected frozen TCN-attention-Z16 architecture")
+    if int(architecture.get("parameter_count", -1)) != 171_905:
+        raise AssertionError("unexpected frozen TCN-attention-Z16 parameter count")
+    if architecture.get("bottleneck_shape") != ["B", 16]:
+        raise AssertionError("unexpected frozen TCN-attention-Z16 bottleneck")
+    if architecture.get("encoder_decoder_skip_connections") is not False:
+        raise AssertionError("TCN-attention-Z16 must not contain long skips")
+
+    model = ResTCNSingleQueryAttentionPoolNBM(
+        dropout=float(architecture.get("dropout", 0.10))
+    ).to(device)
+    checkpoint = Path(artifact["nbm_checkpoint"])
+    payload = torch.load(checkpoint, map_location=device, weights_only=False)
+    if payload.get("architecture") != architecture:
+        raise AssertionError(
+            "TCN-attention-Z16 checkpoint/frozen architecture mismatch"
+        )
+    if payload.get("augmentation") != training.get("augmentation"):
+        raise AssertionError(
+            "TCN-attention-Z16 checkpoint/frozen augmentation mismatch"
+        )
+    if int(payload.get("seed", -1)) != int(training["seed"]):
+        raise AssertionError("TCN-attention-Z16 checkpoint/frozen seed mismatch")
+    if int(payload.get("epoch", -1)) != int(training["best_epoch"]):
+        raise AssertionError(
+            "TCN-attention-Z16 checkpoint/frozen best epoch mismatch"
+        )
+    if not np.isclose(
+        float(payload.get("validation_huber", np.nan)),
+        float(training["best_validation_huber"]),
+        rtol=1e-7,
+        atol=1e-10,
+    ):
+        raise AssertionError(
+            "TCN-attention-Z16 checkpoint/frozen validation loss mismatch"
+        )
+    model.load_state_dict(payload["model_state"], strict=True)
+    model.eval()
+
+    calibration = frozen["calibration"]
+    bias = np.asarray(calibration["bias"], dtype=np.float32)
+    sigma = np.asarray(calibration["sigma"], dtype=np.float32)
+    if (
+        bias.shape != (9,)
+        or sigma.shape != (9,)
+        or not np.all(np.isfinite(bias))
+        or not np.all(np.isfinite(sigma))
+        or np.any(sigma < 0.05)
+    ):
+        raise AssertionError("invalid frozen TCN-attention-Z16 role-5 calibration")
     manifest = {
         **artifact,
         "best_epoch": int(training["best_epoch"]),
@@ -843,6 +972,17 @@ def make_features(
         )
         scaled = centered_scaled_bct(full_scaler, raw)
         reconstruction = reconstruct_tcn_v2(nbm, scaled, device)
+        error = (scaled - reconstruction).astype(np.float32, copy=False)
+    elif nbm_kind == "tcn_attn_z16":
+        if window_samples != 128:
+            raise ValueError("TCN-attention-Z16 NBM is fixed to 128 samples")
+        nbm, full_scaler, bias, sigma, nbm_manifest = (
+            load_frozen_tcn_attention_z16_nbm(
+                nbm_source_root, fold, device
+            )
+        )
+        scaled = centered_scaled_bct(full_scaler, raw)
+        reconstruction = reconstruct_attention_pool_nbm(nbm, scaled, device)
         error = (scaled - reconstruction).astype(np.float32, copy=False)
     elif nbm_kind == "transformer":
         if window_samples != 128:
