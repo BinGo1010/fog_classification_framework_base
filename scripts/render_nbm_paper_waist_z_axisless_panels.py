@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Export Original, Gaussian-noise, and Time-mask traces as separate axisless panels."""
+"""Render the S01/S02/S03 waist-IMU Z-axis augmentation panels."""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
-import sys
 from pathlib import Path
 
 import matplotlib as mpl
@@ -13,17 +13,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from scripts.plot_nbm_paper_augmentation_triptych import (
-    COLORS,
-    WINDOW_SAMPLES,
-    load_subject_traces,
-)
-
 FS = 64
+WINDOW_SAMPLES = 128
+SUBJECTS = ("S01", "S02", "S03")
 ORIGINAL_SIGNAL_COLOR = "#000000"
+ZERO_BASELINE_COLOR = "#D9DCDF"
+COLORS = {
+    "original": "#2F6B9A",
+    "gaussian": "#D98524",
+    "mask": "#B84A5A",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,8 +33,17 @@ def parse_args() -> argparse.Namespace:
         default=REPO_ROOT
         / "outputs"
         / "figures"
-        / "nbm_trunk_three_windows"
+        / "nbm_paper_augmentation_axisless_panels"
         / "source_data.csv",
+    )
+    parser.add_argument(
+        "--slice-metadata",
+        type=Path,
+        default=REPO_ROOT
+        / "outputs"
+        / "figures"
+        / "nbm_paper_augmentation_axisless_panels"
+        / "slice_metadata.json",
     )
     parser.add_argument(
         "--output-dir",
@@ -45,17 +53,40 @@ def parse_args() -> argparse.Namespace:
         / "figures"
         / "nbm_paper_augmentation_axisless_panels",
     )
-    parser.add_argument("--seed", type=int, default=20260807)
-    parser.add_argument("--visualization-gaussian-std", type=float, default=0.30)
     parser.add_argument("--panel-width", type=float, default=3.5)
     parser.add_argument("--panel-height", type=float, default=1.65)
     return parser.parse_args()
 
 
+def load_traces(path: Path) -> dict[str, dict[str, np.ndarray]]:
+    grouped: dict[str, list[dict[str, str]]] = {}
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            grouped.setdefault(row["subject_id"], []).append(row)
+
+    traces: dict[str, dict[str, np.ndarray]] = {}
+    for subject in SUBJECTS:
+        rows = grouped.get(subject, [])
+        rows.sort(key=lambda row: float(row["plot_time_s"]))
+        if len(rows) != WINDOW_SAMPLES:
+            raise RuntimeError(
+                f"{subject} must contribute exactly {WINDOW_SAMPLES} source-data rows"
+            )
+        traces[subject] = {
+            "time": np.asarray([float(row["plot_time_s"]) for row in rows]),
+            "clean": np.asarray([float(row["clean_waist_z"]) for row in rows]),
+            "displayed": np.asarray(
+                [float(row["displayed_waist_z"]) for row in rows]
+            ),
+            "mask_active": np.asarray([int(row["mask_active"]) for row in rows]),
+        }
+    return traces
+
+
 def save_panel(
     output_dir: Path,
     stem: str,
-    title: str,
+    condition: str,
     color: str,
     time: np.ndarray,
     displayed: np.ndarray,
@@ -72,12 +103,13 @@ def save_panel(
     ax.set_axis_off()
     ax.axhline(
         0.0,
-        color=COLORS["zero"],
+        color=ZERO_BASELINE_COLOR,
         linewidth=0.65,
+        linestyle="--",
         zorder=0.5,
     )
 
-    if title != "Original":
+    if condition != "Original":
         ax.plot(
             time,
             clean,
@@ -86,18 +118,17 @@ def save_panel(
             linestyle="--",
             zorder=1,
         )
-
-    if title == "Time mask":
+    if condition == "Time mask":
         if mask_active is None:
-            raise RuntimeError("Time mask panel requires mask metadata")
+            raise RuntimeError("Time-mask panel requires mask metadata")
         mask_indices = np.flatnonzero(mask_active)
         if mask_indices.size == 0:
-            raise RuntimeError("Time mask panel contains no masked samples")
-        mask_start = int(mask_indices[0])
-        mask_end = int(mask_indices[-1] + 1)
+            raise RuntimeError("Time-mask panel contains no masked samples")
+        start = int(mask_indices[0])
+        end = int(mask_indices[-1] + 1)
         ax.axvspan(
-            mask_start / FS,
-            mask_end / FS,
+            start / FS,
+            end / FS,
             ymin=0.02,
             ymax=0.62,
             color=COLORS["mask"],
@@ -107,7 +138,6 @@ def save_panel(
         )
 
     ax.plot(time, displayed, color=color, linewidth=1.35, zorder=2)
-
     path = output_dir / stem
     fig.savefig(path.with_suffix(".png"), dpi=600, facecolor="white")
     fig.savefig(path.with_suffix(".svg"), facecolor="white")
@@ -123,23 +153,18 @@ def save_panel(
 
 def main() -> None:
     args = parse_args()
-    traces = load_subject_traces(args.input_csv.resolve())
+    traces = load_traces(args.input_csv.resolve())
+    slice_metadata = json.loads(args.slice_metadata.read_text(encoding="utf-8"))
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    rng = np.random.default_rng(args.seed)
-    gaussian = traces["S02"]["clean"] + rng.normal(
-        0.0,
-        args.visualization_gaussian_std,
-        size=WINDOW_SAMPLES,
-    )
     all_values = np.concatenate(
         (
-            traces["S03"]["clean"],
+            traces["S01"]["clean"],
             traces["S02"]["clean"],
-            gaussian,
-            traces["S09"]["clean"],
-            traces["S09"]["masked"],
+            traces["S02"]["displayed"],
+            traces["S03"]["clean"],
+            traces["S03"]["displayed"],
         )
     )
     y_limit = 1.08 * float(np.max(np.abs(all_values)))
@@ -153,15 +178,14 @@ def main() -> None:
             "font.size": 9,
         }
     )
-
     save_panel(
         output_dir,
         "01_original",
         "Original",
         COLORS["original"],
-        traces["S03"]["time"],
-        traces["S03"]["clean"],
-        traces["S03"]["clean"],
+        traces["S01"]["time"],
+        traces["S01"]["displayed"],
+        traces["S01"]["clean"],
         y_limit,
         args.panel_width,
         args.panel_height,
@@ -172,7 +196,7 @@ def main() -> None:
         "Gaussian noise",
         COLORS["gaussian"],
         traces["S02"]["time"],
-        gaussian,
+        traces["S02"]["displayed"],
         traces["S02"]["clean"],
         y_limit,
         args.panel_width,
@@ -183,13 +207,13 @@ def main() -> None:
         "03_time_mask",
         "Time mask",
         COLORS["mask"],
-        traces["S09"]["time"],
-        traces["S09"]["masked"],
-        traces["S09"]["clean"],
+        traces["S03"]["time"],
+        traces["S03"]["displayed"],
+        traces["S03"]["clean"],
         y_limit,
         args.panel_width,
         args.panel_height,
-        traces["S09"]["mask_active"],
+        traces["S03"]["mask_active"],
     )
 
     metadata = {
@@ -200,11 +224,17 @@ def main() -> None:
         "original_panel_color": COLORS["original"],
         "reference_signal_color": ORIGINAL_SIGNAL_COLOR,
         "zero_baseline_retained": True,
-        "zero_baseline_color": COLORS["zero"],
+        "zero_baseline_color": ZERO_BASELINE_COLOR,
+        "zero_baseline_linestyle": "dashed",
+        "displayed_channel": slice_metadata["displayed_channel"],
+        "selection_rule": slice_metadata["selection_rule"],
+        "pooled_target_trunk_energy": slice_metadata[
+            "pooled_target_trunk_energy"
+        ],
         "axes_removed": True,
         "shared_y_limit": y_limit,
-        "visualization_gaussian_std": args.visualization_gaussian_std,
         "panel_size_inches": [args.panel_width, args.panel_height],
+        "windows": slice_metadata["windows"],
         "outputs": ["01_original", "02_gaussian_noise", "03_time_mask"],
     }
     (output_dir / "figure_metadata.json").write_text(
@@ -213,13 +243,16 @@ def main() -> None:
     (output_dir / "figure_contract.md").write_text(
         """# Figure contract
 
-- Core conclusion: Three standalone signals show unchanged, Gaussian-noised, and continuously masked NBM inputs without coordinate axes.
+- Core conclusion: Three standalone waist-IMU Z-axis signals from S01, S02, and S03 show unchanged, Gaussian-noised, and continuously masked NBM inputs without coordinate axes.
 - Figure archetype: Three independent method illustrations.
 - Backend: Python/matplotlib only.
 - Output: Three separate 3.5 x 1.65 inch images.
-- Retained elements: signals, a shared gray zero baseline, and the Time-mask interval shading.
-- Removed elements: processing-method titles, direct keys, axes, ticks, tick labels, axis titles, grid, subject labels, and panel letters.
-- Integrity: all panels use the same y-range and no amplitude normalization or smoothing.
+- Panel mapping: S01 Original, S02 Gaussian noise, and S03 Time mask.
+- Signal: `trunk_acc_vertical`, interpreted as waist IMU Z-axis acceleration.
+- Selection: Each subject's valid role-4 window nearest the pooled median three-axis trunk energy across S01-S03.
+- Retained elements: Signals, a shared gray dashed zero baseline, and the Time-mask interval shading.
+- Removed elements: Processing-method titles, direct keys, axes, ticks, tick labels, axis titles, grid, subject labels, and panel letters.
+- Integrity: All panels use the same y-range and no smoothing; values retain the fold-0 RobustScaler and per-window centering used for NBM inputs.
 """,
         encoding="utf-8",
     )
@@ -227,11 +260,12 @@ def main() -> None:
         """# Figure QA notes
 
 - All three panels use the same y-limit even though the coordinate axes are hidden.
-- No smoothing, interpolation, or amplitude normalization was applied.
+- No smoothing, interpolation, or post-selection amplitude normalization was applied.
+- Source mapping: S01/S02/S03 waist IMU Z-axis (`trunk_acc_vertical`, channel index 7).
+- Selection: Each subject's valid role-4 window nearest the pooled median three-axis trunk energy across S01-S03.
 - Gaussian noise is illustrative with sigma 0.30; the actual training value remains sigma 0.04.
-- The Original panel retains its original blue signal color.
-- The Gaussian-noise and Time-mask panels retain black dashed original-signal references but contain no keys or text labels.
-- Each panel contains the same thin gray horizontal baseline at y = 0, drawn beneath the signal traces.
+- The Original panel is blue; augmented panels retain black dashed original-signal references and contain no keys or text labels.
+- Each panel contains the same thin gray dashed horizontal baseline at y = 0, drawn beneath the signal traces.
 - All formats retain the exact 3.5 x 1.65 inch panel canvas; no content is clipped.
 - Each panel is exported as editable SVG/PDF and 600-dpi PNG/TIFF.
 """,
