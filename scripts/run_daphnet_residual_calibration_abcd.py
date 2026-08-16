@@ -80,6 +80,10 @@ METRIC_KEYS = (
 )
 EPSILON = 1e-6
 CLIP_LIMIT = 12.0
+# A-D shares one frozen NBM across TCN seeds. Experiments that deliberately
+# pair a different frozen NBM with each TCN seed opt into paired_nbm mode.
+CLIP_STATISTICS_SEED_MODE = "invariant"
+CLIP_STATISTICS_EQUIVALENT_GROUP_PAIRS = (("A", "B"),)
 CHANNEL_NAMES = (
     "ankle_acc_forward",
     "ankle_acc_vertical",
@@ -995,49 +999,118 @@ def run_aggregate(args: argparse.Namespace) -> None:
             subject_rows.append(row)
     write_csv(output_root / "subject_metrics_3seed_mean_std.csv", subject_rows)
 
-    clip_by_fold_group: dict[tuple[str, int], dict[str, Any]] = {}
-    for group in groups:
-        for fold in FOLDS:
-            subset = [
-                result for result in results
-                if result["group"] == group and result["fold"] == fold
-            ]
-            reference = subset[0]["clip_statistics"]
-            if any(result["clip_statistics"] != reference for result in subset[1:]):
-                raise AssertionError(f"clip statistics depend on TCN seed for {group}, fold {fold}")
-            clip_by_fold_group[(group, fold)] = reference
-    for fold in FOLDS:
-        if {"A", "B"}.issubset(groups) and (
-            clip_by_fold_group[("A", fold)] != clip_by_fold_group[("B", fold)]
-        ):
-            raise AssertionError(f"A/B pre-centering clip rates differ in fold {fold}")
-
     split_names = (
         "roles_6_7_train",
         "roles_2_3_validation",
         "roles_0_1_test",
         "all_classifier_roles_6_7_2_3_0_1",
     )
+    seed_mode = CLIP_STATISTICS_SEED_MODE
+    if seed_mode not in ("invariant", "paired_nbm"):
+        raise ValueError(f"unknown clip-statistics seed mode: {seed_mode}")
+
+    clip_by_fold_group: dict[tuple[str, int], dict[str, Any]] = {}
+    clip_by_fold_group_seed: dict[tuple[str, int, int], dict[str, Any]] = {}
+    for group in groups:
+        for fold in FOLDS:
+            subset = [
+                result for result in results
+                if result["group"] == group and result["fold"] == fold
+            ]
+            if len(subset) != len(seeds):
+                raise AssertionError(
+                    f"expected {len(seeds)} seeds for clip statistics: {group}, fold {fold}"
+                )
+            for result in subset:
+                seed = int(result["tcn_seed"])
+                clip_by_fold_group_seed[(group, fold, seed)] = result["clip_statistics"]
+
+            reference = subset[0]["clip_statistics"]
+            if seed_mode == "invariant":
+                if any(result["clip_statistics"] != reference for result in subset[1:]):
+                    raise AssertionError(
+                        f"clip statistics depend on TCN seed for {group}, fold {fold}"
+                    )
+                clip_by_fold_group[(group, fold)] = reference
+            else:
+                for result in subset:
+                    if int(result.get("nbm_seed", -1)) != int(result["tcn_seed"]):
+                        raise AssertionError(
+                            "paired_nbm clip-statistics mode requires nbm_seed == tcn_seed"
+                        )
+                clip_by_fold_group[(group, fold)] = {
+                    split: combine_clip_statistics(
+                        result["clip_statistics"][split] for result in subset
+                    )
+                    for split in split_names
+                }
+
+    for first, second in CLIP_STATISTICS_EQUIVALENT_GROUP_PAIRS:
+        if not {first, second}.issubset(groups):
+            continue
+        for fold in FOLDS:
+            if seed_mode == "invariant":
+                if clip_by_fold_group[(first, fold)] != clip_by_fold_group[(second, fold)]:
+                    raise AssertionError(
+                        f"{first}/{second} pre-transform clip rates differ in fold {fold}"
+                    )
+            else:
+                for seed in seeds:
+                    if (
+                        clip_by_fold_group_seed[(first, fold, seed)]
+                        != clip_by_fold_group_seed[(second, fold, seed)]
+                    ):
+                        raise AssertionError(
+                            f"{first}/{second} pre-transform clip rates differ in "
+                            f"fold {fold}, paired seed {seed}"
+                        )
+
     clip_rows = []
     channel_rows = []
+    if seed_mode == "paired_nbm":
+        for (group, fold, seed), payload in clip_by_fold_group_seed.items():
+            for split in split_names:
+                stats = payload[split]
+                row = clip_rate_row(group, fold, split, stats)
+                row["paired_seed"] = seed
+                clip_rows.append(row)
+                if stats.get("applicable", False):
+                    for channel in stats["per_channel"]:
+                        channel_rows.append(
+                            {
+                                "group": group,
+                                "fold": fold,
+                                "paired_seed": seed,
+                                "split": split,
+                                "channel": channel["channel"],
+                                "channel_name": channel["channel_name"],
+                                "overall_clip_rate": channel["overall"]["rate"],
+                                "nonfog_clip_rate": channel["nonfog"]["rate"],
+                                "fog_clip_rate": channel["fog"]["rate"],
+                            }
+                        )
     for (group, fold), payload in clip_by_fold_group.items():
         for split in split_names:
             stats = payload[split]
-            clip_rows.append(clip_rate_row(group, fold, split, stats))
+            row = clip_rate_row(group, fold, split, stats)
+            if seed_mode == "paired_nbm":
+                row["paired_seed"] = "all_paired_seeds"
+            clip_rows.append(row)
             if stats.get("applicable", False):
                 for channel in stats["per_channel"]:
-                    channel_rows.append(
-                        {
-                            "group": group,
-                            "fold": fold,
-                            "split": split,
-                            "channel": channel["channel"],
-                            "channel_name": channel["channel_name"],
-                            "overall_clip_rate": channel["overall"]["rate"],
-                            "nonfog_clip_rate": channel["nonfog"]["rate"],
-                            "fog_clip_rate": channel["fog"]["rate"],
-                        }
-                    )
+                    channel_row = {
+                        "group": group,
+                        "fold": fold,
+                        "split": split,
+                        "channel": channel["channel"],
+                        "channel_name": channel["channel_name"],
+                        "overall_clip_rate": channel["overall"]["rate"],
+                        "nonfog_clip_rate": channel["nonfog"]["rate"],
+                        "fog_clip_rate": channel["fog"]["rate"],
+                    }
+                    if seed_mode == "paired_nbm":
+                        channel_row["paired_seed"] = "all_paired_seeds"
+                    channel_rows.append(channel_row)
     clip_group_summary: dict[str, Any] = {}
     for group in groups:
         clip_group_summary[group] = {}
@@ -1046,7 +1119,10 @@ def run_aggregate(args: argparse.Namespace) -> None:
                 clip_by_fold_group[(group, fold)][split] for fold in FOLDS
             )
             clip_group_summary[group][split] = combined
-            clip_rows.append(clip_rate_row(group, "all_folds", split, combined))
+            row = clip_rate_row(group, "all_folds", split, combined)
+            if seed_mode == "paired_nbm":
+                row["paired_seed"] = "all_paired_seeds"
+            clip_rows.append(row)
     write_csv(output_root / "clip_rates_by_fold_split.csv", clip_rows)
     write_csv(output_root / "clip_rates_per_channel.csv", channel_rows)
 
@@ -1061,6 +1137,12 @@ def run_aggregate(args: argparse.Namespace) -> None:
             ),
             "subject_metrics": subject_summary_json,
             "clip_rates": clip_group_summary,
+            "clip_statistics_seed_mode": seed_mode,
+            "clip_statistics_definition": (
+                "one frozen NBM shared across TCN seeds"
+                if seed_mode == "invariant"
+                else "NBM and TCN seeds are paired; retain per-seed statistics and pool counts"
+            ),
             "run_count": len(results),
             "groups": {group: GROUP_CONFIG[group] for group in groups},
             "tcn_seeds": list(seeds),

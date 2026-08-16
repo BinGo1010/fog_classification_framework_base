@@ -39,9 +39,10 @@ NO_DATA_SHADE = "#E2E2E2"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INPUT_DIR = PROJECT_ROOT / "dataset" / "All_dataset" / "segments"
 OUTPUT_DIR = PROJECT_ROOT / "dataset" / "All_dataset" / "figures"
-SEGMENT_ID = "seg000"
-TARGET_START = "18:40:34:25"
-TARGET_END = "18:40:41:30"
+OUTPUT_BASENAME = ""  # Empty: automatic name; example: "seg001_freezing_1"
+SEGMENT_ID = "seg001"
+TARGET_START = "18:42:38:20"
+TARGET_END = "18:42:48:20"
 FPS = 60
 CONTEXT_SECONDS = 5.0
 # =============================================================================
@@ -73,6 +74,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=OUTPUT_DIR,
         help="Directory for SVG, PDF, TIFF, and PNG outputs.",
+    )
+    parser.add_argument(
+        "--output-name",
+        default=OUTPUT_BASENAME,
+        help="Custom output basename without an extension; empty uses an automatic name.",
     )
     return parser.parse_args()
 
@@ -284,9 +290,11 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     start_token = format_timecode(target_start, args.fps).replace(":", "")
     end_token = format_timecode(target_end, args.fps).replace(":", "")
-    output_base = args.output_dir / (
+    automatic_name = (
         f"{args.segment_id}_5imu_az_target_{start_token}_{end_token}_world_time"
     )
+    output_name = args.output_name.strip() or automatic_name
+    output_base = args.output_dir / output_name
     svg_path = output_base.with_suffix(".svg")
     pdf_path = output_base.with_suffix(".pdf")
     tiff_path = output_base.with_suffix(".tiff")

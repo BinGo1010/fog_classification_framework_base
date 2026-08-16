@@ -313,6 +313,8 @@ def patch_core() -> None:
     core.reconstruction_error = reconstruction_error_gru
     core.build_abcd_features = build_g123_features
     core.no_clip_statistics = no_hard_clip_statistics
+    core.CLIP_STATISTICS_SEED_MODE = "paired_nbm"
+    core.CLIP_STATISTICS_EQUIVALENT_GROUP_PAIRS = (("G1", "G2"),)
 
 
 def expected_jobs(seeds: tuple[int, ...]) -> list[tuple[int, str, int]]:
