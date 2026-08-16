@@ -24,6 +24,7 @@ SOURCE_EXPERIMENT = (
 GROUPS = ("G1", "G2", "G3")
 FOLDS = (0, 1, 2)
 SEEDS = (0, 52, 161)
+SUPPORTED_TCN_TRAINING = ((10, 2), (50, 6))
 
 from scripts.launch_daphnet_residual_calibration_abcd_7gpu import (
     command_text,
@@ -75,8 +76,12 @@ def validate_contract(args: argparse.Namespace) -> tuple[int, ...]:
     seeds = parse_seed_list(args.tcn_seeds)
     if seeds != SEEDS:
         raise ValueError(f"this experiment requires exact seeds {SEEDS}")
-    if args.tcn_max_epochs != 10 or args.tcn_patience != 2:
-        raise ValueError("this experiment requires TCN max_epoch=10 and patience=2")
+    training_contract = (args.tcn_max_epochs, args.tcn_patience)
+    if training_contract not in SUPPORTED_TCN_TRAINING:
+        raise ValueError(
+            "this experiment requires one of the TCN "
+            f"(max_epoch, patience) contracts {SUPPORTED_TCN_TRAINING}"
+        )
     return seeds
 
 
@@ -196,7 +201,10 @@ def main() -> None:
         "G1": "clip((e-b)/sigma), then residual window-axis centering",
         "G2": "clip((e-b)/sigma), no residual second centering",
         "G3": "asinh((e-b)/sigma), no hard clip, no residual second centering",
-        "classifier": "same RepresentationTCNM; AdamW lr1e-3; weighted BCE; max10/pat2",
+        "classifier": (
+            "same RepresentationTCNM; AdamW lr1e-3; weighted BCE; "
+            f"max{args.tcn_max_epochs}/pat{args.tcn_patience}"
+        ),
         "example_train": command_text(train_jobs[0]["command"]),
         "seal": command_text(singleton(args, "seal")),
         "example_test": command_text(evaluate_jobs[0]["command"]),

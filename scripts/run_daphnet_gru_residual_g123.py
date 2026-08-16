@@ -47,6 +47,7 @@ from scripts.run_daphnet_s01_nonfog_gru_reconstruction_tcnm import (
 GROUPS = ("G1", "G2", "G3")
 FOLDS = (0, 1, 2)
 REQUIRED_SEEDS = (0, 52, 161)
+SUPPORTED_TCN_TRAINING = ((10, 2), (50, 6))
 EPSILON = 1e-6
 CLIP_LIMIT = 12.0
 
@@ -134,8 +135,12 @@ def parse_contract(args: argparse.Namespace) -> tuple[int, ...]:
         raise ValueError(f"this experiment requires exact paired seeds {REQUIRED_SEEDS}")
     if groups != GROUPS:
         raise ValueError(f"this experiment requires exact groups {GROUPS}")
-    if args.tcn_max_epochs != 10 or args.tcn_patience != 2:
-        raise ValueError("this controlled experiment requires TCN max_epoch=10, patience=2")
+    training_contract = (args.tcn_max_epochs, args.tcn_patience)
+    if training_contract not in SUPPORTED_TCN_TRAINING:
+        raise ValueError(
+            "this controlled experiment requires one of the TCN "
+            f"(max_epoch, patience) contracts {SUPPORTED_TCN_TRAINING}"
+        )
     if args.tcn_seed is not None and args.tcn_seed not in seeds:
         raise ValueError(f"--tcn-seed must be one of {seeds}")
     return seeds
@@ -429,7 +434,11 @@ def run_seal(args: argparse.Namespace, seeds: tuple[int, ...]) -> None:
             "nbm_retrained": False,
             "nbm": "paired frozen GRU-v1; role4/5; max300/pat20",
             "paired_seeds": list(seeds),
-            "tcn": "same RepresentationTCNM; max10/pat2; AdamW lr1e-3; weighted BCE",
+            "tcn": (
+                "same RepresentationTCNM; "
+                f"max{args.tcn_max_epochs}/pat{args.tcn_patience}; "
+                "AdamW lr1e-3; weighted BCE"
+            ),
             "roles": {str(key): value for key, value in core.ROLES.items()},
             "threshold": "roles 2/3 balanced accuracy; ties FoG F1 then higher threshold",
             "barrier_schema": barrier["barrier_schema"],

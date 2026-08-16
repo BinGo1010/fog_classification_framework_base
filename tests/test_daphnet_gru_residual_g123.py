@@ -1,11 +1,33 @@
 from __future__ import annotations
 
-import numpy as np
+import argparse
 
+import numpy as np
+import pytest
+
+from scripts.launch_daphnet_gru_residual_g123_7gpu import validate_contract
 from scripts.run_daphnet_gru_residual_g123 import (
     GROUPS,
     build_g123_features,
 )
+
+
+def test_launcher_accepts_only_frozen_tcn_training_contracts() -> None:
+    for maximum_epochs, patience in ((10, 2), (50, 6)):
+        args = argparse.Namespace(
+            tcn_seeds="0,52,161",
+            tcn_max_epochs=maximum_epochs,
+            tcn_patience=patience,
+        )
+        assert validate_contract(args) == (0, 52, 161)
+
+    invalid = argparse.Namespace(
+        tcn_seeds="0,52,161",
+        tcn_max_epochs=50,
+        tcn_patience=2,
+    )
+    with pytest.raises(ValueError, match="requires one of the TCN"):
+        validate_contract(invalid)
 
 
 def test_g123_exact_formulas_and_shared_feature_shape() -> None:
