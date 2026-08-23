@@ -3,7 +3,12 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from scripts import (
     launch_all_dataset_processed_nbm_exp_within_subject_conv_tcn_ngm_tcn_7gpu as launcher,
@@ -13,11 +18,11 @@ from scripts.run_all_dataset_processed_nbm_exp_within_subject_mlp_ngm_tcn import
     EXPERIMENT_SCHEMA,
     NBM_PARAMETER_COUNT,
     NBM_VARIANT,
+    SUBJECTS,
     architecture_config,
 )
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKER = (
     REPO_ROOT
     / "scripts"
@@ -36,6 +41,7 @@ def configure_launcher() -> None:
     launcher.EXPERIMENT_SCHEMA = EXPERIMENT_SCHEMA
     launcher.NBM_PARAMETER_COUNT = NBM_PARAMETER_COUNT
     launcher.NBM_VARIANT = NBM_VARIANT
+    launcher.SUBJECTS = SUBJECTS
     launcher.architecture_config = architecture_config
     launcher.CRITICAL_CODE = (
         WORKER,

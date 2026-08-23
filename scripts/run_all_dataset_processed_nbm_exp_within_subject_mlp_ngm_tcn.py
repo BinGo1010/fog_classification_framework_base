@@ -9,6 +9,13 @@ Only the normal-gait autoencoder backbone is replaced.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from scripts import (
     run_all_dataset_processed_nbm_exp_within_subject_conv_tcn_ngm_tcn as worker,
 )
@@ -46,6 +53,8 @@ def configure_worker() -> None:
     worker.BARRIER_SCHEMA = BARRIER_SCHEMA
     worker.MODEL_DESCRIPTION = MODEL_DESCRIPTION
     worker.NBM_DISPLAY_NAME = NBM_DISPLAY_NAME
+    worker.SUBJECTS = SUBJECTS
+    worker.base.SUBJECTS = SUBJECTS
     worker.architecture_config = architecture_config
     worker.configure_base()
 

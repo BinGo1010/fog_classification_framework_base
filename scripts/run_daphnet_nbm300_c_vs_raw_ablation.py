@@ -974,6 +974,65 @@ def load_frozen_transformer_48k_ngm(
     return model, scaler, bias, sigma, manifest
 
 
+def load_frozen_mlp_ngm(
+    source_root: Path,
+    fold: int,
+    device: torch.device,
+) -> tuple[
+    FactorizedMLPNGM9,
+    RobustScaler,
+    np.ndarray,
+    np.ndarray,
+    dict[str, Any],
+]:
+    scaler, artifact, frozen = load_scaler_only(source_root, fold, "mlp")
+    training = frozen["training"]
+    architecture = training["architecture"]
+    if architecture.get("name") != "factorized_mlp_ngm_v1_9channel":
+        raise AssertionError("unexpected frozen MLP-NGM architecture")
+    if int(architecture.get("parameter_count", -1)) != MLP_NGM_9_PARAMETER_COUNT:
+        raise AssertionError("unexpected frozen MLP-NGM parameter count")
+    model = FactorizedMLPNGM9(dropout=0.10).to(device)
+    checkpoint = Path(artifact["nbm_checkpoint"])
+    payload = torch.load(checkpoint, map_location=device, weights_only=False)
+    if payload.get("architecture") != architecture:
+        raise AssertionError("MLP-NGM checkpoint architecture mismatch")
+    if int(payload.get("seed", -1)) != int(training["seed"]):
+        raise AssertionError("MLP-NGM checkpoint seed mismatch")
+    if int(payload.get("epoch", -1)) != int(training["best_epoch"]):
+        raise AssertionError("MLP-NGM checkpoint epoch mismatch")
+    if not np.isclose(
+        float(payload.get("validation_huber", np.nan)),
+        float(training["best_validation_huber"]),
+        rtol=1e-7,
+        atol=1e-10,
+    ):
+        raise AssertionError("MLP-NGM checkpoint/frozen validation loss mismatch")
+    model.load_state_dict(payload["model_state"], strict=True)
+    model.eval()
+    calibration = frozen["calibration"]
+    bias = np.asarray(calibration["bias"], dtype=np.float32)
+    sigma = np.asarray(calibration["sigma"], dtype=np.float32)
+    if (
+        bias.shape != (9,)
+        or sigma.shape != (9,)
+        or not np.all(np.isfinite(bias))
+        or not np.all(np.isfinite(sigma))
+        or np.any(sigma < 0.05)
+    ):
+        raise AssertionError("invalid MLP-NGM role-5 calibration")
+    manifest = {
+        **artifact,
+        "best_epoch": int(training["best_epoch"]),
+        "best_validation_loss": float(training["best_validation_huber"]),
+        "best_validation_metric": "role5_validation_SmoothL1",
+        "calibration_role": 5,
+        "scaler_role": 4,
+        "architecture": architecture,
+    }
+    return model, scaler, bias, sigma, manifest
+
+
 def raw_windows_dynamic(
     records: dict[str, Any],
     rows: Any,
@@ -1171,6 +1230,15 @@ def make_features(
         )
         scaled = centered_scaled_bct(full_scaler, raw)
         reconstruction = reconstruct_transformer_48k(nbm, scaled, device)
+        error = (scaled - reconstruction).astype(np.float32, copy=False)
+    elif nbm_kind == "mlp":
+        if window_samples != 128:
+            raise ValueError("MLP-NGM is fixed to 128 samples")
+        nbm, full_scaler, bias, sigma, nbm_manifest = load_frozen_mlp_ngm(
+            nbm_source_root, fold, device
+        )
+        scaled = centered_scaled_bct(full_scaler, raw)
+        reconstruction = reconstruct_mlp_bct(nbm, scaled, device)
         error = (scaled - reconstruction).astype(np.float32, copy=False)
     else:
         raise ValueError(f"unsupported NBM kind: {nbm_kind}")
