@@ -61,9 +61,23 @@ BOTTLENECK = 16
 NBM_PARAMETER_COUNT = 40_942
 TCN_PARAMETER_COUNT = 143_649
 NBM_VARIANT = "GRU_BASE_MASK4_8"
+NBM_CHECKPOINT_NAME = "gru_nbm_best.pt"
+NBM_DEFAULT_MAX_EPOCHS = 300
+NBM_DEFAULT_PATIENCE = 20
 METRIC_KEYS = raw_base.METRIC_KEYS
 EXPERIMENT_SCHEMA = "all_dataset_within_subject_gru_nbm_tcn.v1"
 BARRIER_SCHEMA = "all_dataset_within_subject_gru_nbm_tcn_barrier.v1"
+MODEL_DESCRIPTION = "GRU BASE Mask4-8 NBM + scheme-C 90-channel TCN"
+EVENT_MINIMUM_POSITIVE_WINDOWS = 2
+EVENT_MERGE_GAP_SECONDS = 0.5
+EVENT_FALSE_ALARM_DENOMINATOR = (
+    "union coverage of evaluated valid Non-FoG samples"
+)
+EVENT_AGGREGATION = "subject_macro"
+AGGREGATION_DESCRIPTION = (
+    "subject/seed macro mean of 3 folds; subject mean+population SD over 5 "
+    "seeds; overall subject-macro per seed then mean+population SD"
+)
 
 
 def utc_now() -> str:
@@ -86,8 +100,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--nbm-max-epochs", type=int, default=300)
-    parser.add_argument("--nbm-patience", type=int, default=20)
+    parser.add_argument("--nbm-max-epochs", type=int, default=NBM_DEFAULT_MAX_EPOCHS)
+    parser.add_argument("--nbm-patience", type=int, default=NBM_DEFAULT_PATIENCE)
     parser.add_argument("--tcn-max-epochs", type=int, default=5)
     parser.add_argument("--tcn-patience", type=int, default=2)
     parser.add_argument("--overwrite", action="store_true")
@@ -261,7 +275,7 @@ def train_nbm(
     train_batches = nbm_loader(train_x, batch_size, True, seed, workers)
     validation_batches = nbm_loader(validation_x, batch_size, False, seed, workers)
     augmentation_generator = torch.Generator(device=device).manual_seed(seed + 1000)
-    checkpoint = destination / "checkpoints" / "gru_nbm_best.pt"
+    checkpoint = destination / "checkpoints" / NBM_CHECKPOINT_NAME
     best_loss = math.inf
     best_epoch = 0
     stale = 0
@@ -363,6 +377,24 @@ def calibrate(model: nn.Module, role5_x: np.ndarray, device: torch.device, batch
         "scheme_c_uses_bias": False,
         "bias_usage": "bias centers role5 error only while estimating MAD sigma",
     }
+
+
+def build_nbm_from_checkpoint(
+    payload: dict[str, Any], device: torch.device
+) -> nn.Module:
+    """Construct the configured NBM from a validated frozen payload.
+
+    Kept as an explicit hook so parameter-free normal-gait models can reuse the
+    strict role split, calibration, TCN, and global-test-barrier implementation.
+    """
+
+    if payload.get("architecture") != architecture_config():
+        raise AssertionError("NBM checkpoint architecture mismatch")
+    model = GRUReconstructionNBM(
+        channels=RAW_CHANNELS, hidden=HIDDEN, bottleneck=BOTTLENECK
+    ).to(device)
+    model.load_state_dict(payload["model_state"])
+    return model
 
 
 def scheme_c_features(
@@ -568,7 +600,7 @@ def validate_completed_train(destination: Path, plan: dict[str, Any]) -> bool:
         return False
     frozen_path = destination / "FROZEN_TRAIN.json"
     paths = {
-        "nbm_checkpoint_sha256": destination / "checkpoints" / "gru_nbm_best.pt",
+        "nbm_checkpoint_sha256": destination / "checkpoints" / NBM_CHECKPOINT_NAME,
         "tcn_checkpoint_sha256": destination / "checkpoints" / "tcn.pt",
         "scaler_sha256": destination / "scaler_role4.json",
         "calibration_sha256": destination / "calibration_role5.json",
@@ -650,7 +682,7 @@ def run_train(args: argparse.Namespace) -> None:
     tcn_history_path = destination / "tcn_history.csv"
     write_csv(nbm_history_path, nbm_training["history"])
     write_csv(tcn_history_path, tcn_training["history"])
-    nbm_checkpoint = destination / "checkpoints" / "gru_nbm_best.pt"
+    nbm_checkpoint = destination / "checkpoints" / NBM_CHECKPOINT_NAME
     tcn_checkpoint = destination / "checkpoints" / "tcn.pt"
     frozen = {
         "schema": EXPERIMENT_SCHEMA,
@@ -715,7 +747,7 @@ def load_and_validate_barrier(root: Path, subject: str, fold: int, seed: int) ->
     if sha256_file(frozen_path) != sealed["frozen_sha256"] or frozen["frozen_id"] != sealed["frozen_id"]:
         raise AssertionError(f"frozen artifact changed after seal: {key}")
     paths = {
-        "nbm_checkpoint_sha256": destination / "checkpoints" / "gru_nbm_best.pt",
+        "nbm_checkpoint_sha256": destination / "checkpoints" / NBM_CHECKPOINT_NAME,
         "tcn_checkpoint_sha256": destination / "checkpoints" / "tcn.pt",
         "scaler_sha256": destination / "scaler_role4.json",
         "calibration_sha256": destination / "calibration_role5.json",
@@ -761,11 +793,14 @@ def run_evaluate(args: argparse.Namespace) -> None:
     )
     sigma = np.asarray(calibration_payload["sigma"], dtype=np.float32)
     device = resolve_device(args.device)
-    nbm = GRUReconstructionNBM(channels=RAW_CHANNELS, hidden=HIDDEN, bottleneck=BOTTLENECK).to(device)
-    nbm_payload = torch.load(destination / "checkpoints" / "gru_nbm_best.pt", map_location=device, weights_only=False)
-    if nbm_payload.get("seed") != seed or nbm_payload.get("architecture") != architecture_config():
+    nbm_payload = torch.load(
+        destination / "checkpoints" / NBM_CHECKPOINT_NAME,
+        map_location=device,
+        weights_only=False,
+    )
+    if nbm_payload.get("seed") != seed:
         raise AssertionError("NBM checkpoint identity mismatch")
-    nbm.load_state_dict(nbm_payload["model_state"])
+    nbm = build_nbm_from_checkpoint(nbm_payload, device)
     test_x = scheme_c_features(
         nbm, scaler, sigma, raw_base.raw_windows(dataset, test_rows), device, args.batch_size
     )
@@ -945,10 +980,34 @@ def run_aggregate(args: argparse.Namespace) -> None:
     overall_seed_rows = []
     for seed in seeds:
         selected = [row for row in subject_seed_rows if row["seed"] == seed]
-        overall_seed_rows.append({
+        seed_row = {
             "seed": seed,
             **{key: float(np.mean([row[key] for row in selected])) for key in METRIC_KEYS},
-        })
+        }
+        if EVENT_AGGREGATION == "pooled_counts_and_exposure":
+            fold_event_sensitivity: list[float] = []
+            fold_false_alarms_per_hour: list[float] = []
+            for fold in FOLDS:
+                fold_rows = [
+                    row
+                    for row in run_rows
+                    if row["seed"] == seed and row["fold"] == fold
+                ]
+                detected = sum(int(row["detected_true_events"]) for row in fold_rows)
+                events = sum(int(row["evaluable_true_events"]) for row in fold_rows)
+                false_alarms = sum(int(row["false_alarm_events"]) for row in fold_rows)
+                exposure = sum(float(row["evaluated_nonfog_hours"]) for row in fold_rows)
+                if events <= 0 or exposure <= 0.0:
+                    raise ValueError("pooled event aggregation has an empty denominator")
+                fold_event_sensitivity.append(detected / events)
+                fold_false_alarms_per_hour.append(false_alarms / exposure)
+            seed_row["event_sensitivity"] = float(np.mean(fold_event_sensitivity))
+            seed_row["false_alarms_per_hour"] = float(
+                np.mean(fold_false_alarms_per_hour)
+            )
+        elif EVENT_AGGREGATION != "subject_macro":
+            raise ValueError(f"unsupported event aggregation: {EVENT_AGGREGATION}")
+        overall_seed_rows.append(seed_row)
     overall = {key: mean_std(row[key] for row in overall_seed_rows) for key in METRIC_KEYS}
     write_csv(root / "run_metrics.csv", run_rows)
     write_csv(root / "subject_seed_metrics.csv", subject_seed_rows)
@@ -956,13 +1015,13 @@ def run_aggregate(args: argparse.Namespace) -> None:
     write_csv(root / "overall_seed_metrics.csv", overall_seed_rows)
     summary = {
         "schema": EXPERIMENT_SCHEMA,
-        "model": "GRU BASE Mask4-8 NBM + scheme-C 90-channel TCN",
-        "aggregation": "subject/seed macro mean of 3 folds; subject mean+population SD over 5 seeds; overall subject-macro per seed then mean+population SD",
+        "model": MODEL_DESCRIPTION,
+        "aggregation": AGGREGATION_DESCRIPTION,
         "event_metric": {
             "version": raw_base.EVENT_METRIC_VERSION,
-            "minimum_positive_windows": 2,
-            "merge_gap_seconds": 0.5,
-            "false_alarm_denominator": "union coverage of evaluated valid Non-FoG samples",
+            "minimum_positive_windows": EVENT_MINIMUM_POSITIVE_WINDOWS,
+            "merge_gap_seconds": EVENT_MERGE_GAP_SECONDS,
+            "false_alarm_denominator": EVENT_FALSE_ALARM_DENOMINATOR,
         },
         "subjects": subject_summary_rows,
         "overall": overall,
