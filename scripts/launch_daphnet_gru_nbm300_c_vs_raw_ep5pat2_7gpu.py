@@ -26,6 +26,7 @@ NBM_WORKER = REPO_ROOT / "scripts" / "run_daphnet_gru_nbm300_fold.py"
 PAIR_WORKER = REPO_ROOT / "scripts" / "run_daphnet_nbm300_c_vs_raw_ablation.py"
 FOLDS = (0, 1, 2)
 METHODS = ("FULL_C", "RAW")
+SUPPORTED_METHODS = (*METHODS, "RESIDUAL_R")
 REQUIRED_SEEDS = (0, 52, 161, 5216, 52161)
 SEED_TEXT = "0,52,161,5216,52161"
 
@@ -54,9 +55,26 @@ def parse_args() -> argparse.Namespace:
         / "outputs"
         / "daphnet_tcn_nbm300_C_vs_raw_tcn_ep5pat2_seedset_0_52_161_5216_52161",
     )
+    parser.add_argument(
+        "--reuse-nbm-source-root",
+        type=Path,
+        default=None,
+        help=(
+            "Optional existing nbm_source directory. When supplied, all frozen "
+            "GRU-NBM/scaler/calibration artifacts are reused and NBM fitting is skipped."
+        ),
+    )
     parser.add_argument("--gpu-ids", default="0,1,2,3,4,5,6")
     parser.add_argument("--nbm-seeds", default=SEED_TEXT)
     parser.add_argument("--tcn-seeds", default=SEED_TEXT)
+    parser.add_argument(
+        "--experiment-methods",
+        default=",".join(METHODS),
+        help=(
+            "Comma-separated classifier methods. RESIDUAL_R retains scheme-C r "
+            "but removes abs(r) and delta(r)."
+        ),
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--nbm-max-epochs", type=int, default=300)
     parser.add_argument("--nbm-patience", type=int, default=20)
@@ -83,6 +101,18 @@ def validate_contract(args: argparse.Namespace) -> tuple[int, ...]:
     if args.tcn_max_epochs != 5 or args.tcn_patience != 2:
         raise ValueError("TCN must use max_epoch=5 and patience=2")
     return nbm_seeds
+
+
+def validate_methods(value: str) -> tuple[str, ...]:
+    methods = tuple(item.strip() for item in value.split(",") if item.strip())
+    if not methods or len(methods) != len(set(methods)):
+        raise ValueError(f"invalid unique experiment method list: {value}")
+    unknown = sorted(set(methods) - set(SUPPORTED_METHODS))
+    if unknown:
+        raise ValueError(
+            f"unsupported methods {unknown}; expected a subset of {SUPPORTED_METHODS}"
+        )
+    return methods
 
 
 def validate_gpus(value: str, check_hardware: bool) -> list[str]:
@@ -134,6 +164,12 @@ def nbm_command(args: argparse.Namespace, fold: int, seed: int) -> list[str]:
     return command
 
 
+def nbm_source_base(args: argparse.Namespace) -> Path:
+    if args.reuse_nbm_source_root is not None:
+        return args.reuse_nbm_source_root.resolve()
+    return args.output_root.resolve() / "nbm_source"
+
+
 def pair_common(args: argparse.Namespace, source: Path) -> list[str]:
     values = [
         "--data-dir",
@@ -150,6 +186,8 @@ def pair_common(args: argparse.Namespace, source: Path) -> list[str]:
         args.tcn_seeds,
         "--required-seeds",
         SEED_TEXT,
+        "--experiment-methods",
+        args.experiment_methods,
         "--sampling-rate-hz",
         "64",
         "--window-samples",
@@ -179,7 +217,7 @@ def pair_command(
     method: str,
     seed: int,
 ) -> list[str]:
-    source = args.output_root.resolve() / "nbm_source" / f"seed_{seed}"
+    source = nbm_source_base(args) / f"seed_{seed}"
     return [
         args.python,
         str(PAIR_WORKER),
@@ -205,15 +243,18 @@ def singleton(args: argparse.Namespace, stage: str) -> list[str]:
         str(PAIR_WORKER),
         "--stage",
         stage,
-        *pair_common(args, args.output_root.resolve() / "nbm_source"),
+        *pair_common(args, nbm_source_base(args)),
     ]
 
 
 def main() -> None:
     args = parse_args()
     seeds = validate_contract(args)
+    methods = validate_methods(args.experiment_methods)
     gpu_ids = validate_gpus(args.gpu_ids, not args.dry_run)
     root = args.output_root.resolve()
+    reuse_nbm = args.reuse_nbm_source_root is not None
+    source_base = nbm_source_base(args)
 
     nbm_jobs = [
         {
@@ -226,7 +267,7 @@ def main() -> None:
     specs = [
         (fold, method, seed)
         for fold in FOLDS
-        for method in METHODS
+        for method in methods
         for seed in seeds
     ]
     train_jobs = [
@@ -244,7 +285,10 @@ def main() -> None:
         for fold, method, seed in specs
     ]
     plan = {
-        "strategy": "7-GPU queue; 15 GRU-NBMs then 30-classifier global test barrier",
+        "strategy": (
+            f"7-GPU queue; {0 if reuse_nbm else len(nbm_jobs)} GRU-NBMs then "
+            f"{len(train_jobs)}-classifier global test barrier"
+        ),
         "dataset": str(args.data_dir.resolve()),
         "sampling_rate_hz": 64,
         "window_samples": 128,
@@ -253,7 +297,7 @@ def main() -> None:
         "stride_seconds": 1.0,
         "gpu_ids": gpu_ids,
         "folds": list(FOLDS),
-        "methods": list(METHODS),
+        "methods": list(methods),
         "nbm_backbone": (
             "GRU(9,64)->Linear(64,16)->Linear(16,64)->"
             "128-step zero-input GRU(9,64)->Linear(64,9)"
@@ -261,14 +305,19 @@ def main() -> None:
         "nbm_seeds": list(seeds),
         "tcn_seeds": list(seeds),
         "seed_policy": "exact paired seeds; no fold offset",
-        "nbm_jobs": len(nbm_jobs),
+        "nbm_jobs": 0 if reuse_nbm else len(nbm_jobs),
+        "nbm_source_mode": "reuse_frozen" if reuse_nbm else "fit_new",
+        "nbm_source_root": str(source_base),
         "classifier_train_jobs": len(train_jobs),
         "post_barrier_test_jobs": len(evaluate_jobs),
         "nbm_training": "max300/pat20, SmoothL1, AdamW lr1e-3, 40/40/20 augmentation",
         "classifier_training": "max5/pat2, weighted BCE, AdamW lr1e-3",
         "full_input": "scheme C [r,abs(r),delta(r)] [B,27,128]",
+        "residual_r_input": "scheme C r only [B,9,128]; no abs/delta expansion",
         "raw_input": "role4 RobustScaler + per-window/per-axis centering [B,9,128]",
-        "example_nbm": command_text(nbm_jobs[0]["command"]),
+        "example_nbm": (
+            None if reuse_nbm else command_text(nbm_jobs[0]["command"])
+        ),
         "example_train": command_text(train_jobs[0]["command"]),
         "seal": command_text(singleton(args, "seal")),
         "example_test": command_text(evaluate_jobs[0]["command"]),
@@ -291,16 +340,23 @@ def main() -> None:
     )
 
     if args.phase in ("full", "nbm"):
-        run_pool("nbm", nbm_jobs, gpu_ids, root)
+        if reuse_nbm:
+            for fold in FOLDS:
+                for seed in seeds:
+                    done = source_base / f"seed_{seed}" / f"fold_{fold}" / "DONE_NBM.json"
+                    if not done.exists():
+                        raise FileNotFoundError(f"reused GRU-NBM is not frozen: {done}")
+            print(f"REUSE FROZEN GRU-NBM source={source_base}", flush=True)
+        else:
+            run_pool("nbm", nbm_jobs, gpu_ids, root)
         if args.phase == "nbm":
-            print(f"64-Hz GRU-NBM COMPLETE output={root / 'nbm_source'}", flush=True)
+            print(f"64-Hz GRU-NBM READY source={source_base}", flush=True)
             return
     if args.phase in ("full", "train"):
         for fold in FOLDS:
             for seed in seeds:
                 done = (
-                    root
-                    / "nbm_source"
+                    source_base
                     / f"seed_{seed}"
                     / f"fold_{fold}"
                     / "DONE_NBM.json"

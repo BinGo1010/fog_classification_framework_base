@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict paired FULL-C versus RAW TCN ablation on processed_NBM.
+"""Strict paired TCN representation ablations on processed_NBM.
 
 FULL_C
     role-4 RobustScaler -> per-window/per-axis centering -> selected frozen NBM
@@ -8,6 +8,10 @@ FULL_C
 RAW
     the identical role-4 RobustScaler -> per-window/per-axis centering
     -> TCN [B,9,T].  The NBM, role-5 b/sigma, and residual path are absent.
+
+RESIDUAL_R
+    the identical FULL_C path through centered scheme-C residual r, followed
+    directly by TCN [B,9,T]; abs(r) and delta(r) are the only removed terms.
 
 Stages enforce a global test barrier: all configured classifiers and validation-only
 thresholds must be frozen before roles 0/1 can be materialized.
@@ -84,6 +88,7 @@ from scripts.run_daphnet_transformer_nbm300_fold import (
 
 FOLDS = (0, 1, 2)
 METHODS = ("FULL_C", "RAW")
+SUPPORTED_METHODS = (*METHODS, "RESIDUAL_R")
 METRIC_KEYS = (
     "accuracy",
     "balanced_accuracy",
@@ -101,6 +106,18 @@ def parse_csv_ints(value: str) -> tuple[int, ...]:
     if not values or len(values) != len(set(values)):
         raise ValueError(f"invalid unique integer list: {value}")
     return values
+
+
+def parse_csv_methods(value: str) -> tuple[str, ...]:
+    methods = tuple(item.strip() for item in value.split(",") if item.strip())
+    if not methods or len(methods) != len(set(methods)):
+        raise ValueError(f"invalid unique method list: {value}")
+    unknown = sorted(set(methods) - set(SUPPORTED_METHODS))
+    if unknown:
+        raise ValueError(
+            f"unsupported methods {unknown}; expected a subset of {SUPPORTED_METHODS}"
+        )
+    return methods
 
 
 def parse_args() -> argparse.Namespace:
@@ -127,7 +144,15 @@ def parse_args() -> argparse.Namespace:
         / "daphnet_conv_tcn_nbm300_C_vs_raw_tcn_ep10pat2_seedset_0_52_161",
     )
     parser.add_argument("--fold", type=int, choices=FOLDS)
-    parser.add_argument("--method", choices=METHODS)
+    parser.add_argument("--method", choices=SUPPORTED_METHODS)
+    parser.add_argument(
+        "--experiment-methods",
+        default=",".join(METHODS),
+        help=(
+            "Comma-separated methods sealed and aggregated together. "
+            "RESIDUAL_R is scheme-C r without abs(r) or delta(r)."
+        ),
+    )
     parser.add_argument(
         "--nbm-kind",
         choices=(
@@ -179,6 +204,11 @@ def require_job_args(args: argparse.Namespace) -> None:
         )
     if args.nbm_seed != args.tcn_seed:
         raise ValueError("strict paired repeats require NBM seed == TCN seed")
+    methods = parse_csv_methods(args.experiment_methods)
+    if args.method not in methods:
+        raise ValueError(
+            f"job method {args.method!r} is absent from --experiment-methods {methods}"
+        )
     required_seeds = parse_csv_ints(args.required_seeds)
     if args.nbm_seed not in required_seeds:
         raise ValueError(f"seed must be one of {required_seeds}")
@@ -192,8 +222,16 @@ def job_dir(root: Path, fold: int, method: str, seed: int) -> Path:
     return root / "runs" / f"fold_{fold}" / f"method_{method}" / f"seed_{seed}"
 
 
-def expected_jobs(seeds: tuple[int, ...]) -> list[tuple[int, str, int]]:
-    return [(fold, method, seed) for fold in FOLDS for method in METHODS for seed in seeds]
+def expected_jobs(
+    seeds: tuple[int, ...],
+    methods: tuple[str, ...] = METHODS,
+) -> list[tuple[int, str, int]]:
+    return [
+        (fold, method, seed)
+        for fold in FOLDS
+        for method in methods
+        for seed in seeds
+    ]
 
 
 def stable_json_hash(value: Any) -> str:
@@ -872,8 +910,15 @@ def build_scheme_c_features(
     labels: np.ndarray,
     sigma: np.ndarray,
     window_samples: int,
+    expand: bool = True,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Scheme C for arbitrary T: e/sigma -> clip -> center -> [r,|r|,dr]."""
+    """Scheme C for arbitrary T, optionally without residual expansion.
+
+    ``expand=True`` returns [r, |r|, delta(r)] with 27 channels.  The strict
+    residual-expansion ablation uses ``expand=False`` and returns only r with
+    9 channels; every operation before this final representation choice is
+    identical.
+    """
     error = np.asarray(error_bct, dtype=np.float32)
     if error.ndim != 3 or error.shape[1:] != (9, window_samples):
         raise ValueError(
@@ -897,12 +942,17 @@ def build_scheme_c_features(
         raise AssertionError(
             f"scheme-C centering failed: max_mean={maximum_mean}, tolerance={tolerance}"
         )
-    absolute = np.abs(residual).astype(np.float32, copy=False)
-    delta = np.diff(
-        residual, axis=2, prepend=residual[:, :, :1]
-    ).astype(np.float32, copy=False)
-    features = np.concatenate([residual, absolute, delta], axis=1)
-    if features.shape[1:] != (27, window_samples):
+    if expand:
+        absolute = np.abs(residual).astype(np.float32, copy=False)
+        delta = np.diff(
+            residual, axis=2, prepend=residual[:, :, :1]
+        ).astype(np.float32, copy=False)
+        features = np.concatenate([residual, absolute, delta], axis=1)
+        expected_channels = 27
+    else:
+        features = residual
+        expected_channels = 9
+    if features.shape[1:] != (expected_channels, window_samples):
         raise AssertionError(f"unexpected scheme-C tensor shape: {features.shape}")
 
     def clip_record(mask: np.ndarray) -> dict[str, Any]:
@@ -996,16 +1046,27 @@ def make_features(
     else:
         raise ValueError(f"unsupported NBM kind: {nbm_kind}")
     if stable_json_hash(full_scaler.as_dict()) != stable_json_hash(scaler.as_dict()):
-        raise AssertionError("FULL_C and RAW scalers differ")
+        raise AssertionError("NBM and classifier role-4 scalers differ")
+    expand = method == "FULL_C"
+    if method not in ("FULL_C", "RESIDUAL_R"):
+        raise ValueError(f"unsupported residual method: {method}")
     values, clip_stats = build_scheme_c_features(
-        error, labels, sigma, window_samples
+        error, labels, sigma, window_samples, expand=expand
     )
     del nbm, error
     if device.type == "cuda":
         torch.cuda.empty_cache()
+    formula = "e=X-Xhat; q=clip(e/(sigma+1e-6),-12,12); r=q-mean_t(q)"
+    if expand:
+        formula += "; F=[r,abs(r),delta_t(r)]"
+    else:
+        formula += "; F=r (no residual expansion)"
     return values, {
-        "formula": "e=X-Xhat; q=clip(e/(sigma+1e-6),-12,12); r=q-mean_t(q); F=[r,abs(r),delta_t(r)]",
-        "shape": ["B", 27, window_samples],
+        "formula": formula,
+        "shape": ["B", 27 if expand else 9, window_samples],
+        "residual_expansion": (
+            "[r,abs(r),delta_t(r)]" if expand else "none; r only"
+        ),
         "uses_nbm": True,
         "uses_role5_b_sigma": True,
         "uses_bias_b": False,
@@ -1093,9 +1154,12 @@ def run_train(args: argparse.Namespace, device: torch.device) -> None:
         "validation_feature": validation_feature,
         "role4_scaler_artifact": artifact_manifest,
         "nbm_contract": nbm_contract,
-        "raw_ablation_role5_policy": (
-            "RAW reads only the role-4 scaler fields; it does not load NBM weights, b, sigma, "
-            "or use role-5 windows"
+        "role5_policy": (
+            "RAW reads only the role-4 scaler fields; it does not load NBM weights, "
+            "b, sigma, or use role-5 windows"
+            if args.method == "RAW"
+            else "Residual methods use frozen role-5 sigma; b is used to estimate "
+            "sigma but is not subtracted in scheme C"
         ),
         "roles": {"classifier_train": [6, 7], "classifier_validation": [2, 3], "test_not_accessed": [0, 1]},
         "test_roles_accessed": False,
@@ -1131,13 +1195,14 @@ def run_seal(args: argparse.Namespace) -> None:
     nbm_seeds = parse_csv_ints(args.nbm_seeds)
     seeds = parse_csv_ints(args.tcn_seeds)
     required_seeds = parse_csv_ints(args.required_seeds)
+    methods = parse_csv_methods(args.experiment_methods)
     if nbm_seeds != seeds:
         raise ValueError("strict paired repeats require identical NBM and TCN seed lists")
     if seeds != required_seeds:
         raise ValueError(f"this experiment requires seeds {required_seeds}")
     root = args.output_root.resolve()
     entries = []
-    for fold, method, seed in expected_jobs(seeds):
+    for fold, method, seed in expected_jobs(seeds, methods):
         directory = job_dir(root, fold, method, seed)
         frozen_path = directory / "frozen_validation.json"
         checkpoint = directory / "checkpoints" / "tcn.pt"
@@ -1167,7 +1232,11 @@ def run_seal(args: argparse.Namespace) -> None:
                 raise AssertionError(f"fold {fold} mismatch: {key}")
         for seed in seeds:
             paired = [item for item in same_fold if item["tcn_seed"] == seed]
-            if len(paired) != 2 or len({item["pair_id"] for item in paired}) != 1:
+            if (
+                len(paired) != len(methods)
+                or len({item["method"] for item in paired}) != len(methods)
+                or len({item["pair_id"] for item in paired}) != 1
+            ):
                 raise AssertionError(f"fold {fold}, seed {seed} is not a valid paired initialization")
             if len({item["nbm_seed"] for item in paired}) != 1 or paired[0]["nbm_seed"] != seed:
                 raise AssertionError(f"fold {fold}, seed {seed} NBM/TCN seeds are not paired")
@@ -1194,9 +1263,9 @@ def run_seal(args: argparse.Namespace) -> None:
     )
     barrier = {
         "barrier_schema": "strict_test_barrier.v2",
-        "status": "all_FULL_C_and_RAW_classifiers_and_thresholds_frozen",
+        "status": f"all_{'_and_'.join(methods)}_classifiers_and_thresholds_frozen",
         "created_utc": datetime.now(timezone.utc).isoformat(),
-        "folds": list(FOLDS), "methods": list(METHODS),
+        "folds": list(FOLDS), "methods": list(methods),
         "nbm_seeds": list(nbm_seeds), "tcn_seeds": list(seeds),
         "job_count": len(entries),
         "strict_test_gate": "roles 0/1 may be accessed only after this global barrier",
@@ -1206,16 +1275,26 @@ def run_seal(args: argparse.Namespace) -> None:
     }
     barrier["barrier_id"] = stable_json_hash(barrier_identity_payload(barrier))
     write_json(root / "TRAINING_BARRIER.json", barrier)
-    write_json(root / "experiment_config.json", {
-        "experiment": f"strict_paired_{entries[0]['nbm_kind']}_NBM_schemeC_vs_centered_scaled_RAW_TCN",
-        "full": (
+    method_inputs = {
+        "FULL_C": (
             "role4 scaler + window-axis centering + NBM + scheme C "
             f"[r,abs(r),delta] [B,27,{args.window_samples}]"
         ),
-        "ablation": (
+        "RESIDUAL_R": (
+            "role4 scaler + window-axis centering + NBM + scheme C "
+            f"r only [B,9,{args.window_samples}]; no abs/delta expansion"
+        ),
+        "RAW": (
             "role4 scaler + window-axis centering + RAW "
             f"[B,9,{args.window_samples}]"
         ),
+    }
+    experiment_config = {
+        "experiment": (
+            f"strict_paired_{entries[0]['nbm_kind']}_NBM_"
+            f"{'_vs_'.join(methods)}_TCN"
+        ),
+        "methods": {method: method_inputs[method] for method in methods},
         "nbm": "max_epoch=300, patience=20, SmoothL1, lr=1e-3, augmentation=40% clean/40% Gaussian(std=.04)/20% mask",
         "paired_seeds": list(seeds),
         "nbm_kind": entries[0]["nbm_kind"],
@@ -1230,7 +1309,16 @@ def run_seal(args: argparse.Namespace) -> None:
         "barrier_schema": barrier["barrier_schema"],
         "barrier_id": barrier["barrier_id"],
         "test_data_manifest_sha256": test_data_manifest["sha256"],
-    })
+    }
+    if "FULL_C" in methods:
+        experiment_config["full"] = method_inputs["FULL_C"]
+    if "RAW" in methods:
+        experiment_config["ablation"] = method_inputs["RAW"]
+    if "RESIDUAL_R" in methods:
+        experiment_config["residual_expansion_ablation"] = method_inputs[
+            "RESIDUAL_R"
+        ]
+    write_json(root / "experiment_config.json", experiment_config)
     print(f"GLOBAL TRAINING BARRIER SEALED jobs={len(entries)}", flush=True)
 
 
@@ -1446,6 +1534,7 @@ def run_aggregate(args: argparse.Namespace) -> None:
     nbm_seeds = parse_csv_ints(args.nbm_seeds)
     seeds = parse_csv_ints(args.tcn_seeds)
     required_seeds = parse_csv_ints(args.required_seeds)
+    methods = parse_csv_methods(args.experiment_methods)
     if nbm_seeds != seeds:
         raise ValueError("strict paired repeats require identical NBM and TCN seed lists")
     if seeds != required_seeds:
@@ -1455,6 +1544,10 @@ def run_aggregate(args: argparse.Namespace) -> None:
     if not barrier_path.exists():
         raise FileNotFoundError("cannot aggregate without global barrier")
     barrier = load_and_validate_barrier(barrier_path)
+    if tuple(barrier.get("methods", ())) != methods:
+        raise AssertionError(
+            "requested experiment methods differ from the sealed method order"
+        )
     require_strict_barrier_for_tcn_v2(barrier, args.nbm_kind)
     barrier_schema = barrier.get("barrier_schema", "legacy.v1")
     barrier_id = barrier.get("barrier_id", sha256_file(barrier_path))
@@ -1472,7 +1565,7 @@ def run_aggregate(args: argparse.Namespace) -> None:
             raise AssertionError("permanent-test data changed after the global seal")
     barrier_jobs = {item["job_id"]: item for item in barrier["jobs"]}
     results = []
-    for fold, method, seed in expected_jobs(seeds):
+    for fold, method, seed in expected_jobs(seeds, methods):
         directory = job_dir(root, fold, method, seed)
         target = job_id(fold, method, seed)
         if target not in barrier_jobs:
@@ -1503,7 +1596,7 @@ def run_aggregate(args: argparse.Namespace) -> None:
     } for r in results]
     write_csv(root / f"run_metrics_{len(results)}.csv", run_rows)
     seed_rows = []
-    for method in METHODS:
+    for method in methods:
         for seed in seeds:
             subset = [r for r in results if r["method"] == method and r["tcn_seed"] == seed]
             seed_rows.append({
@@ -1513,25 +1606,49 @@ def run_aggregate(args: argparse.Namespace) -> None:
     write_csv(root / "seed_macro_over_3folds.csv", seed_rows)
     summary: dict[str, Any] = {}
     summary_rows = []
-    for method in METHODS:
+    for method in methods:
         method_rows = [row for row in seed_rows if row["method"] == method]
         summary[method] = {key: mean_std(row[key] for row in method_rows) for key in METRIC_KEYS}
         for key in METRIC_KEYS:
             summary_rows.append({"method": method, "metric": key, **summary[method][key]})
     write_csv(root / f"method_summary_{len(seeds)}seed_mean_std.csv", summary_rows)
-    deltas = []
-    for seed in seeds:
-        full = next(row for row in seed_rows if row["method"] == "FULL_C" and row["tcn_seed"] == seed)
-        raw = next(row for row in seed_rows if row["method"] == "RAW" and row["tcn_seed"] == seed)
-        deltas.append({"tcn_seed": seed, **{key: full[key] - raw[key] for key in METRIC_KEYS}})
-    delta_summary = {key: mean_std(row[key] for row in deltas) for key in METRIC_KEYS}
-    write_csv(root / "paired_delta_FULL_C_minus_RAW_by_seed.csv", deltas)
-    write_csv(root / "paired_delta_FULL_C_minus_RAW_summary.csv", [
-        {"metric": key, **value} for key, value in delta_summary.items()
-    ])
+    paired_comparisons: dict[str, Any] = {}
+    if len(methods) == 2:
+        reference, ablation = methods
+        comparison_name = f"{reference}_minus_{ablation}"
+        deltas = []
+        for seed in seeds:
+            reference_row = next(
+                row
+                for row in seed_rows
+                if row["method"] == reference and row["tcn_seed"] == seed
+            )
+            ablation_row = next(
+                row
+                for row in seed_rows
+                if row["method"] == ablation and row["tcn_seed"] == seed
+            )
+            deltas.append(
+                {
+                    "tcn_seed": seed,
+                    **{
+                        key: reference_row[key] - ablation_row[key]
+                        for key in METRIC_KEYS
+                    },
+                }
+            )
+        delta_summary = {
+            key: mean_std(row[key] for row in deltas) for key in METRIC_KEYS
+        }
+        write_csv(root / f"paired_delta_{comparison_name}_by_seed.csv", deltas)
+        write_csv(
+            root / f"paired_delta_{comparison_name}_summary.csv",
+            [{"metric": key, **value} for key, value in delta_summary.items()],
+        )
+        paired_comparisons[comparison_name] = delta_summary
     subject_rows = []
-    subject_json: dict[str, Any] = {method: {} for method in METHODS}
-    for method in METHODS:
+    subject_json: dict[str, Any] = {method: {} for method in methods}
+    for method in methods:
         for subject in SUBJECTS:
             per_seed = []
             for seed in seeds:
@@ -1551,7 +1668,7 @@ def run_aggregate(args: argparse.Namespace) -> None:
     final = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "primary_metrics": summary,
-        "paired_delta_FULL_C_minus_RAW": delta_summary,
+        "paired_comparisons": paired_comparisons,
         "subject_metrics": subject_json,
         "definition": (
             f"within each seed macro-average 3 folds; mean±population SD across "
@@ -1563,11 +1680,16 @@ def run_aggregate(args: argparse.Namespace) -> None:
         "test_data_manifest_sha256": test_data_manifest_sha256,
         "nbm_kind": results[0]["nbm_kind"],
         "run_count": len(results),
+        "methods": list(methods),
     }
+    for comparison_name, comparison_summary in paired_comparisons.items():
+        # Keep the historical top-level paired-delta key while also exposing
+        # all comparisons through the generic mapping above.
+        final[f"paired_delta_{comparison_name}"] = comparison_summary
     write_json(root / "summary.json", final)
     write_json(root / "DONE.json", {
         "status": "complete", "completed_utc": datetime.now(timezone.utc).isoformat(),
-        "run_count": len(results), "methods": list(METHODS),
+        "run_count": len(results), "methods": list(methods),
         "nbm_seeds": list(seeds), "tcn_seeds": list(seeds),
     })
     print(json.dumps(final["primary_metrics"], ensure_ascii=False, indent=2), flush=True)

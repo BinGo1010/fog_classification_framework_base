@@ -45,3 +45,39 @@ def test_job_grid_is_three_folds_two_methods_five_paired_seeds() -> None:
         * len(launcher.REQUIRED_SEEDS)
         == 30
     )
+
+
+def test_residual_expansion_ablation_command_contract(monkeypatch, tmp_path) -> None:
+    output_root = tmp_path / "residual_expansion_ablation"
+    reuse_root = tmp_path / "frozen_nbm_source"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "launcher",
+            "--output-root",
+            str(output_root),
+            "--experiment-methods",
+            "FULL_C,RESIDUAL_R",
+            "--reuse-nbm-source-root",
+            str(reuse_root),
+        ],
+    )
+    args = launcher.parse_args()
+    assert launcher.validate_methods(args.experiment_methods) == (
+        "FULL_C",
+        "RESIDUAL_R",
+    )
+
+    command = launcher.pair_command(
+        args, "train", fold=1, method="RESIDUAL_R", seed=5216
+    )
+    assert option_value(command, "--method") == "RESIDUAL_R"
+    assert option_value(command, "--experiment-methods") == (
+        "FULL_C,RESIDUAL_R"
+    )
+    assert option_value(command, "--output-root") == str(output_root.resolve())
+    assert option_value(command, "--nbm-source-root") == str(
+        (reuse_root / "seed_5216").resolve()
+    )
+    assert launcher.nbm_source_base(args) == reuse_root.resolve()

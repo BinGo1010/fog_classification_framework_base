@@ -9,8 +9,10 @@ from scripts.run_daphnet_nbm300_c_vs_raw_ablation import (
     barrier_identity_payload,
     build_test_data_manifest,
     build_scheme_c_features,
+    expected_jobs,
     load_and_validate_barrier,
     paired_initialization,
+    parse_csv_methods,
     raw_features,
     require_strict_barrier_for_tcn_v2,
     stable_json_hash,
@@ -105,6 +107,45 @@ def test_dynamic_scheme_c_matches_original_128_sample_implementation() -> None:
     expected, _ = build_abcd_features(error, labels, "C", bias, sigma)
     actual, _ = build_scheme_c_features(error, labels, sigma, window_samples=128)
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_residual_expansion_ablation_keeps_only_centered_r() -> None:
+    rng = np.random.default_rng(20260823)
+    error = rng.normal(size=(6, 9, 128)).astype(np.float32)
+    labels = np.asarray([0, 1, 0, 1, 0, 1], dtype=np.int8)
+    sigma = np.linspace(0.05, 1.25, 9, dtype=np.float32)
+
+    expanded, expanded_stats = build_scheme_c_features(
+        error, labels, sigma, window_samples=128, expand=True
+    )
+    residual_only, residual_stats = build_scheme_c_features(
+        error, labels, sigma, window_samples=128, expand=False
+    )
+
+    assert expanded.shape == (6, 128, 27)
+    assert residual_only.shape == (6, 128, 9)
+    np.testing.assert_array_equal(residual_only, expanded[:, :, :9])
+    assert residual_stats == expanded_stats
+    np.testing.assert_allclose(
+        residual_only.mean(axis=1, dtype=np.float64), 0.0, atol=2e-6
+    )
+
+
+def test_residual_r_uses_the_same_9ch_initialization_as_raw() -> None:
+    raw_state, raw_meta = paired_initialization(5216, "RAW")
+    residual_state, residual_meta = paired_initialization(5216, "RESIDUAL_R")
+    assert raw_meta["pair_id"] == residual_meta["pair_id"]
+    assert raw_state.keys() == residual_state.keys()
+    for name in raw_state:
+        assert torch.equal(raw_state[name], residual_state[name])
+
+
+def test_dynamic_experiment_method_grid_supports_residual_ablation() -> None:
+    methods = parse_csv_methods("FULL_C,RESIDUAL_R")
+    jobs = expected_jobs((0, 52, 161, 5216, 52161), methods)
+    assert methods == ("FULL_C", "RESIDUAL_R")
+    assert len(jobs) == 30
+    assert (2, "RESIDUAL_R", 52161) in jobs
 
 
 def _test_rows() -> SimpleNamespace:

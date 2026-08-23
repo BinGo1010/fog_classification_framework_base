@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Add event-level metrics to the frozen Daphnet RAW+TCN test outputs.
+"""Add event-level metrics to frozen Daphnet TCN test outputs.
 
 This script performs evaluation only.  It does not train a model, alter a
 checkpoint, change a validation-selected threshold, or regenerate test
@@ -46,7 +46,27 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment-dir", type=Path, default=DEFAULT_EXPERIMENT)
     parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET)
+    parser.add_argument(
+        "--method",
+        choices=("RAW", "FULL_C"),
+        default="RAW",
+        help="Frozen classifier branch to evaluate.",
+    )
+    parser.add_argument(
+        "--seeds",
+        default=",".join(str(seed) for seed in EXPECTED_SEEDS),
+        help="Comma-separated frozen run seeds.",
+    )
     return parser.parse_args()
+
+
+def parse_seeds(text: str) -> tuple[int, ...]:
+    seeds = tuple(int(item.strip()) for item in text.split(",") if item.strip())
+    if not seeds:
+        raise ValueError("At least one seed is required")
+    if len(seeds) != len(set(seeds)):
+        raise ValueError(f"Duplicate seeds are not allowed: {seeds}")
+    return seeds
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
@@ -263,14 +283,20 @@ def main() -> None:
     args = parse_args()
     experiment_dir = args.experiment_dir.resolve()
     dataset_dir = args.dataset_dir.resolve()
+    method = str(args.method)
+    expected_seeds = parse_seeds(args.seeds)
+    output_stem = method.lower()
     window_lookup = load_window_lookup(dataset_dir)
     fog_groups = load_fog_groups(dataset_dir)
     prediction_paths = sorted(
-        experiment_dir.glob("runs/fold_*/method_RAW/seed_*/test_predictions.csv")
+        experiment_dir.glob(
+            f"runs/fold_*/method_{method}/seed_*/test_predictions.csv"
+        )
     )
-    if len(prediction_paths) != len(EXPECTED_FOLDS) * len(EXPECTED_SEEDS):
+    if len(prediction_paths) != len(EXPECTED_FOLDS) * len(expected_seeds):
         raise ValueError(
-            f"Expected 15 frozen RAW prediction files, found {len(prediction_paths)}"
+            f"Expected {len(EXPECTED_FOLDS) * len(expected_seeds)} frozen "
+            f"{method} prediction files, found {len(prediction_paths)}"
         )
 
     run_rows: list[dict[str, Any]] = []
@@ -283,12 +309,14 @@ def main() -> None:
         subject_rows.extend(run_subject_rows)
 
     observed = {(int(row["fold"]), int(row["seed"])) for row in run_rows}
-    expected = {(fold, seed) for fold in EXPECTED_FOLDS for seed in EXPECTED_SEEDS}
+    expected = {
+        (fold, seed) for fold in EXPECTED_FOLDS for seed in expected_seeds
+    }
     if observed != expected:
         raise ValueError(f"Run grid mismatch: missing={expected-observed}, extra={observed-expected}")
 
     seed_rows: list[dict[str, Any]] = []
-    for seed in EXPECTED_SEEDS:
+    for seed in expected_seeds:
         rows = [row for row in run_rows if int(row["seed"]) == seed]
         seed_rows.append(
             {
@@ -305,12 +333,12 @@ def main() -> None:
 
     summary = {
         "experiment": str(experiment_dir),
-        "method": "RAW+TCN",
+        "method": f"{method}+TCN",
         "evaluation_only": True,
         "model_retrained": False,
         "threshold_changed": False,
         "folds": list(EXPECTED_FOLDS),
-        "seeds": list(EXPECTED_SEEDS),
+        "seeds": list(expected_seeds),
         "sampling_rate_hz": FS,
         "stride_samples": STRIDE,
         "event_definition": (
@@ -325,7 +353,7 @@ def main() -> None:
             "union duration of pure Non-FoG test-window intervals"
         ),
         "aggregation": (
-            "mean over 3 folds within each seed, then mean and sample SD over 5 seeds"
+            "mean over 3 folds within each seed, then mean and sample SD over seeds"
         ),
         "event_sensitivity": mean_sd(
             row["event_sensitivity"] for row in seed_rows
@@ -363,16 +391,25 @@ def main() -> None:
         "event_sensitivity",
         "false_alarm_events_per_hour",
     ]
-    write_csv(experiment_dir / "raw_event_metrics_15runs.csv", run_rows, run_columns)
+    run_count = len(EXPECTED_FOLDS) * len(expected_seeds)
+    seed_count = len(expected_seeds)
     write_csv(
-        experiment_dir / "raw_event_metrics_by_subject_15runs.csv",
+        experiment_dir / f"{output_stem}_event_metrics_{run_count}runs.csv",
+        run_rows,
+        run_columns,
+    )
+    write_csv(
+        experiment_dir
+        / f"{output_stem}_event_metrics_by_subject_{run_count}runs.csv",
         subject_rows,
         subject_columns,
     )
     write_csv(
-        experiment_dir / "raw_event_metrics_5seed_macro.csv", seed_rows, seed_columns
+        experiment_dir / f"{output_stem}_event_metrics_{seed_count}seed_macro.csv",
+        seed_rows,
+        seed_columns,
     )
-    with (experiment_dir / "raw_event_metrics_summary.json").open(
+    with (experiment_dir / f"{output_stem}_event_metrics_summary.json").open(
         "w", encoding="utf-8"
     ) as handle:
         json.dump(summary, handle, ensure_ascii=False, indent=2)
@@ -382,7 +419,7 @@ def main() -> None:
     false_alarm = summary["false_alarm_events_per_hour"]
     report = "\n".join(
         [
-            "# Daphnet RAW+TCN event-level test metrics",
+            f"# Daphnet {method}+TCN event-level test metrics",
             "",
             "This is an evaluation-only supplement based on frozen test predictions. "
             "No model was retrained and no validation-selected threshold was changed.",
@@ -397,7 +434,7 @@ def main() -> None:
                 f"{false_alarm['mean']:.2f} ± {false_alarm['std']:.2f} |"
             ),
             "",
-            "The mean and sample SD are calculated over five seed-level values. "
+            f"The mean and sample SD are calculated over {seed_count} seed-level values. "
             "Each seed-level value is the mean of the three fixed folds.",
             "",
             "## Frozen evaluation definitions",
@@ -411,7 +448,7 @@ def main() -> None:
             "",
         ]
     )
-    (experiment_dir / "RAW_EVENT_METRICS_REPORT.md").write_text(
+    (experiment_dir / f"{method}_EVENT_METRICS_REPORT.md").write_text(
         report, encoding="utf-8"
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
