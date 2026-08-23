@@ -43,6 +43,23 @@ FEATURES_PER_CHANNEL = (
     "spectral_entropy_0p5_28hz",
     "dominant_frequency_0p5_28hz",
 )
+FEATURES_PER_CHANNEL_4F = (
+    "std",
+    "peak_to_peak",
+    "log_power_3_8hz",
+    "log_power_8_28hz",
+)
+FEATURE_SCHEMAS = {
+    "tf330_all5_30ch_v1": FEATURES_PER_CHANNEL,
+    "tf120_all5_30ch_4f_v1": FEATURES_PER_CHANNEL_4F,
+}
+FEATURE_SCHEMA_VERSIONS = {
+    "tf330_all5_30ch_v1": 1,
+    "tf120_all5_30ch_4f_v1": 2,
+}
+LEGACY_TF330_IMPLEMENTATION_SHA256 = (
+    "97107f3911ad7fa292247cd013fcffce18500d394852838f62c84b69eccc8f20"
+)
 
 
 def _json_safe(value: Any) -> Any:
@@ -161,11 +178,15 @@ def resolve_path(project_root: Path, value: str | Path) -> Path:
     return path.resolve() if path.is_absolute() else (project_root / path).resolve()
 
 
-def feature_names(channel_names: Iterable[str]) -> list[str]:
+def feature_names(
+    channel_names: Iterable[str], feature_schema: str = "tf330_all5_30ch_v1"
+) -> list[str]:
+    if feature_schema not in FEATURE_SCHEMAS:
+        raise ValueError(f"Unsupported private TF feature schema: {feature_schema}")
     return [
         f"{channel}__{feature}"
         for channel in channel_names
-        for feature in FEATURES_PER_CHANNEL
+        for feature in FEATURE_SCHEMAS[feature_schema]
     ]
 
 
@@ -193,8 +214,9 @@ def extract_tf_features(
     high_band_hz: float = 28.0,
     remove_channel_mean: bool = True,
     epsilon: float = 1e-12,
+    feature_schema: str = "tf330_all5_30ch_v1",
 ) -> np.ndarray:
-    """Return 11 features per physical channel for 2-second windows."""
+    """Return configured features per physical channel for 2-second windows."""
 
     values = np.asarray(windows, dtype=np.float64)
     expected_samples = int(round(2.0 * float(sampling_rate_hz)))
@@ -208,52 +230,67 @@ def extract_tf_features(
         raise ValueError("high-band limit exceeds Nyquist")
     if epsilon <= 0.0 or not np.isfinite(epsilon):
         raise ValueError("epsilon must be finite and positive")
+    if feature_schema not in FEATURE_SCHEMAS:
+        raise ValueError(f"Unsupported private TF feature schema: {feature_schema}")
 
     centered = (
         values - values.mean(axis=1, keepdims=True)
         if remove_channel_mean
         else values
     )
-    differences = np.diff(centered, axis=1)
     time_features = [
         centered.std(axis=1),
         np.ptp(centered, axis=1),
-        np.mean(np.abs(centered), axis=1),
-        np.sqrt(np.mean(np.square(differences), axis=1)),
-        np.mean(np.abs(differences), axis=1),
     ]
+    if feature_schema == "tf330_all5_30ch_v1":
+        differences = np.diff(centered, axis=1)
+        time_features.extend(
+            [
+                np.mean(np.abs(centered), axis=1),
+                np.sqrt(np.mean(np.square(differences), axis=1)),
+                np.mean(np.abs(differences), axis=1),
+            ]
+        )
 
     taper = np.hanning(values.shape[1]).reshape(1, -1, 1)
     frequencies = np.fft.rfftfreq(values.shape[1], d=1.0 / sampling_rate_hz)
     spectrum = np.fft.rfft(centered * taper, axis=1)
     power = np.square(np.abs(spectrum)) / max(float(np.square(taper).sum()), epsilon)
-    locomotor = _band_power(
-        power, frequencies, 0.5, 3.0, include_high=False
-    )
     freezing = _band_power(power, frequencies, 3.0, 8.0, include_high=False)
     high = _band_power(
         power, frequencies, 8.0, high_band_hz, include_high=True
     )
-    analysis_mask = (frequencies >= 0.5) & (frequencies <= high_band_hz)
-    analysis = power[:, analysis_mask, :]
-    normalized = analysis / np.maximum(analysis.sum(axis=1, keepdims=True), epsilon)
-    entropy = -np.sum(
-        normalized * np.log(np.maximum(normalized, epsilon)), axis=1
-    ) / np.log(float(analysis.shape[1]))
-    analysis_frequencies = frequencies[analysis_mask]
-    dominant = analysis_frequencies[np.argmax(analysis, axis=1)]
-
     frequency_features = [
-        np.log1p(locomotor),
         np.log1p(freezing),
         np.log1p(high),
-        np.log1p(freezing / np.maximum(locomotor, epsilon)),
-        entropy,
-        dominant,
     ]
+    if feature_schema == "tf330_all5_30ch_v1":
+        locomotor = _band_power(
+            power, frequencies, 0.5, 3.0, include_high=False
+        )
+        analysis_mask = (frequencies >= 0.5) & (frequencies <= high_band_hz)
+        analysis = power[:, analysis_mask, :]
+        normalized = analysis / np.maximum(
+            analysis.sum(axis=1, keepdims=True), epsilon
+        )
+        entropy = -np.sum(
+            normalized * np.log(np.maximum(normalized, epsilon)), axis=1
+        ) / np.log(float(analysis.shape[1]))
+        analysis_frequencies = frequencies[analysis_mask]
+        dominant = analysis_frequencies[np.argmax(analysis, axis=1)]
+        frequency_features = [
+            np.log1p(locomotor),
+            *frequency_features,
+            np.log1p(freezing / np.maximum(locomotor, epsilon)),
+            entropy,
+            dominant,
+        ]
     matrix = np.stack([*time_features, *frequency_features], axis=2)
     result = matrix.reshape(len(values), -1)
-    if not np.isfinite(result).all():
+    if (
+        result.shape[1] != len(feature_names(range(values.shape[2]), feature_schema))
+        or not np.isfinite(result).all()
+    ):
         raise RuntimeError("Feature extraction produced NaN or Inf")
     return result.astype(np.float32)
 
@@ -468,12 +505,13 @@ def validate_config(config: dict[str, Any], project_root: Path) -> dict[str, Any
     if tuple(sensor_config.get("sensors", [])) != sensors or indices != tuple(range(30)):
         raise ValueError("sensor_config must use all five IMUs and all 30 channels")
     features = config.get("features", {})
+    feature_schema = str(features.get("schema", ""))
     if (
-        features.get("schema") != "tf330_all5_30ch_v1"
+        feature_schema not in FEATURE_SCHEMAS
         or int(features.get("sampling_rate_hz", 0)) != 64
         or int(features.get("window_samples", 0)) != 128
     ):
-        raise ValueError("Feature schema must be tf330_all5_30ch_v1 at 64 Hz/128 samples")
+        raise ValueError("Feature schema must be registered at 64 Hz/128 samples")
     evaluation = config.get("evaluation", {})
     if tuple(evaluation.get("e1_e3_window_metrics", ())) != WINDOW_METRICS:
         raise ValueError("E1/E3 metric contract is not frozen")
@@ -499,6 +537,7 @@ def validate_config(config: dict[str, Any], project_root: Path) -> dict[str, Any
         "sensors": sensors,
         "C": c_grid,
         "gamma": gamma_grid,
+        "feature_schema": feature_schema,
     }
 
 
@@ -529,7 +568,10 @@ def audit_dataset(config: dict[str, Any], project_root: Path) -> dict[str, Any]:
         "outer_folds": registered["folds"],
         "sensors": registered["sensors"],
         "channel_count": len(registered["channel_names"]),
-        "feature_count": len(feature_names(registered["channel_names"])),
+        "feature_schema": registered["feature_schema"],
+        "feature_count": len(
+            feature_names(registered["channel_names"], registered["feature_schema"])
+        ),
         "eligible_annotated_events_before_test_partition": eligible,
         "job_count": len(counts),
         "role_counts": counts,
@@ -764,17 +806,22 @@ def _job_fingerprint(
 ) -> dict[str, Any]:
     script_path = Path(__file__).resolve()
     split_path = root / "split_indices" / f"{subject}_outer{fold}_nbm_indices.npz"
+    feature_schema = str(config.get("features", {}).get("schema", ""))
     return {
         "format": "private-nbm-tf-svm-all5",
-        "version": 1,
-        "implementation_sha256": sha256_file(script_path),
+        "version": FEATURE_SCHEMA_VERSIONS[feature_schema],
+        "implementation_sha256": (
+            LEGACY_TF330_IMPLEMENTATION_SHA256
+            if feature_schema == "tf330_all5_30ch_v1"
+            else sha256_file(script_path)
+        ),
         "configuration_hash": stable_hash(public_config(config)),
         "split_index_sha256": sha256_file(split_path),
         "schema_sha256": sha256_file(root / "schema.json"),
         "subject_id": subject,
         "outer_fold": int(fold),
         "sensor_config": "all5_30ch",
-        "feature_schema": "tf330_all5_30ch_v1",
+        "feature_schema": feature_schema,
     }
 
 
@@ -837,6 +884,8 @@ def run_experiment(
     folds: Iterable[int] | None = None,
 ) -> dict[str, Any]:
     registered = validate_config(config, project_root)
+    feature_schema = registered["feature_schema"]
+    features_per_channel = FEATURE_SCHEMAS[feature_schema]
     selected_subjects = list(subjects or registered["subjects"])
     selected_folds = [int(item) for item in (folds or registered["folds"])]
     if set(selected_subjects) - set(registered["subjects"]):
@@ -858,15 +907,15 @@ def run_experiment(
     run_root.mkdir(parents=True, exist_ok=True)
     report_root.mkdir(parents=True, exist_ok=True)
     atomic_json_dump(public_config(config), run_root / "config_resolved.json")
-    names = feature_names(registered["channel_names"])
+    names = feature_names(registered["channel_names"], feature_schema)
     atomic_json_dump(
         {
-            "schema": "tf330_all5_30ch_v1",
+            "schema": feature_schema,
             "sampling_rate_hz": 64,
             "window_samples": 128,
             "sensors": registered["sensors"],
             "channel_names": registered["channel_names"],
-            "features_per_channel": FEATURES_PER_CHANNEL,
+            "features_per_channel": features_per_channel,
             "feature_names": names,
             "feature_count": len(names),
             "frequency_band_boundary_rule": "[0.5,3), [3,8), [8,28] Hz",
@@ -916,6 +965,7 @@ def run_experiment(
                 high_band_hz=28.0,
                 remove_channel_mean=True,
                 epsilon=epsilon,
+                feature_schema=feature_schema,
             )
             train_mask = frame["role_code"].isin((6, 7)).to_numpy()
             validation_mask = frame["role_code"].isin((2, 3)).to_numpy()
@@ -961,7 +1011,7 @@ def run_experiment(
                     "channel_count": 30,
                     "subject_id": subject,
                     "outer_fold": int(fold),
-                    "feature_schema": "tf330_all5_30ch_v1",
+                    "feature_schema": feature_schema,
                     "feature_count": len(names),
                     "C": float(selection["C"]),
                     "gamma": selection["gamma"],
@@ -1009,7 +1059,11 @@ def run_experiment(
     atomic_csv_write(subject_metrics, report_root / "per_subject_averaged_metrics.csv")
 
     summary_row: dict[str, Any] = {
-        "model": "TF+SVM (all5_30ch)",
+        "model": (
+            "TF+SVM (all5_30ch)"
+            if feature_schema == "tf330_all5_30ch_v1"
+            else "TF+SVM (all5_30ch, 4F/ch)"
+        ),
         "sensors": 5,
         "channels": 30,
         "subjects": int(len(subject_metrics)),
@@ -1053,7 +1107,7 @@ def run_experiment(
         "sensor_config": "all5_30ch",
         "sensors": registered["sensors"],
         "channel_count": 30,
-        "feature_schema": "tf330_all5_30ch_v1",
+        "feature_schema": feature_schema,
         "feature_count": len(names),
         "model_selection": "maximum validation PR-AUC on roles 2/3",
         "threshold_rule": "maximum validation FoG-F1 on roles 2/3",
@@ -1110,4 +1164,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

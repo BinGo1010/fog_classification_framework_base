@@ -59,6 +59,18 @@ TCN_INPUT_CHANNELS = 30
 TCN_PARAMETER_COUNT = 135_969
 NBM_VARIANT = expanded.NBM_VARIANT
 REPRESENTATION = "r_only"
+TCN_CHECKPOINT_NAME = "tcn_r_only.pt"
+MODEL_DESCRIPTION = "frozen GRU-BASE Mask4-8 NBM + r-only 30-channel TCN"
+ABLATION_DESCRIPTION = "remove abs(r) and delta(r) from expanded scheme C"
+EVENT_METRIC_VERSION = raw_base.EVENT_METRIC_VERSION
+EVENT_MINIMUM_POSITIVE_WINDOWS = 2
+EVENT_MERGE_GAP_SECONDS = 0.5
+EVENT_FALSE_ALARM_DENOMINATOR = "union coverage of evaluated valid Non-FoG samples"
+EVENT_AGGREGATION = "subject_macro"
+AGGREGATION_DESCRIPTION = (
+    "subject/seed macro mean of 3 folds; subject mean+population SD over 5 seeds; "
+    "overall subject-macro per seed then mean+population SD"
+)
 METRIC_KEYS = expanded.METRIC_KEYS
 EXPERIMENT_SCHEMA = "all_dataset_within_subject_gru_nbm_r_only_tcn.v1"
 BARRIER_SCHEMA = "all_dataset_within_subject_gru_nbm_r_only_tcn_barrier.v1"
@@ -298,7 +310,7 @@ def train_tcn(
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     batches = expanded.tcn_loader(train_x, train_y, batch_size, True, seed, workers)
-    checkpoint = destination / "checkpoints" / "tcn_r_only.pt"
+    checkpoint = destination / "checkpoints" / TCN_CHECKPOINT_NAME
     best_pr_auc = -math.inf
     best_epoch = 0
     stale = 0
@@ -357,7 +369,7 @@ def train_tcn(
         else:
             stale += 1
         print(
-            f"TCN-r epoch={epoch:03d} train={train_bce:.7f} val={validation_bce:.7f} "
+            f"TCN-{REPRESENTATION} epoch={epoch:03d} train={train_bce:.7f} val={validation_bce:.7f} "
             f"val_pr_auc={validation_pr_auc:.7f} stale={stale}/{patience}",
             flush=True,
         )
@@ -382,7 +394,7 @@ def train_tcn(
 
 def training_contract(args: argparse.Namespace) -> dict[str, Any]:
     return {
-        "ablation": "remove abs(r) and delta(r); retain centered standardized r only",
+        "ablation": ABLATION_DESCRIPTION,
         "frozen_source": "same per-job role4 Scaler, GRU-BASE Mask4-8 NBM, and role5 sigma as expanded experiment",
         "source_trainable_parameters_updated": False,
         "residual": "e=X-Xhat; q=clip(e/(sigma+1e-6),-12,12); r=q-mean_t(q)",
@@ -407,7 +419,7 @@ def validate_completed_train(destination: Path, plan: dict[str, Any]) -> bool:
     if not done_path.is_file():
         return False
     frozen_path = destination / "FROZEN_TRAIN.json"
-    checkpoint_path = destination / "checkpoints" / "tcn_r_only.pt"
+    checkpoint_path = destination / "checkpoints" / TCN_CHECKPOINT_NAME
     history_path = destination / "tcn_history.csv"
     if not all(path.is_file() for path in (frozen_path, checkpoint_path, history_path)):
         raise FileNotFoundError(f"incomplete completed train job: {destination}")
@@ -465,7 +477,7 @@ def run_train(args: argparse.Namespace) -> None:
     threshold, validation_metrics = raw_base.choose_threshold(val_true, val_prob)
     history_path = destination / "tcn_history.csv"
     expanded.write_csv(history_path, training["history"])
-    checkpoint_path = destination / "checkpoints" / "tcn_r_only.pt"
+    checkpoint_path = destination / "checkpoints" / TCN_CHECKPOINT_NAME
     frozen = {
         "schema": EXPERIMENT_SCHEMA,
         "status": "frozen_before_permanent_test",
@@ -528,7 +540,7 @@ def load_and_validate_barrier(
     frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
     if sha256_file(frozen_path) != sealed["frozen_sha256"] or frozen["frozen_id"] != sealed["frozen_id"]:
         raise AssertionError(f"frozen artifact changed after seal: {key}")
-    if sha256_file(destination / "checkpoints" / "tcn_r_only.pt") != sealed["tcn_checkpoint_sha256"]:
+    if sha256_file(destination / "checkpoints" / TCN_CHECKPOINT_NAME) != sealed["tcn_checkpoint_sha256"]:
         raise AssertionError(f"TCN checkpoint changed after seal: {key}")
     return barrier, frozen
 
@@ -572,7 +584,7 @@ def run_evaluate(args: argparse.Namespace) -> None:
     )
     model = RepresentationTCNM(TCN_INPUT_CHANNELS).to(device)
     checkpoint = torch.load(
-        destination / "checkpoints" / "tcn_r_only.pt",
+        destination / "checkpoints" / TCN_CHECKPOINT_NAME,
         map_location=device,
         weights_only=False,
     )
@@ -779,12 +791,34 @@ def run_aggregate(args: argparse.Namespace) -> None:
     overall_seed_rows = []
     for seed in seeds:
         selected = [row for row in subject_seed_rows if row["seed"] == seed]
-        overall_seed_rows.append(
-            {
-                "seed": seed,
-                **{key: float(np.mean([row[key] for row in selected])) for key in METRIC_KEYS},
-            }
-        )
+        seed_row = {
+            "seed": seed,
+            **{key: float(np.mean([row[key] for row in selected])) for key in METRIC_KEYS},
+        }
+        if EVENT_AGGREGATION == "pooled_counts_and_exposure":
+            fold_event_sensitivity: list[float] = []
+            fold_false_alarms_per_hour: list[float] = []
+            for fold in FOLDS:
+                fold_rows = [
+                    row
+                    for row in run_rows
+                    if row["seed"] == seed and row["fold"] == fold
+                ]
+                detected = sum(int(row["detected_true_events"]) for row in fold_rows)
+                events = sum(int(row["evaluable_true_events"]) for row in fold_rows)
+                false_alarms = sum(int(row["false_alarm_events"]) for row in fold_rows)
+                exposure = sum(float(row["evaluated_nonfog_hours"]) for row in fold_rows)
+                if events <= 0 or exposure <= 0.0:
+                    raise ValueError("pooled event aggregation has an empty denominator")
+                fold_event_sensitivity.append(detected / events)
+                fold_false_alarms_per_hour.append(false_alarms / exposure)
+            seed_row["event_sensitivity"] = float(np.mean(fold_event_sensitivity))
+            seed_row["false_alarms_per_hour"] = float(
+                np.mean(fold_false_alarms_per_hour)
+            )
+        elif EVENT_AGGREGATION != "subject_macro":
+            raise ValueError(f"unsupported event aggregation: {EVENT_AGGREGATION}")
+        overall_seed_rows.append(seed_row)
     overall = {key: mean_std(row[key] for row in overall_seed_rows) for key in METRIC_KEYS}
     expanded.write_csv(root / "run_metrics.csv", run_rows)
     expanded.write_csv(root / "subject_seed_metrics.csv", subject_seed_rows)
@@ -792,14 +826,14 @@ def run_aggregate(args: argparse.Namespace) -> None:
     expanded.write_csv(root / "overall_seed_metrics.csv", overall_seed_rows)
     summary = {
         "schema": EXPERIMENT_SCHEMA,
-        "model": "frozen GRU-BASE Mask4-8 NBM + r-only 30-channel TCN",
-        "ablation": "remove abs(r) and delta(r) from expanded scheme C",
-        "aggregation": "subject/seed macro mean of 3 folds; subject mean+population SD over 5 seeds; overall subject-macro per seed then mean+population SD",
+        "model": MODEL_DESCRIPTION,
+        "ablation": ABLATION_DESCRIPTION,
+        "aggregation": AGGREGATION_DESCRIPTION,
         "event_metric": {
-            "version": raw_base.EVENT_METRIC_VERSION,
-            "minimum_positive_windows": 2,
-            "merge_gap_seconds": 0.5,
-            "false_alarm_denominator": "union coverage of evaluated valid Non-FoG samples",
+            "version": EVENT_METRIC_VERSION,
+            "minimum_positive_windows": EVENT_MINIMUM_POSITIVE_WINDOWS,
+            "merge_gap_seconds": EVENT_MERGE_GAP_SECONDS,
+            "false_alarm_denominator": EVENT_FALSE_ALARM_DENOMINATOR,
         },
         "subjects": subject_summary_rows,
         "overall": overall,

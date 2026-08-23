@@ -29,6 +29,42 @@ def test_feature_schema_is_330_finite_features() -> None:
     assert features[1, freeze_index_offset] > features[0, freeze_index_offset]
 
 
+def test_four_feature_private_schema_is_120_finite_features() -> None:
+    rng = np.random.default_rng(31)
+    windows = rng.normal(size=(2, 128, 30))
+
+    features = MODULE.extract_tf_features(
+        windows, feature_schema="tf120_all5_30ch_4f_v1"
+    )
+    names = MODULE.feature_names(
+        [f"channel_{index}" for index in range(30)],
+        "tf120_all5_30ch_4f_v1",
+    )
+    suffixes = {name.split("__", 1)[1] for name in names}
+
+    assert features.shape == (2, 120)
+    assert len(names) == 120
+    assert suffixes == {
+        "std",
+        "peak_to_peak",
+        "log_power_3_8hz",
+        "log_power_8_28hz",
+    }
+    assert np.isfinite(features).all()
+
+
+def test_four_feature_private_configuration_and_split_audit() -> None:
+    config, project_root = MODULE.load_config(
+        ROOT / "configs" / "private_nbm_tf_svm_all5_4f_gamma01_c10.yaml"
+    )
+    result = MODULE.audit_dataset(config, project_root)
+
+    assert result["status"] == "PASS"
+    assert result["feature_schema"] == "tf120_all5_30ch_4f_v1"
+    assert result["feature_count"] == 120
+    assert result["job_count"] == 24
+
+
 def test_window_metrics_follow_positive_fog_contract() -> None:
     metrics = MODULE.compute_window_metrics(
         np.array([0, 0, 1, 1]),
