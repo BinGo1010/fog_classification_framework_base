@@ -63,6 +63,7 @@ NBM_DEFAULT_PATIENCE = 20
 EXPERIMENT_SCHEMA = "all_dataset_within_subject_conv_tcn_ngm_tcn.v1"
 BARRIER_SCHEMA = "all_dataset_within_subject_conv_tcn_ngm_tcn_barrier.v1"
 MODEL_DESCRIPTION = "Conv-TCN NGM Mask4-8 + scheme-C 90-channel TCN"
+NBM_DISPLAY_NAME = "Conv-TCN-NGM"
 AGGREGATION_DESCRIPTION = (
     "window metrics: subject/seed macro mean of 3 folds, then subject-macro per "
     "seed and mean+population SD over 5 seeds; event sensitivity: detected "
@@ -221,7 +222,7 @@ def train_conv_tcn_ngm(
     base.set_seed(seed)
     model = ConvTCNNGM30().to(device)
     if sum(parameter.numel() for parameter in model.parameters()) != NBM_PARAMETER_COUNT:
-        raise RuntimeError("Conv-TCN NGM parameter contract changed")
+        raise RuntimeError(f"{NBM_DISPLAY_NAME} parameter contract changed")
     initial_state = base.state_dict_sha256(model.state_dict())
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -256,7 +257,7 @@ def train_conv_tcn_ngm(
             loss.backward()
             gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             if not torch.isfinite(gradient_norm):
-                raise FloatingPointError("non-finite Conv-TCN NGM gradient")
+                raise FloatingPointError(f"non-finite {NBM_DISPLAY_NAME} gradient")
             optimizer.step()
             train_total += float(loss.detach()) * len(clean_ntc)
             train_count += len(clean_ntc)
@@ -308,7 +309,7 @@ def train_conv_tcn_ngm(
         else:
             stale += 1
         print(
-            f"Conv-TCN-NGM epoch={epoch:03d} train={train_loss:.7f} "
+            f"{NBM_DISPLAY_NAME} epoch={epoch:03d} train={train_loss:.7f} "
             f"val={validation_loss:.7f} lr={learning_rate:.2e} "
             f"stale={stale}/{patience}",
             flush=True,
@@ -318,9 +319,9 @@ def train_conv_tcn_ngm(
 
     payload = torch.load(checkpoint, map_location=device, weights_only=False)
     if payload.get("variant") != NBM_VARIANT:
-        raise AssertionError("Conv-TCN NGM checkpoint variant mismatch")
+        raise AssertionError(f"{NBM_DISPLAY_NAME} checkpoint variant mismatch")
     if payload.get("architecture") != architecture_config():
-        raise AssertionError("Conv-TCN NGM checkpoint architecture mismatch")
+        raise AssertionError(f"{NBM_DISPLAY_NAME} checkpoint architecture mismatch")
     model.load_state_dict(payload["model_state"])
     return model, {
         "maximum_epochs": maximum_epochs,
@@ -338,9 +339,9 @@ def build_conv_tcn_from_checkpoint(
     payload: dict[str, Any], device: torch.device
 ) -> nn.Module:
     if payload.get("variant") != NBM_VARIANT:
-        raise AssertionError("Conv-TCN NGM checkpoint variant mismatch")
+        raise AssertionError(f"{NBM_DISPLAY_NAME} checkpoint variant mismatch")
     if payload.get("architecture") != architecture_config():
-        raise AssertionError("Conv-TCN NGM checkpoint architecture mismatch")
+        raise AssertionError(f"{NBM_DISPLAY_NAME} checkpoint architecture mismatch")
     model = ConvTCNNGM30().to(device)
     model.load_state_dict(payload["model_state"])
     return model

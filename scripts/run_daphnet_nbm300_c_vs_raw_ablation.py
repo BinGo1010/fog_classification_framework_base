@@ -85,6 +85,12 @@ from scripts.run_daphnet_transformer_nbm300_fold import (
     PatchTransformerNBM,
     reconstruct_transformer,
 )
+from scripts.run_daphnet_transformer_ngm_48k_fold import (
+    ARCHITECTURE_NAME as TRANSFORMER_48K_ARCHITECTURE_NAME,
+    PARAMETER_COUNT as TRANSFORMER_48K_PARAMETER_COUNT,
+    PatchTransformerNGM48K,
+    reconstruct_transformer_48k,
+)
 
 FOLDS = (0, 1, 2)
 METHODS = ("FULL_C", "RAW")
@@ -162,6 +168,7 @@ def parse_args() -> argparse.Namespace:
             "tcn_v2",
             "tcn_attn_z16",
             "transformer",
+            "transformer_48k",
         ),
         default="conv_tcn",
     )
@@ -430,6 +437,7 @@ def load_scaler_only(
         "tcn_v2": "tcn_v2_nbm_best.pt",
         "tcn_attn_z16": TCN_ATTN_Z16_CHECKPOINT_NAME,
         "transformer": "transformer_nbm_best.pt",
+        "transformer_48k": "transformer_nbm_best.pt",
     }
     checkpoint_name = checkpoint_names[nbm_kind]
     checkpoint = fold_dir / "checkpoints" / checkpoint_name
@@ -491,6 +499,7 @@ def validate_nbm_contract(frozen: dict[str, Any], args: argparse.Namespace) -> d
                 "tcn_v2": TCN_V2_ARCHITECTURE_NAME,
                 "tcn_attn_z16": TCN_ATTN_Z16_ARCHITECTURE_NAME,
                 "transformer": "transformer_patch_autoencoder",
+                "transformer_48k": "tiny_patch_transformer_ngm",
             }[args.nbm_kind]
         ),
         "gru_v2_architecture_details": (
@@ -587,6 +596,31 @@ def validate_nbm_contract(frozen: dict[str, Any], args: argparse.Namespace) -> d
                 and architecture.get("decoder", {}).get("ffn") == 576
                 and architecture.get("encoder_decoder_skip_connections") is False
                 and int(architecture.get("parameter_count", -1)) == 2_329_736
+            )
+        ),
+        "transformer_48k_architecture_details": (
+            args.nbm_kind != "transformer_48k"
+            or (
+                architecture.get("name") == TRANSFORMER_48K_ARCHITECTURE_NAME
+                and architecture.get("input_shape") == ["B", 9, 128]
+                and architecture.get("patchify", {}).get("patch_size") == 8
+                and architecture.get("patchify", {}).get("token_shape")
+                == ["B", 16, 72]
+                and architecture.get("encoder", {}).get("layers") == 2
+                and architecture.get("encoder", {}).get("d_model") == 40
+                and architecture.get("encoder", {}).get("heads") == 4
+                and architecture.get("encoder", {}).get("ffn") == 80
+                and architecture.get("bottleneck_shape") == ["B", 16]
+                and architecture.get("decoder", {}).get("layers") == 1
+                and architecture.get("decoder", {}).get("d_model") == 40
+                and architecture.get("decoder", {}).get("heads") == 4
+                and architecture.get("decoder", {}).get("ffn") == 80
+                and architecture.get("encoder_decoder_skip_connections") is False
+                and architecture.get("cross_attention") is False
+                and architecture.get("teacher_forcing") is False
+                and architecture.get("raw_input_bypass") is False
+                and int(architecture.get("parameter_count", -1))
+                == TRANSFORMER_48K_PARAMETER_COUNT
             )
         ),
     }
@@ -854,6 +888,70 @@ def load_frozen_transformer_nbm(
     return model, scaler, bias, sigma, manifest
 
 
+def load_frozen_transformer_48k_ngm(
+    source_root: Path,
+    fold: int,
+    device: torch.device,
+) -> tuple[
+    PatchTransformerNGM48K,
+    RobustScaler,
+    np.ndarray,
+    np.ndarray,
+    dict[str, Any],
+]:
+    scaler, artifact, frozen = load_scaler_only(
+        source_root, fold, "transformer_48k"
+    )
+    training = frozen["training"]
+    architecture = training["architecture"]
+    probe = PatchTransformerNGM48K(dropout=0.10)
+    expected_architecture = probe.architecture_config()
+    del probe
+    if architecture != expected_architecture:
+        raise AssertionError("unexpected frozen compact Transformer-NGM architecture")
+    model = PatchTransformerNGM48K(dropout=0.10).to(device)
+    checkpoint = Path(artifact["nbm_checkpoint"])
+    payload = torch.load(checkpoint, map_location=device, weights_only=False)
+    if payload.get("architecture") != expected_architecture:
+        raise AssertionError("compact Transformer-NGM checkpoint architecture mismatch")
+    if int(payload.get("seed", -1)) != int(training["seed"]):
+        raise AssertionError("compact Transformer-NGM checkpoint seed mismatch")
+    if int(payload.get("epoch", -1)) != int(training["best_epoch"]):
+        raise AssertionError("compact Transformer-NGM checkpoint epoch mismatch")
+    if not np.isclose(
+        float(payload.get("validation_huber", np.nan)),
+        float(training["best_validation_huber"]),
+        rtol=1e-7,
+        atol=1e-10,
+    ):
+        raise AssertionError(
+            "compact Transformer-NGM checkpoint/frozen validation loss mismatch"
+        )
+    model.load_state_dict(payload["model_state"], strict=True)
+    model.eval()
+    calibration = frozen["calibration"]
+    bias = np.asarray(calibration["bias"], dtype=np.float32)
+    sigma = np.asarray(calibration["sigma"], dtype=np.float32)
+    if (
+        bias.shape != (9,)
+        or sigma.shape != (9,)
+        or not np.all(np.isfinite(bias))
+        or not np.all(np.isfinite(sigma))
+        or np.any(sigma < 0.05)
+    ):
+        raise AssertionError("invalid compact Transformer-NGM role-5 calibration")
+    manifest = {
+        **artifact,
+        "best_epoch": int(training["best_epoch"]),
+        "best_validation_loss": float(training["best_validation_huber"]),
+        "best_validation_metric": "role5_validation_SmoothL1",
+        "calibration_role": 5,
+        "scaler_role": 4,
+        "architecture": architecture,
+    }
+    return model, scaler, bias, sigma, manifest
+
+
 def raw_windows_dynamic(
     records: dict[str, Any],
     rows: Any,
@@ -1042,6 +1140,15 @@ def make_features(
         )
         scaled = centered_scaled_bct(full_scaler, raw)
         reconstruction = reconstruct_transformer(nbm, scaled, device)
+        error = (scaled - reconstruction).astype(np.float32, copy=False)
+    elif nbm_kind == "transformer_48k":
+        if window_samples != 128:
+            raise ValueError("compact Transformer-NGM is fixed to 128 samples")
+        nbm, full_scaler, bias, sigma, nbm_manifest = (
+            load_frozen_transformer_48k_ngm(nbm_source_root, fold, device)
+        )
+        scaled = centered_scaled_bct(full_scaler, raw)
+        reconstruction = reconstruct_transformer_48k(nbm, scaled, device)
         error = (scaled - reconstruction).astype(np.float32, copy=False)
     else:
         raise ValueError(f"unsupported NBM kind: {nbm_kind}")
