@@ -96,6 +96,11 @@ from scripts.mlp_ngm_30x128 import (
     FactorizedMLPNGM9,
     reconstruct_bct as reconstruct_mlp_bct,
 )
+from scripts.tcn_ngm_40k import (
+    TCN_NGM_9_PARAMETER_COUNT,
+    CapacityMatchedTCNNGM9,
+    reconstruct_bct as reconstruct_tcn_ngm40k_bct,
+)
 
 FOLDS = (0, 1, 2)
 METHODS = ("FULL_C", "RAW")
@@ -175,6 +180,7 @@ def parse_args() -> argparse.Namespace:
             "transformer",
             "transformer_48k",
             "mlp",
+            "tcn_40k",
         ),
         default="conv_tcn",
     )
@@ -445,6 +451,7 @@ def load_scaler_only(
         "transformer": "transformer_nbm_best.pt",
         "transformer_48k": "transformer_nbm_best.pt",
         "mlp": "mlp_ngm_best.pt",
+        "tcn_40k": "tcn_ngm40k_best.pt",
     }
     checkpoint_name = checkpoint_names[nbm_kind]
     checkpoint = fold_dir / "checkpoints" / checkpoint_name
@@ -508,6 +515,7 @@ def validate_nbm_contract(frozen: dict[str, Any], args: argparse.Namespace) -> d
                 "transformer": "transformer_patch_autoencoder",
                 "transformer_48k": "tiny_patch_transformer_ngm",
                 "mlp": "factorized_mlp_ngm",
+                "tcn_40k": "capacity_matched_tcn_ngm",
             }[args.nbm_kind]
         ),
         "gru_v2_architecture_details": (
@@ -643,6 +651,22 @@ def validate_nbm_contract(frozen: dict[str, Any], args: argparse.Namespace) -> d
                 and architecture.get("output_activation") is None
                 and int(architecture.get("parameter_count", -1))
                 == MLP_NGM_9_PARAMETER_COUNT
+            )
+        ),
+        "tcn_40k_architecture_details": (
+            args.nbm_kind != "tcn_40k"
+            or (
+                architecture.get("name")
+                == "capacity_matched_tcn_ngm_v1_9channel"
+                and architecture.get("input_shape") == ["B", 9, 128]
+                and architecture.get("bottleneck_shape") == ["B", 16, 32]
+                and architecture.get("output_shape") == ["B", 9, 128]
+                and architecture.get("dilations") == [1, 2]
+                and architecture.get("encoder_decoder_skip_connections") is False
+                and architecture.get("input_output_global_residual") is False
+                and architecture.get("output_activation") is None
+                and int(architecture.get("parameter_count", -1))
+                == TCN_NGM_9_PARAMETER_COUNT
             )
         ),
     }
@@ -1033,6 +1057,65 @@ def load_frozen_mlp_ngm(
     return model, scaler, bias, sigma, manifest
 
 
+def load_frozen_tcn_ngm40k(
+    source_root: Path,
+    fold: int,
+    device: torch.device,
+) -> tuple[
+    CapacityMatchedTCNNGM9,
+    RobustScaler,
+    np.ndarray,
+    np.ndarray,
+    dict[str, Any],
+]:
+    scaler, artifact, frozen = load_scaler_only(source_root, fold, "tcn_40k")
+    training = frozen["training"]
+    architecture = training["architecture"]
+    if architecture.get("name") != "capacity_matched_tcn_ngm_v1_9channel":
+        raise AssertionError("unexpected frozen 40k TCN-NGM architecture")
+    if int(architecture.get("parameter_count", -1)) != TCN_NGM_9_PARAMETER_COUNT:
+        raise AssertionError("unexpected frozen 40k TCN-NGM parameter count")
+    model = CapacityMatchedTCNNGM9(dropout=0.10).to(device)
+    checkpoint = Path(artifact["nbm_checkpoint"])
+    payload = torch.load(checkpoint, map_location=device, weights_only=False)
+    if payload.get("architecture") != architecture:
+        raise AssertionError("40k TCN-NGM checkpoint architecture mismatch")
+    if int(payload.get("seed", -1)) != int(training["seed"]):
+        raise AssertionError("40k TCN-NGM checkpoint seed mismatch")
+    if int(payload.get("epoch", -1)) != int(training["best_epoch"]):
+        raise AssertionError("40k TCN-NGM checkpoint epoch mismatch")
+    if not np.isclose(
+        float(payload.get("validation_huber", np.nan)),
+        float(training["best_validation_huber"]),
+        rtol=1e-7,
+        atol=1e-10,
+    ):
+        raise AssertionError("40k TCN-NGM checkpoint/frozen loss mismatch")
+    model.load_state_dict(payload["model_state"], strict=True)
+    model.eval()
+    calibration = frozen["calibration"]
+    bias = np.asarray(calibration["bias"], dtype=np.float32)
+    sigma = np.asarray(calibration["sigma"], dtype=np.float32)
+    if (
+        bias.shape != (9,)
+        or sigma.shape != (9,)
+        or not np.all(np.isfinite(bias))
+        or not np.all(np.isfinite(sigma))
+        or np.any(sigma < 0.05)
+    ):
+        raise AssertionError("invalid 40k TCN-NGM role-5 calibration")
+    manifest = {
+        **artifact,
+        "best_epoch": int(training["best_epoch"]),
+        "best_validation_loss": float(training["best_validation_huber"]),
+        "best_validation_metric": "role5_validation_SmoothL1",
+        "calibration_role": 5,
+        "scaler_role": 4,
+        "architecture": architecture,
+    }
+    return model, scaler, bias, sigma, manifest
+
+
 def raw_windows_dynamic(
     records: dict[str, Any],
     rows: Any,
@@ -1239,6 +1322,15 @@ def make_features(
         )
         scaled = centered_scaled_bct(full_scaler, raw)
         reconstruction = reconstruct_mlp_bct(nbm, scaled, device)
+        error = (scaled - reconstruction).astype(np.float32, copy=False)
+    elif nbm_kind == "tcn_40k":
+        if window_samples != 128:
+            raise ValueError("40k TCN-NGM is fixed to 128 samples")
+        nbm, full_scaler, bias, sigma, nbm_manifest = load_frozen_tcn_ngm40k(
+            nbm_source_root, fold, device
+        )
+        scaled = centered_scaled_bct(full_scaler, raw)
+        reconstruction = reconstruct_tcn_ngm40k_bct(nbm, scaled, device)
         error = (scaled - reconstruction).astype(np.float32, copy=False)
     else:
         raise ValueError(f"unsupported NBM kind: {nbm_kind}")

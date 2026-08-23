@@ -111,11 +111,13 @@ def validate_contract(args: argparse.Namespace) -> tuple[tuple[int, ...], list[s
         raise ValueError("this experiment requires batch_size=128")
     gpu_ids = [value.strip() for value in args.gpu_ids.split(",") if value.strip()]
     if (
-        len(gpu_ids) != 7
-        or len(set(gpu_ids)) != 7
+        len(gpu_ids) not in (7, 8)
+        or len(set(gpu_ids)) != len(gpu_ids)
         or any(not value.isdigit() for value in gpu_ids)
     ):
-        raise ValueError("--gpu-ids must contain seven unique non-negative integers")
+        raise ValueError(
+            "--gpu-ids must contain seven unique GPU ids or eight unique GPU ids"
+        )
     return seeds, gpu_ids
 
 
@@ -143,7 +145,9 @@ def build_plan(args: argparse.Namespace, seeds: tuple[int, ...]) -> dict[str, An
         "folds": list(FOLDS),
         "seeds": list(seeds),
         "job_count": len(SUBJECTS) * len(FOLDS) * len(seeds),
-        "gpu_count": 7,
+        "gpu_count": len(
+            [value for value in args.gpu_ids.split(",") if value.strip()]
+        ),
         "sampling_rate_hz": 64,
         "window_samples": 128,
         "stride_samples": 64,

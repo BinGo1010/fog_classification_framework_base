@@ -125,11 +125,20 @@ def test_final_six_metric_event_contract_is_explicit() -> None:
     )
 
 
-def test_invalid_gpu_count_or_budget_is_rejected(
+def test_eight_gpu_queue_is_supported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     args = default_args(monkeypatch)
     args.gpu_ids = "0,1,2,3,4,5,6,7"
+    _, gpu_ids = launcher.validate_contract(args)
+    assert gpu_ids == ["0", "1", "2", "3", "4", "5", "6", "7"]
+
+
+def test_invalid_gpu_count_or_budget_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = default_args(monkeypatch)
+    args.gpu_ids = "0,1,2,3,4,5"
     with pytest.raises(ValueError, match="seven unique"):
         launcher.validate_contract(args)
     args.gpu_ids = "0,1,2,3,4,5,6"

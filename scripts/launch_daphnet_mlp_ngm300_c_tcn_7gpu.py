@@ -26,6 +26,19 @@ from scripts.launch_daphnet_residual_calibration_abcd_7gpu import parse_seed_lis
 
 NBM_WORKER = REPO_ROOT / "scripts" / "run_daphnet_mlp_ngm300_fold.py"
 PAIR_WORKER = REPO_ROOT / "scripts" / "run_daphnet_nbm300_c_vs_raw_ablation.py"
+NBM_KIND = "mlp"
+NBM_DISPLAY_NAME = "MLP-NGM"
+NBM_JOB_LABEL = "MLP_NGM"
+NBM_PARAMETER_COUNT = 38_283
+NBM_BACKBONE = (
+    "factorized MLP: temporal 128->64->32, channel 9->16, "
+    "two residual 32->128->32 blocks, mirrored decoder"
+)
+DEFAULT_OUTPUT_ROOT = (
+    REPO_ROOT
+    / "outputs"
+    / "daphnet_mlp_ngm300_FULL_C_tcn_ep5pat2_seedset_0_52_161_5216_52161"
+)
 FOLDS = (0, 1, 2)
 REQUIRED_SEEDS = (0, 52, 161, 5216, 52161)
 SEED_TEXT = "0,52,161,5216,52161"
@@ -44,9 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=REPO_ROOT
-        / "outputs"
-        / "daphnet_mlp_ngm300_FULL_C_tcn_ep5pat2_seedset_0_52_161_5216_52161",
+        default=DEFAULT_OUTPUT_ROOT,
     )
     parser.add_argument("--gpu-ids", default="0,1,2,3,4,5,6")
     parser.add_argument("--nbm-seeds", default=SEED_TEXT)
@@ -74,7 +85,7 @@ def validate_contract(args: argparse.Namespace) -> tuple[int, ...]:
     if nbm_seeds != REQUIRED_SEEDS or tcn_seeds != REQUIRED_SEEDS:
         raise ValueError(f"this experiment requires paired seeds {SEED_TEXT}")
     if args.nbm_max_epochs != 300 or args.nbm_patience != 20:
-        raise ValueError("MLP-NGM requires max_epoch=300 and patience=20")
+        raise ValueError(f"{NBM_DISPLAY_NAME} requires max_epoch=300 and patience=20")
     if args.tcn_max_epochs != 5 or args.tcn_patience != 2:
         raise ValueError("TCN requires max_epoch=5 and patience=2")
     return nbm_seeds
@@ -123,7 +134,7 @@ def pair_common(args: argparse.Namespace, source: Path) -> list[str]:
         "--output-root",
         str(args.output_root.resolve()),
         "--nbm-kind",
-        "mlp",
+        NBM_KIND,
         "--nbm-seeds",
         args.nbm_seeds,
         "--tcn-seeds",
@@ -199,7 +210,7 @@ def main() -> None:
     root = args.output_root.resolve()
     nbm_jobs = [
         {
-            "id": f"fold{fold}_MLP_NGM_seed{seed}",
+            "id": f"fold{fold}_{NBM_JOB_LABEL}_seed{seed}",
             "command": nbm_command(args, fold, seed),
         }
         for fold in FOLDS
@@ -227,7 +238,7 @@ def main() -> None:
     ]
     plan = {
         "strategy": (
-            f"7-GPU queue; {len(nbm_jobs)} MLP-NGMs then "
+            f"7-GPU queue; {len(nbm_jobs)} {NBM_DISPLAY_NAME} models then "
             f"{len(train_jobs)}-classifier global test barrier"
         ),
         "dataset": str(args.data_dir.resolve()),
@@ -237,11 +248,8 @@ def main() -> None:
         "folds": list(FOLDS),
         "methods": list(methods),
         "gpu_ids": gpu_ids,
-        "nbm_backbone": (
-            "factorized MLP: temporal 128->64->32, channel 9->16, "
-            "two residual 32->128->32 blocks, mirrored decoder"
-        ),
-        "nbm_parameter_count": 38283,
+        "nbm_backbone": NBM_BACKBONE,
+        "nbm_parameter_count": NBM_PARAMETER_COUNT,
         "nbm_seeds": list(seeds),
         "tcn_seeds": list(seeds),
         "seed_policy": "exact paired seeds; no fold offset",
@@ -277,7 +285,7 @@ def main() -> None:
     if args.phase in ("full", "nbm"):
         run_pool("nbm", nbm_jobs, gpu_ids, root)
         if args.phase == "nbm":
-            print(f"MLP-NGM READY source={root / 'nbm_source'}", flush=True)
+            print(f"{NBM_DISPLAY_NAME} READY source={root / 'nbm_source'}", flush=True)
             return
     if args.phase in ("full", "train"):
         for fold in FOLDS:
@@ -290,7 +298,9 @@ def main() -> None:
                     / "DONE_NBM.json"
                 )
                 if not done.exists():
-                    raise FileNotFoundError(f"MLP-NGM fold/seed not frozen: {done}")
+                    raise FileNotFoundError(
+                        f"{NBM_DISPLAY_NAME} fold/seed not frozen: {done}"
+                    )
         run_pool("train", train_jobs, gpu_ids, root)
         subprocess.run(
             singleton(args, "seal"), cwd=REPO_ROOT, env=environment, check=True

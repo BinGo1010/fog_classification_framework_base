@@ -58,12 +58,17 @@ FOLDS = (0, 1, 2)
 NBM_VARIANT = "FACTORIZED_MLP_NGM_MASK4_8"
 CHECKPOINT_NAME = "mlp_ngm_best.pt"
 EXPERIMENT_SCHEMA = "daphnet_mlp_ngm300_source.v1"
+NBM_MODEL_CLASS = FactorizedMLPNGM9
+NBM_PARAMETER_COUNT = MLP_NGM_9_PARAMETER_COUNT
+NBM_DISPLAY_NAME = "MLP-NGM"
+EXPERIMENT_NAME = "MLP_NGM300_schemeC_source"
+TRAINING_FIGURE_STEM = "mlp_ngm_training_validation"
 
 
 def architecture() -> dict[str, Any]:
     config = generic_architecture_config(9)
-    if int(config["parameter_count"]) != MLP_NGM_9_PARAMETER_COUNT:
-        raise RuntimeError("Daphnet MLP-NGM parameter contract changed")
+    if int(config["parameter_count"]) != NBM_PARAMETER_COUNT:
+        raise RuntimeError(f"Daphnet {NBM_DISPLAY_NAME} parameter contract changed")
     return config
 
 
@@ -137,12 +142,12 @@ def train_nbm(
     num_workers: int,
     maximum_epochs: int,
     patience: int,
-) -> tuple[FactorizedMLPNGM9, dict[str, Any]]:
+) -> tuple[nn.Module, dict[str, Any]]:
     set_seed(seed)
-    model = FactorizedMLPNGM9(dropout=0.10).to(device)
+    model = NBM_MODEL_CLASS(dropout=0.10).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
-    if parameter_count != MLP_NGM_9_PARAMETER_COUNT:
-        raise RuntimeError("Daphnet MLP-NGM parameter contract changed")
+    if parameter_count != NBM_PARAMETER_COUNT:
+        raise RuntimeError(f"Daphnet {NBM_DISPLAY_NAME} parameter contract changed")
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-5
@@ -175,7 +180,7 @@ def train_nbm(
             loss.backward()
             gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             if not torch.isfinite(gradient_norm):
-                raise FloatingPointError("non-finite MLP-NGM gradient")
+                raise FloatingPointError(f"non-finite {NBM_DISPLAY_NAME} gradient")
             optimizer.step()
             train_total += float(loss.detach()) * len(clean_ntc)
             train_count += len(clean_ntc)
@@ -226,7 +231,7 @@ def train_nbm(
         else:
             stale += 1
         print(
-            f"MLP-NGM epoch={epoch:03d} train={train_loss:.7f} "
+            f"{NBM_DISPLAY_NAME} epoch={epoch:03d} train={train_loss:.7f} "
             f"val={validation_loss:.7f} lr={learning_rate:.2e} "
             f"stale={stale}/{patience}",
             flush=True,
@@ -236,9 +241,9 @@ def train_nbm(
 
     payload = torch.load(checkpoint, map_location=device, weights_only=False)
     if payload.get("variant") != NBM_VARIANT:
-        raise AssertionError("MLP-NGM checkpoint variant mismatch")
+        raise AssertionError(f"{NBM_DISPLAY_NAME} checkpoint variant mismatch")
     if payload.get("architecture") != architecture():
-        raise AssertionError("MLP-NGM checkpoint architecture mismatch")
+        raise AssertionError(f"{NBM_DISPLAY_NAME} checkpoint architecture mismatch")
     model.load_state_dict(payload["model_state"], strict=True)
     return model, {
         "seed": seed,
@@ -289,10 +294,10 @@ def plot_training(fold_dir: Path, training: dict[str, Any]) -> None:
         label="Role 5 validation",
     )
     ax.axvline(training["best_epoch"], color="black", linestyle="--", linewidth=1)
-    ax.set(xlabel="Epoch", ylabel="SmoothL1 loss", title="Factorized MLP-NGM")
+    ax.set(xlabel="Epoch", ylabel="SmoothL1 loss", title=NBM_DISPLAY_NAME)
     ax.grid(alpha=0.25)
     ax.legend()
-    save_figure_bundle(fig, fold_dir / "mlp_ngm_training_validation")
+    save_figure_bundle(fig, fold_dir / TRAINING_FIGURE_STEM)
     plt.close(fig)
 
 
@@ -307,7 +312,7 @@ def validate_existing(
     checkpoint = fold_dir / "checkpoints" / CHECKPOINT_NAME
     for path in (done_path, frozen_path, scaler_path, checkpoint):
         if not path.is_file():
-            raise FileNotFoundError(f"incomplete MLP-NGM artifacts: {path}")
+            raise FileNotFoundError(f"incomplete {NBM_DISPLAY_NAME} artifacts: {path}")
     done = json.loads(done_path.read_text(encoding="utf-8"))
     frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
     expected = {
@@ -320,19 +325,21 @@ def validate_existing(
     }
     for key, value in expected.items():
         if done.get(key) != value:
-            raise AssertionError(f"stale MLP-NGM DONE_NBM {key}: {done.get(key)!r}")
+            raise AssertionError(
+                f"stale {NBM_DISPLAY_NAME} DONE_NBM {key}: {done.get(key)!r}"
+            )
     training = frozen["training"]
     if training.get("architecture") != architecture():
-        raise AssertionError("stale MLP-NGM architecture")
+        raise AssertionError(f"stale {NBM_DISPLAY_NAME} architecture")
     if frozen.get("scientific_data_sha256") != scientific_sha256:
-        raise AssertionError("MLP-NGM scientific dataset changed")
+        raise AssertionError(f"{NBM_DISPLAY_NAME} scientific dataset changed")
     if done.get("checkpoint_sha256") != sha256_file(checkpoint):
-        raise AssertionError("MLP-NGM checkpoint hash mismatch")
+        raise AssertionError(f"{NBM_DISPLAY_NAME} checkpoint hash mismatch")
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if payload.get("variant") != NBM_VARIANT:
-        raise AssertionError("MLP-NGM checkpoint variant mismatch")
+        raise AssertionError(f"{NBM_DISPLAY_NAME} checkpoint variant mismatch")
     if int(payload.get("seed", -1)) != args.seed:
-        raise AssertionError("MLP-NGM checkpoint seed mismatch")
+        raise AssertionError(f"{NBM_DISPLAY_NAME} checkpoint seed mismatch")
 
 
 def run(args: argparse.Namespace, device: torch.device) -> None:
@@ -342,7 +349,7 @@ def run(args: argparse.Namespace, device: torch.device) -> None:
     if args.seed not in required_seeds:
         raise ValueError(f"seed must be one of {required_seeds}")
     if args.nbm_max_epochs != 300 or args.nbm_patience != 20:
-        raise ValueError("MLP-NGM requires max_epoch=300 and patience=20")
+        raise ValueError(f"{NBM_DISPLAY_NAME} requires max_epoch=300 and patience=20")
     if (
         args.sampling_rate_hz != 64
         or args.window_samples != 128
@@ -356,7 +363,7 @@ def run(args: argparse.Namespace, device: torch.device) -> None:
     scientific_data = processed_nbm_scientific_manifest(data_dir)
     if done_path.exists() and not args.overwrite:
         validate_existing(fold_dir, args, scientific_data["sha256"])
-        print(f"SKIP completed MLP-NGM fold/seed: {done_path}", flush=True)
+        print(f"SKIP completed {NBM_DISPLAY_NAME} fold/seed: {done_path}", flush=True)
         return
     fold_dir.mkdir(parents=True, exist_ok=True)
 
@@ -392,7 +399,7 @@ def run(args: argparse.Namespace, device: torch.device) -> None:
         scaler, raw_windows_dynamic(records, role5, 128), center=True
     )
     config = {
-        "experiment": "MLP_NGM300_schemeC_source",
+        "experiment": EXPERIMENT_NAME,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "fold": args.fold,
         "seed": args.seed,
