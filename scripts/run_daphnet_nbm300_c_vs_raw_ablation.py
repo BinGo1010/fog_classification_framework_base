@@ -91,6 +91,11 @@ from scripts.run_daphnet_transformer_ngm_48k_fold import (
     PatchTransformerNGM48K,
     reconstruct_transformer_48k,
 )
+from scripts.mlp_ngm_30x128 import (
+    MLP_NGM_9_PARAMETER_COUNT,
+    FactorizedMLPNGM9,
+    reconstruct_bct as reconstruct_mlp_bct,
+)
 
 FOLDS = (0, 1, 2)
 METHODS = ("FULL_C", "RAW")
@@ -169,6 +174,7 @@ def parse_args() -> argparse.Namespace:
             "tcn_attn_z16",
             "transformer",
             "transformer_48k",
+            "mlp",
         ),
         default="conv_tcn",
     )
@@ -438,6 +444,7 @@ def load_scaler_only(
         "tcn_attn_z16": TCN_ATTN_Z16_CHECKPOINT_NAME,
         "transformer": "transformer_nbm_best.pt",
         "transformer_48k": "transformer_nbm_best.pt",
+        "mlp": "mlp_ngm_best.pt",
     }
     checkpoint_name = checkpoint_names[nbm_kind]
     checkpoint = fold_dir / "checkpoints" / checkpoint_name
@@ -500,6 +507,7 @@ def validate_nbm_contract(frozen: dict[str, Any], args: argparse.Namespace) -> d
                 "tcn_attn_z16": TCN_ATTN_Z16_ARCHITECTURE_NAME,
                 "transformer": "transformer_patch_autoencoder",
                 "transformer_48k": "tiny_patch_transformer_ngm",
+                "mlp": "factorized_mlp_ngm",
             }[args.nbm_kind]
         ),
         "gru_v2_architecture_details": (
@@ -621,6 +629,20 @@ def validate_nbm_contract(frozen: dict[str, Any], args: argparse.Namespace) -> d
                 and architecture.get("raw_input_bypass") is False
                 and int(architecture.get("parameter_count", -1))
                 == TRANSFORMER_48K_PARAMETER_COUNT
+            )
+        ),
+        "mlp_architecture_details": (
+            args.nbm_kind != "mlp"
+            or (
+                architecture.get("name") == "factorized_mlp_ngm_v1_9channel"
+                and architecture.get("input_shape") == ["B", 9, 128]
+                and architecture.get("bottleneck_shape") == ["B", 16, 32]
+                and architecture.get("output_shape") == ["B", 9, 128]
+                and architecture.get("channel_mlp") == "9->16->9"
+                and architecture.get("encoder_decoder_skip_connections") is False
+                and architecture.get("output_activation") is None
+                and int(architecture.get("parameter_count", -1))
+                == MLP_NGM_9_PARAMETER_COUNT
             )
         ),
     }
