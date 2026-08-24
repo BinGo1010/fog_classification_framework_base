@@ -1,0 +1,70 @@
+project_root: ..
+
+run:
+  name: private_tf_svm_all5_30ch_4f120_gamma01_c1_maxprecision_v1
+  protocol: within_subject_three_fold_fixed_test
+  description: >-
+    Deterministic all-five-IMU 120-dimensional time-frequency plus RBF-SVM
+    experiment with gamma fixed to 0.1, C fixed to 1, and a validation-only
+    maximum-Precision threshold rule.
+
+data:
+  root: dataset/0.Private/processed_NBM_Exp
+  subjects: [P01, P02, P03, P04, P05, P06, P07, P08]
+  outer_folds: [0, 1, 2]
+  train_roles: [6, 7]
+  validation_roles: [2, 3]
+  test_roles: [0, 1]
+  sensor_config:
+    name: all5_30ch
+    sensors: [lumbar, ankle_l, ankle_r, foot_l, foot_r]
+    channel_indices:
+      [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+       15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+
+features:
+  schema: tf120_all5_30ch_4f_v1
+  sampling_rate_hz: 64
+  window_samples: 128
+  remove_channel_mean: true
+  taper: hann
+  epsilon: 1.0e-12
+  time_features: [std, peak_to_peak]
+  frequency_bands_hz:
+    freezing: [3.0, 8.0]
+    high: [8.0, 28.0]
+  frequency_features: [log_power_3_8hz, log_power_8_28hz]
+  removed_features:
+    [line_length, diff_rms, mean_abs, log_power_0p5_3hz, log_freeze_index,
+     spectral_entropy_0p5_28hz, dominant_frequency_0p5_28hz]
+
+model:
+  type: sklearn_svc
+  kernel: rbf
+  class_weight: balanced
+  probability: false
+  cache_size_mb: 1024
+  tolerance: 0.001
+  grid:
+    C: [1.0]
+    gamma: [0.1]
+
+evaluation:
+  model_selection: validation_pr_auc
+  model_selection_tie_breakers:
+    [validation_fog_f1, validation_specificity, config_grid_order]
+  threshold_rule: validation_max_precision
+  threshold_tie_breakers:
+    [higher_sensitivity, higher_specificity, larger_threshold]
+  e1_e3_window_metrics: [sensitivity, precision, specificity, pr_auc]
+  e4_metrics:
+    [sensitivity, precision, specificity, pr_auc, event_sensitivity, false_alarms_per_hour]
+  primary_aggregation: average_folds_within_subject_then_subject_mean_sd
+  event:
+    event_sensitivity_rule: any_positive_permanent_test_pure_fog_window_in_annotated_event
+    merge_gap_sec: 1.0
+    false_alarm_denominator: union_role0_nonfog_hours
+
+artifacts:
+  run_root: outputs/private_nbm_tf_svm_all5/runs
+  report_root: outputs/private_nbm_tf_svm_all5/reports

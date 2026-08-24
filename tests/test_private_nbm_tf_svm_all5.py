@@ -82,6 +82,58 @@ def test_window_metrics_follow_positive_fog_contract() -> None:
     assert 0.0 <= metrics["pr_auc"] <= 1.0
 
 
+def test_target_sensitivity_threshold_uses_highest_feasible_threshold() -> None:
+    selection = MODULE.target_sensitivity_threshold(
+        np.array([0, 0, 0, 1, 1, 1, 1]),
+        np.array([0.20, 0.45, 0.80, 0.30, 0.50, 0.70, 0.90]),
+        target_sensitivity=0.75,
+    )
+
+    assert selection["threshold"] == 0.50
+    assert selection["sensitivity"] == 0.75
+    assert selection["specificity"] == 2.0 / 3.0
+    assert selection["target_sensitivity"] == 0.75
+
+
+def test_maximum_precision_threshold_prefers_higher_sensitivity_on_tie() -> None:
+    selection = MODULE.maximum_precision_threshold(
+        np.array([0, 0, 1, 1, 1]),
+        np.array([0.10, 0.20, 0.30, 0.40, 0.90]),
+    )
+
+    assert selection["threshold"] == 0.30
+    assert selection["precision"] == 1.0
+    assert selection["sensitivity"] == 1.0
+    assert selection["specificity"] == 1.0
+
+
+def test_maximum_precision_configuration_and_split_audit() -> None:
+    config, project_root = MODULE.load_config(
+        ROOT
+        / "configs"
+        / "private_nbm_tf_svm_all5_4f_gamma01_c1_maxprecision.yaml"
+    )
+    result = MODULE.audit_dataset(config, project_root)
+
+    assert result["status"] == "PASS"
+    assert config["evaluation"]["threshold_rule"] == "validation_max_precision"
+    assert result["job_count"] == 24
+
+
+def test_sensitivity_target_configuration_and_split_audit() -> None:
+    config, project_root = MODULE.load_config(
+        ROOT
+        / "configs"
+        / "private_nbm_tf_svm_all5_4f_gamma01_c10_sens090.yaml"
+    )
+    result = MODULE.audit_dataset(config, project_root)
+
+    assert result["status"] == "PASS"
+    assert config["evaluation"]["threshold_rule"] == "validation_target_sensitivity"
+    assert config["evaluation"]["target_sensitivity"] == 0.90
+    assert result["job_count"] == 24
+
+
 def test_event_and_false_alarm_episode_contract() -> None:
     predictions = pd.DataFrame(
         {

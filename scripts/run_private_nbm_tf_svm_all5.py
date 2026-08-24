@@ -60,6 +60,12 @@ FEATURE_SCHEMA_VERSIONS = {
 LEGACY_TF330_IMPLEMENTATION_SHA256 = (
     "97107f3911ad7fa292247cd013fcffce18500d394852838f62c84b69eccc8f20"
 )
+LEGACY_TF120_F1_IMPLEMENTATION_SHA256 = (
+    "fd186e36b29de9d2472e79347751bdfc9110b0d4f679ecd2ef8564077a07d693"
+)
+LEGACY_TF120_SENSITIVITY_IMPLEMENTATION_SHA256 = (
+    "3aeb1cd8d2ca597fd47d63a6792ffae11fd58044243176a31a3423098993795f"
+)
 
 
 def _json_safe(value: Any) -> Any:
@@ -446,6 +452,140 @@ def maximum_fog_f1_threshold(y_true: np.ndarray, y_score: np.ndarray) -> dict[st
     return selected
 
 
+def target_sensitivity_threshold(
+    y_true: np.ndarray, y_score: np.ndarray, target_sensitivity: float
+) -> dict[str, Any]:
+    """Select the highest validation threshold attaining the sensitivity target."""
+
+    truth = np.asarray(y_true, dtype=np.int8).reshape(-1)
+    score = np.asarray(y_score, dtype=np.float64).reshape(-1)
+    target = float(target_sensitivity)
+    if len(truth) != len(score) or np.unique(truth).tolist() != [0, 1]:
+        raise ValueError("Threshold selection requires aligned binary validation data")
+    if not np.isfinite(score).all():
+        raise ValueError("Validation score contains NaN or Inf")
+    if not np.isfinite(target) or not 0.0 < target <= 1.0:
+        raise ValueError("Target sensitivity must be in (0, 1]")
+
+    candidates = np.unique(score)
+    selected: dict[str, Any] | None = None
+    for threshold in candidates[::-1]:
+        prediction = score >= threshold
+        tp = int(np.sum((truth == 1) & prediction))
+        fn = int(np.sum((truth == 1) & (~prediction)))
+        sensitivity = tp / (tp + fn)
+        if sensitivity + 1e-12 < target:
+            continue
+        tn = int(np.sum((truth == 0) & (~prediction)))
+        fp = int(np.sum((truth == 0) & prediction))
+        specificity = tn / (tn + fp)
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        fog_f1 = (
+            2.0 * precision * sensitivity / (precision + sensitivity)
+            if precision + sensitivity > 0.0
+            else 0.0
+        )
+        selected = {
+            "threshold": float(threshold),
+            "fog_f1": float(fog_f1),
+            "sensitivity": float(sensitivity),
+            "precision": float(precision),
+            "specificity": float(specificity),
+            "tp": tp,
+            "tn": tn,
+            "fp": fp,
+            "fn": fn,
+            "rule": "validation_target_sensitivity",
+            "target_sensitivity": target,
+            "tie_break": ["largest_threshold"],
+            "n_samples": int(len(truth)),
+            "n_threshold_candidates": int(len(candidates)),
+        }
+        break
+    if selected is None:
+        raise RuntimeError("No validation threshold attains the sensitivity target")
+    return selected
+
+
+def maximum_precision_threshold(
+    y_true: np.ndarray, y_score: np.ndarray
+) -> dict[str, Any]:
+    """Maximize validation precision, then sensitivity, specificity and threshold."""
+
+    truth = np.asarray(y_true, dtype=np.int8).reshape(-1)
+    score = np.asarray(y_score, dtype=np.float64).reshape(-1)
+    if len(truth) != len(score) or np.unique(truth).tolist() != [0, 1]:
+        raise ValueError("Threshold selection requires aligned binary validation data")
+    if not np.isfinite(score).all():
+        raise ValueError("Validation score contains NaN or Inf")
+
+    candidates = np.unique(score)
+    selected: dict[str, Any] | None = None
+    best_key: tuple[float, float, float, float] | None = None
+    for threshold in candidates:
+        prediction = score >= threshold
+        tp = int(np.sum((truth == 1) & prediction))
+        tn = int(np.sum((truth == 0) & (~prediction)))
+        fp = int(np.sum((truth == 0) & prediction))
+        fn = int(np.sum((truth == 1) & (~prediction)))
+        sensitivity = tp / (tp + fn)
+        specificity = tn / (tn + fp)
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        fog_f1 = (
+            2.0 * precision * sensitivity / (precision + sensitivity)
+            if precision + sensitivity > 0.0
+            else 0.0
+        )
+        key = (
+            float(precision),
+            float(sensitivity),
+            float(specificity),
+            float(threshold),
+        )
+        if best_key is None or key > best_key:
+            best_key = key
+            selected = {
+                "threshold": float(threshold),
+                "fog_f1": float(fog_f1),
+                "sensitivity": float(sensitivity),
+                "precision": float(precision),
+                "specificity": float(specificity),
+                "tp": tp,
+                "tn": tn,
+                "fp": fp,
+                "fn": fn,
+                "rule": "maximum_validation_precision",
+                "tie_break": [
+                    "higher_sensitivity",
+                    "higher_specificity",
+                    "larger_threshold",
+                ],
+                "n_samples": int(len(truth)),
+                "n_threshold_candidates": int(len(candidates)),
+            }
+    if selected is None:
+        raise RuntimeError("Threshold selection produced no candidate")
+    return selected
+
+
+def select_threshold(
+    config: dict[str, Any], y_true: np.ndarray, y_score: np.ndarray
+) -> dict[str, Any]:
+    evaluation = config.get("evaluation", {})
+    rule = evaluation.get("threshold_rule")
+    if rule == "validation_max_fog_f1":
+        return maximum_fog_f1_threshold(y_true, y_score)
+    if rule == "validation_target_sensitivity":
+        return target_sensitivity_threshold(
+            y_true,
+            y_score,
+            float(evaluation.get("target_sensitivity", float("nan"))),
+        )
+    if rule == "validation_max_precision":
+        return maximum_precision_threshold(y_true, y_score)
+    raise ValueError(f"Unsupported threshold rule: {rule}")
+
+
 def compute_window_metrics(
     y_true: np.ndarray, y_score: np.ndarray, threshold: float
 ) -> dict[str, Any]:
@@ -519,8 +659,17 @@ def validate_config(config: dict[str, Any], project_root: Path) -> dict[str, Any
         raise ValueError("E4 metric contract is not frozen")
     if evaluation.get("model_selection") != "validation_pr_auc":
         raise ValueError("Model selection must use validation PR-AUC")
-    if evaluation.get("threshold_rule") != "validation_max_fog_f1":
-        raise ValueError("Threshold rule must use validation maximum FoG-F1")
+    threshold_rule = evaluation.get("threshold_rule")
+    if threshold_rule not in {
+        "validation_max_fog_f1",
+        "validation_target_sensitivity",
+        "validation_max_precision",
+    }:
+        raise ValueError("Unsupported validation threshold rule")
+    if threshold_rule == "validation_target_sensitivity":
+        target = float(evaluation.get("target_sensitivity", float("nan")))
+        if not np.isfinite(target) or not 0.0 < target <= 1.0:
+            raise ValueError("evaluation.target_sensitivity must be in (0, 1]")
     model = config.get("model", {})
     if model.get("kernel") != "rbf" or model.get("class_weight") != "balanced":
         raise ValueError("Model must be balanced RBF-SVC")
@@ -618,7 +767,7 @@ def select_model(
         model = _make_pipeline(config, float(c_value), gamma)
         model.fit(x_train, y_train)
         score = _rank_score(model.decision_function(x_validation))
-        threshold_info = maximum_fog_f1_threshold(y_validation, score)
+        threshold_info = select_threshold(config, y_validation, score)
         metrics = compute_window_metrics(
             y_validation, score, float(threshold_info["threshold"])
         )
@@ -807,14 +956,23 @@ def _job_fingerprint(
     script_path = Path(__file__).resolve()
     split_path = root / "split_indices" / f"{subject}_outer{fold}_nbm_indices.npz"
     feature_schema = str(config.get("features", {}).get("schema", ""))
+    threshold_rule = str(config.get("evaluation", {}).get("threshold_rule", ""))
+    if feature_schema == "tf330_all5_30ch_v1":
+        implementation_sha256 = LEGACY_TF330_IMPLEMENTATION_SHA256
+    elif threshold_rule == "validation_max_fog_f1":
+        implementation_sha256 = LEGACY_TF120_F1_IMPLEMENTATION_SHA256
+    elif threshold_rule == "validation_target_sensitivity":
+        implementation_sha256 = LEGACY_TF120_SENSITIVITY_IMPLEMENTATION_SHA256
+    else:
+        implementation_sha256 = sha256_file(script_path)
     return {
         "format": "private-nbm-tf-svm-all5",
-        "version": FEATURE_SCHEMA_VERSIONS[feature_schema],
-        "implementation_sha256": (
-            LEGACY_TF330_IMPLEMENTATION_SHA256
-            if feature_schema == "tf330_all5_30ch_v1"
-            else sha256_file(script_path)
+        "version": (
+            FEATURE_SCHEMA_VERSIONS[feature_schema]
+            if threshold_rule == "validation_max_fog_f1"
+            else 3 if threshold_rule == "validation_target_sensitivity" else 4
         ),
+        "implementation_sha256": implementation_sha256,
         "configuration_hash": stable_hash(public_config(config)),
         "split_index_sha256": sha256_file(split_path),
         "schema_sha256": sha256_file(root / "schema.json"),
@@ -1015,7 +1173,7 @@ def run_experiment(
                     "feature_count": len(names),
                     "C": float(selection["C"]),
                     "gamma": selection["gamma"],
-                    "threshold_rule": "validation_max_fog_f1",
+                    "threshold_rule": config["evaluation"]["threshold_rule"],
                     "model_selection": "validation_pr_auc",
                 }
             )
@@ -1110,7 +1268,17 @@ def run_experiment(
         "feature_schema": feature_schema,
         "feature_count": len(names),
         "model_selection": "maximum validation PR-AUC on roles 2/3",
-        "threshold_rule": "maximum validation FoG-F1 on roles 2/3",
+        "threshold_rule": (
+            "maximum validation FoG-F1 on roles 2/3"
+            if config["evaluation"]["threshold_rule"] == "validation_max_fog_f1"
+            else (
+                "highest threshold attaining validation sensitivity >= "
+                f"{float(config['evaluation']['target_sensitivity']):.4f} on roles 2/3"
+            )
+            if config["evaluation"]["threshold_rule"]
+            == "validation_target_sensitivity"
+            else "maximum validation Precision on roles 2/3"
+        ),
         "test_roles": [0, 1],
         "subjects": selected_subjects,
         "outer_folds": selected_folds,
