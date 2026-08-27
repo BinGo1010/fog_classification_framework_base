@@ -53,6 +53,46 @@ def test_four_feature_private_schema_is_120_finite_features() -> None:
     assert np.isfinite(features).all()
 
 
+def test_six_feature_private_schema_is_180_finite_features() -> None:
+    rng = np.random.default_rng(41)
+    windows = rng.normal(size=(2, 128, 30))
+
+    features = MODULE.extract_tf_features(
+        windows, feature_schema="tf180_all5_30ch_6f_v1"
+    )
+    names = MODULE.feature_names(
+        [f"channel_{index}" for index in range(30)],
+        "tf180_all5_30ch_6f_v1",
+    )
+    suffixes = {name.split("__", 1)[1] for name in names}
+
+    assert features.shape == (2, 180)
+    assert len(names) == 180
+    assert suffixes == {
+        "std",
+        "peak_to_peak",
+        "mean_abs",
+        "log_power_3_8hz",
+        "log_power_8_28hz",
+        "log_freeze_index",
+    }
+    assert np.isfinite(features).all()
+
+
+def test_six_feature_record_merge_configuration_and_split_audit() -> None:
+    config, project_root = MODULE.load_config(
+        ROOT
+        / "configs"
+        / "private_nbm_tf_svm_all5_6f_gamma01_c1_maxprecision_recordmerge.yaml"
+    )
+    result = MODULE.audit_dataset(config, project_root)
+
+    assert result["status"] == "PASS"
+    assert result["feature_schema"] == "tf180_all5_30ch_6f_v1"
+    assert result["feature_count"] == 180
+    assert result["job_count"] == 24
+
+
 def test_four_feature_private_configuration_and_split_audit() -> None:
     config, project_root = MODULE.load_config(
         ROOT / "configs" / "private_nbm_tf_svm_all5_4f_gamma01_c10.yaml"
@@ -172,6 +212,62 @@ def test_event_and_false_alarm_episode_contract() -> None:
     assert metrics["false_alarms_per_hour"] == 600.0
     assert bool(details.loc[0, "detected"])
     assert len(alarms) == 1
+
+
+def test_record_level_false_alarm_merge_crosses_allocation_groups_only_within_record() -> None:
+    predictions = pd.DataFrame(
+        {
+            "subject_id": ["P01"] * 4,
+            "record_id": ["record_a", "record_a", "record_b", "record_a"],
+            "allocation_group_id": ["normal_a", "normal_b", "normal_c", "fog_a"],
+            "window_id": ["n0", "n1", "n2", "f0"],
+            "role_code": [0, 0, 0, 1],
+            "y_pred": [1, 1, 1, 1],
+            "prob_fog": [0.8, 0.7, 0.6, 0.9],
+            "start_time_sec": [0.0, 2.5, 2.5, 20.0],
+            "end_time_sec": [2.0, 4.5, 4.5, 22.0],
+        }
+    )
+    manifest = pd.DataFrame(
+        {
+            "subject_id": ["P01"],
+            "record_id": ["record_a"],
+            "event_id": [0],
+            "start_time_sec": [20.0],
+            "end_time_sec": [22.0],
+            "nbm_status": ["eligible"],
+            "nbm_allocation_group_ids": ["fog_a"],
+            "nbm_connector_window_ids": [""],
+        }
+    )
+
+    metrics, _, alarms = MODULE.evaluate_events(
+        predictions,
+        manifest,
+        merge_gap_sec=1.0,
+        false_alarm_merge_scope="record_id",
+    )
+
+    assert metrics["n_false_alarm_episodes"] == 2
+    assert metrics["nonfog_exposure_hours"] == 6.0 / 3600.0
+    assert metrics["false_alarms_per_hour"] == 1200.0
+    assert len(alarms) == 2
+    record_a = alarms.loc[alarms["record_id"] == "record_a"].iloc[0]
+    assert record_a["positive_window_count"] == 2
+    assert record_a["allocation_group_ids"] == "normal_a;normal_b"
+
+
+def test_record_merge_configuration_and_split_audit() -> None:
+    config, project_root = MODULE.load_config(
+        ROOT
+        / "configs"
+        / "private_nbm_tf_svm_all5_4f_gamma01_c1_maxprecision_recordmerge.yaml"
+    )
+    result = MODULE.audit_dataset(config, project_root)
+
+    assert result["status"] == "PASS"
+    assert config["evaluation"]["event"]["false_alarm_merge_scope"] == "record_id"
+    assert result["job_count"] == 24
 
 
 def test_private_dataset_configuration_and_split_audit() -> None:

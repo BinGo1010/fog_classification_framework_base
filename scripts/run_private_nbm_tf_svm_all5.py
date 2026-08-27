@@ -49,13 +49,23 @@ FEATURES_PER_CHANNEL_4F = (
     "log_power_3_8hz",
     "log_power_8_28hz",
 )
+FEATURES_PER_CHANNEL_6F = (
+    "std",
+    "peak_to_peak",
+    "mean_abs",
+    "log_power_3_8hz",
+    "log_power_8_28hz",
+    "log_freeze_index",
+)
 FEATURE_SCHEMAS = {
     "tf330_all5_30ch_v1": FEATURES_PER_CHANNEL,
     "tf120_all5_30ch_4f_v1": FEATURES_PER_CHANNEL_4F,
+    "tf180_all5_30ch_6f_v1": FEATURES_PER_CHANNEL_6F,
 }
 FEATURE_SCHEMA_VERSIONS = {
     "tf330_all5_30ch_v1": 1,
     "tf120_all5_30ch_4f_v1": 2,
+    "tf180_all5_30ch_6f_v1": 3,
 }
 LEGACY_TF330_IMPLEMENTATION_SHA256 = (
     "97107f3911ad7fa292247cd013fcffce18500d394852838f62c84b69eccc8f20"
@@ -65,6 +75,12 @@ LEGACY_TF120_F1_IMPLEMENTATION_SHA256 = (
 )
 LEGACY_TF120_SENSITIVITY_IMPLEMENTATION_SHA256 = (
     "3aeb1cd8d2ca597fd47d63a6792ffae11fd58044243176a31a3423098993795f"
+)
+LEGACY_TF120_MAXPRECISION_IMPLEMENTATION_SHA256 = (
+    "0af51f2bf563f4bc117a3836db256a76f14a749593ff8c5c77dbac8526a23c4f"
+)
+LEGACY_TF120_RECORDMERGE_IMPLEMENTATION_SHA256 = (
+    "17cb0abadba2fadb825da8de9473a348eebec79f41d19ef92ea5e6bc7c19179b"
 )
 
 
@@ -111,11 +127,13 @@ def atomic_json_dump(value: Any, path: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def atomic_csv_write(frame: pd.DataFrame, path: Path) -> None:
+def atomic_csv_write(
+    frame: pd.DataFrame, path: Path, *, float_format: str | None = None
+) -> None:
     temporary = _temporary_path(path, "csv")
     try:
         with temporary.open("w", encoding="utf-8", newline="") as handle:
-            frame.to_csv(handle, index=False)
+            frame.to_csv(handle, index=False, float_format=float_format)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -248,6 +266,8 @@ def extract_tf_features(
         centered.std(axis=1),
         np.ptp(centered, axis=1),
     ]
+    if feature_schema == "tf180_all5_30ch_6f_v1":
+        time_features.append(np.mean(np.abs(centered), axis=1))
     if feature_schema == "tf330_all5_30ch_v1":
         differences = np.diff(centered, axis=1)
         time_features.extend(
@@ -270,10 +290,14 @@ def extract_tf_features(
         np.log1p(freezing),
         np.log1p(high),
     ]
-    if feature_schema == "tf330_all5_30ch_v1":
+    if feature_schema in {"tf330_all5_30ch_v1", "tf180_all5_30ch_6f_v1"}:
         locomotor = _band_power(
             power, frequencies, 0.5, 3.0, include_high=False
         )
+        log_freeze_index = np.log1p(freezing / np.maximum(locomotor, epsilon))
+    if feature_schema == "tf180_all5_30ch_6f_v1":
+        frequency_features.append(log_freeze_index)
+    if feature_schema == "tf330_all5_30ch_v1":
         analysis_mask = (frequencies >= 0.5) & (frequencies <= high_band_hz)
         analysis = power[:, analysis_mask, :]
         normalized = analysis / np.maximum(
@@ -287,7 +311,7 @@ def extract_tf_features(
         frequency_features = [
             np.log1p(locomotor),
             *frequency_features,
-            np.log1p(freezing / np.maximum(locomotor, epsilon)),
+            log_freeze_index,
             entropy,
             dominant,
         ]
@@ -670,6 +694,13 @@ def validate_config(config: dict[str, Any], project_root: Path) -> dict[str, Any
         target = float(evaluation.get("target_sensitivity", float("nan")))
         if not np.isfinite(target) or not 0.0 < target <= 1.0:
             raise ValueError("evaluation.target_sensitivity must be in (0, 1]")
+    merge_scope = str(
+        evaluation.get("event", {}).get(
+            "false_alarm_merge_scope", "record_and_allocation_group"
+        )
+    )
+    if merge_scope not in {"record_id", "record_and_allocation_group"}:
+        raise ValueError("Unsupported false-alarm merge scope")
     model = config.get("model", {})
     if model.get("kernel") != "rbf" or model.get("class_weight") != "balanced":
         raise ValueError("Model must be balanced RBF-SVC")
@@ -856,6 +887,7 @@ def evaluate_events(
     event_manifest: pd.DataFrame,
     *,
     merge_gap_sec: float,
+    false_alarm_merge_scope: str = "record_and_allocation_group",
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
     """Evaluate original annotated events and role-0 false-alarm episodes."""
 
@@ -901,8 +933,21 @@ def evaluate_events(
     positives = predictions.loc[
         (predictions["role_code"] == 0) & (predictions["y_pred"] == 1)
     ]
-    group_columns = ["record_id", "allocation_group_id"]
-    for keys, group in positives.groupby(group_columns, sort=False):
+    if false_alarm_merge_scope == "record_id":
+        grouped_positives = positives.groupby("record_id", sort=False)
+    elif false_alarm_merge_scope == "record_and_allocation_group":
+        grouped_positives = positives.groupby(
+            ["record_id", "allocation_group_id"], sort=False
+        )
+    else:
+        raise ValueError("Unsupported false-alarm merge scope")
+    for keys, group in grouped_positives:
+        if false_alarm_merge_scope == "record_id":
+            record_id = str(keys)
+            allocation_group_id = None
+        else:
+            record_id = str(keys[0])
+            allocation_group_id = str(keys[1])
         ordered = group.sort_values(["start_time_sec", "end_time_sec"], kind="stable")
         current: dict[str, Any] | None = None
         local_id = 0
@@ -915,16 +960,27 @@ def evaluate_events(
                     local_id += 1
                 current = {
                     "subject_id": subject,
-                    "record_id": str(keys[0]),
-                    "allocation_group_id": str(keys[1]),
+                    "record_id": record_id,
                     "alarm_id": local_id,
                     "start_time_sec": start,
                     "end_time_sec": end,
                     "positive_window_count": 1,
                 }
+                if allocation_group_id is None:
+                    current["allocation_group_ids"] = str(row.allocation_group_id)
+                else:
+                    current["allocation_group_id"] = allocation_group_id
             else:
                 current["end_time_sec"] = max(float(current["end_time_sec"]), end)
                 current["positive_window_count"] = int(current["positive_window_count"]) + 1
+                if allocation_group_id is None:
+                    group_ids = {
+                        item
+                        for item in str(current["allocation_group_ids"]).split(";")
+                        if item
+                    }
+                    group_ids.add(str(row.allocation_group_id))
+                    current["allocation_group_ids"] = ";".join(sorted(group_ids))
         if current is not None:
             alarm_rows.append(current)
     alarms = pd.DataFrame(alarm_rows)
@@ -943,7 +999,12 @@ def evaluate_events(
             float(len(alarms) / nonfog_hours) if nonfog_hours > 0 else float("nan")
         ),
         "event_detection_rule": "any positive permanent-test pure-FoG window mapped to original annotated event",
-        "false_alarm_rule": "merge positive role-0 windows within record/allocation group when interval gap <= configured seconds",
+        "false_alarm_rule": (
+            "merge positive role-0 windows within record when interval gap <= configured seconds"
+            if false_alarm_merge_scope == "record_id"
+            else "merge positive role-0 windows within record/allocation group when interval gap <= configured seconds"
+        ),
+        "false_alarm_merge_scope": false_alarm_merge_scope,
         "merge_gap_sec": float(merge_gap_sec),
         "exposure_rule": "union of role-0 window intervals per record",
     }
@@ -957,20 +1018,42 @@ def _job_fingerprint(
     split_path = root / "split_indices" / f"{subject}_outer{fold}_nbm_indices.npz"
     feature_schema = str(config.get("features", {}).get("schema", ""))
     threshold_rule = str(config.get("evaluation", {}).get("threshold_rule", ""))
+    merge_scope = str(
+        config.get("evaluation", {}).get("event", {}).get(
+            "false_alarm_merge_scope", "record_and_allocation_group"
+        )
+    )
     if feature_schema == "tf330_all5_30ch_v1":
         implementation_sha256 = LEGACY_TF330_IMPLEMENTATION_SHA256
     elif threshold_rule == "validation_max_fog_f1":
         implementation_sha256 = LEGACY_TF120_F1_IMPLEMENTATION_SHA256
     elif threshold_rule == "validation_target_sensitivity":
         implementation_sha256 = LEGACY_TF120_SENSITIVITY_IMPLEMENTATION_SHA256
+    elif (
+        threshold_rule == "validation_max_precision"
+        and merge_scope == "record_and_allocation_group"
+    ):
+        implementation_sha256 = LEGACY_TF120_MAXPRECISION_IMPLEMENTATION_SHA256
+    elif (
+        feature_schema == "tf120_all5_30ch_4f_v1"
+        and threshold_rule == "validation_max_precision"
+        and merge_scope == "record_id"
+    ):
+        implementation_sha256 = LEGACY_TF120_RECORDMERGE_IMPLEMENTATION_SHA256
     else:
         implementation_sha256 = sha256_file(script_path)
     return {
         "format": "private-nbm-tf-svm-all5",
         "version": (
-            FEATURE_SCHEMA_VERSIONS[feature_schema]
+            6
+            if feature_schema == "tf180_all5_30ch_6f_v1"
+            else FEATURE_SCHEMA_VERSIONS[feature_schema]
             if threshold_rule == "validation_max_fog_f1"
-            else 3 if threshold_rule == "validation_target_sensitivity" else 4
+            else 3
+            if threshold_rule == "validation_target_sensitivity"
+            else 4
+            if merge_scope == "record_and_allocation_group"
+            else 5
         ),
         "implementation_sha256": implementation_sha256,
         "configuration_hash": stable_hash(public_config(config)),
@@ -1083,6 +1166,11 @@ def run_experiment(
     )
     event_manifest = pd.read_csv(registered["root"] / "nbm_fog_event_manifest.csv")
     merge_gap_sec = float(config["evaluation"]["event"].get("merge_gap_sec", 1.0))
+    false_alarm_merge_scope = str(
+        config["evaluation"]["event"].get(
+            "false_alarm_merge_scope", "record_and_allocation_group"
+        )
+    )
     epsilon = float(config["features"].get("epsilon", 1e-12))
 
     rows: list[dict[str, Any]] = []
@@ -1158,7 +1246,10 @@ def run_experiment(
                 test_predictions["y_binary"], test_predictions["prob_fog"], threshold
             )
             event_metrics, event_details, alarms = evaluate_events(
-                test_predictions, event_manifest, merge_gap_sec=merge_gap_sec
+                test_predictions,
+                event_manifest,
+                merge_gap_sec=merge_gap_sec,
+                false_alarm_merge_scope=false_alarm_merge_scope,
             )
             test_metrics.update(event_metrics)
             test_metrics.update(
@@ -1216,11 +1307,27 @@ def run_experiment(
     subject_metrics = pd.DataFrame(subject_rows)
     atomic_csv_write(subject_metrics, report_root / "per_subject_averaged_metrics.csv")
 
+    requested_rows: list[dict[str, Any]] = []
+    for subject, group in per_job.groupby("subject_id", sort=True):
+        row = {"subject_id": subject, "n_folds": int(group["outer_fold"].nunique())}
+        for metric, label in (
+            ("pr_auc", "AP"),
+            ("event_sensitivity", "Event_Sensitivity"),
+            ("false_alarms_per_hour", "False_Alarms_per_hour"),
+        ):
+            mean, sd = _mean_sd(group[metric])
+            row[f"{label}_mean"] = mean
+            row[f"{label}_SD"] = sd
+        requested_rows.append(row)
+    requested_metrics = pd.DataFrame(requested_rows)
+    requested_path = report_root / "per_subject_AP_EventSensitivity_FAh_mean_SD.csv"
+    atomic_csv_write(requested_metrics, requested_path, float_format="%.4f")
+
     summary_row: dict[str, Any] = {
         "model": (
             "TF+SVM (all5_30ch)"
             if feature_schema == "tf330_all5_30ch_v1"
-            else "TF+SVM (all5_30ch, 4F/ch)"
+            else f"TF+SVM (all5_30ch, {len(features_per_channel)}F/ch)"
         ),
         "sensors": 5,
         "channels": 30,
@@ -1286,10 +1393,12 @@ def run_experiment(
         "selected_maximum_C_job_count": boundary_count,
         "event_evaluations_across_folds": total_events,
         "detected_event_evaluations_across_folds": total_detected,
+        "false_alarm_merge_scope": false_alarm_merge_scope,
         "run_root": str(run_root),
         "report_root": str(report_root),
         "e1_e3_table": str(report_root / "e1_e3_four_metric_main_table.md"),
         "e4_table": str(report_root / "e4_six_metric_main_table.md"),
+        "per_subject_requested_metrics": str(requested_path),
     }
     atomic_json_dump(status, report_root / "report_summary.json")
     return status

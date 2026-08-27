@@ -42,6 +42,8 @@ EXPERIMENT_SCHEMA = "all_dataset_within_subject_tcn_ngm40k_poscomposite_tcn.v1"
 BARRIER_SCHEMA = "all_dataset_within_subject_tcn_ngm40k_poscomposite_tcn_barrier.v1"
 MODEL_DESCRIPTION = "Position-conditioned 40k Conv-TCN NBM composite loss + scheme-C 90-channel TCN"
 NBM_DISPLAY_NAME = "Position-conditioned TCN-NBM40K"
+NBM_DEFAULT_MAX_EPOCHS = 400
+NBM_DEFAULT_PATIENCE = 40
 
 SMOOTHL1_WEIGHT = 0.70
 CORRELATION_WEIGHT = 0.15
@@ -119,7 +121,7 @@ def train_position_composite_nbm(
     initial_state = worker.base.state_dict_sha256(model.state_dict())
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-5
+        optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-5
     )
     train_batches = worker.base.nbm_loader(train_x, batch_size, True, seed, workers)
     validation_batches = worker.base.nbm_loader(
@@ -275,7 +277,7 @@ def training_contract(args: Any) -> dict[str, Any]:
                 "first_difference": FIRST_DIFFERENCE_WEIGHT,
             },
             "nbm_optimizer": "AdamW(lr=1e-3,weight_decay=1e-4)",
-            "nbm_scheduler": "ReduceLROnPlateau(factor=0.5,patience=3,min_lr=1e-5)",
+            "nbm_scheduler": "ReduceLROnPlateau(factor=0.5,patience=5,min_lr=1e-5)",
             "nbm_checkpoint": "minimum clean role5 composite reconstruction loss",
             "event_metric": {
                 "version": worker.EVENT_METRIC_VERSION,
@@ -304,6 +306,8 @@ def configure_worker() -> None:
     worker.BARRIER_SCHEMA = BARRIER_SCHEMA
     worker.MODEL_DESCRIPTION = MODEL_DESCRIPTION
     worker.NBM_DISPLAY_NAME = NBM_DISPLAY_NAME
+    worker.NBM_DEFAULT_MAX_EPOCHS = NBM_DEFAULT_MAX_EPOCHS
+    worker.NBM_DEFAULT_PATIENCE = NBM_DEFAULT_PATIENCE
     worker.architecture_config = architecture_config
     worker.train_conv_tcn_ngm = train_position_composite_nbm
     worker.training_contract = training_contract
