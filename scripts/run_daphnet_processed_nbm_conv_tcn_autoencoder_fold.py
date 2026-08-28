@@ -663,6 +663,8 @@ def train_representation_tcn(
     initial_state: dict[str, torch.Tensor],
     reset_seed_after_loading: bool = False,
     batch_size: int = 128,
+    learning_rate: float = 1e-3,
+    weight_decay: float = 1e-4,
 ) -> tuple[nn.Module, dict[str, Any]]:
     set_seed(seed)
     input_channels = representation_channels(representation)
@@ -674,7 +676,9 @@ def train_representation_tcn(
         # Reset here so dropout and all subsequent stochastic operations start
         # from the same seed as well as using the same DataLoader generator.
         set_seed(seed)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
     n_pos = int(np.sum(train_y == 1))
     n_neg = int(np.sum(train_y == 0))
     pos_weight = n_neg / n_pos
@@ -768,6 +772,8 @@ def train_representation_tcn(
         "maximum_epochs": max_epochs,
         "patience": patience,
         "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
         "epochs_completed": len(history),
         "best_epoch": best_epoch,
         "best_validation_pr_auc": best_pr,

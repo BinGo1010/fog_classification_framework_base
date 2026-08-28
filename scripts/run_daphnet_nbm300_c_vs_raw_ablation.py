@@ -195,6 +195,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--tcn-learning-rate", type=float, default=1e-3)
+    parser.add_argument("--tcn-weight-decay", type=float, default=1e-4)
     parser.add_argument("--tcn-max-epochs", type=int, default=10)
     parser.add_argument("--tcn-patience", type=int, default=2)
     parser.add_argument("--required-nbm-max-epochs", type=int, default=300)
@@ -215,6 +217,10 @@ def resolve_device(value: str) -> torch.device:
 def require_job_args(args: argparse.Namespace) -> None:
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive")
+    if args.tcn_learning_rate <= 0:
+        raise ValueError("--tcn-learning-rate must be positive")
+    if args.tcn_weight_decay < 0:
+        raise ValueError("--tcn-weight-decay must be non-negative")
     if (
         args.fold is None
         or args.method is None
@@ -1430,6 +1436,8 @@ def run_train(args: argparse.Namespace, device: torch.device) -> None:
         initial_state,
         reset_seed_after_loading=True,
         batch_size=args.batch_size,
+        learning_rate=args.tcn_learning_rate,
+        weight_decay=args.tcn_weight_decay,
     )
     val_true, val_prob = classifier_predict(
         model,
@@ -1524,6 +1532,8 @@ def run_seal(args: argparse.Namespace) -> None:
             "tcn_max_epochs": frozen["training"]["maximum_epochs"],
             "tcn_patience": frozen["training"]["patience"],
             "batch_size": frozen["training"]["batch_size"],
+            "learning_rate": frozen["training"]["learning_rate"],
+            "weight_decay": frozen["training"]["weight_decay"],
         })
     for fold in FOLDS:
         same_fold = [item for item in entries if item["fold"] == fold]
@@ -1552,6 +1562,10 @@ def run_seal(args: argparse.Namespace) -> None:
         raise AssertionError("TCN patience mismatch")
     if any(item["batch_size"] != args.batch_size for item in entries):
         raise AssertionError("TCN batch size mismatch")
+    if any(item["learning_rate"] != args.tcn_learning_rate for item in entries):
+        raise AssertionError("TCN learning rate mismatch")
+    if any(item["weight_decay"] != args.tcn_weight_decay for item in entries):
+        raise AssertionError("TCN weight decay mismatch")
     rows_by_fold = {fold: load_fold_rows(args.data_dir.resolve(), fold) for fold in FOLDS}
     source_audit = audit_protocol_dynamic(
         args.data_dir.resolve(),
@@ -1606,7 +1620,8 @@ def run_seal(args: argparse.Namespace) -> None:
         "seed_policy": "exact seeds; no hidden fold offset",
         "tcn": (
             f"max_epoch={args.tcn_max_epochs}, patience={args.tcn_patience}, "
-            f"batch_size={args.batch_size}, paired seed/loader order"
+            f"batch_size={args.batch_size}, lr={args.tcn_learning_rate}, "
+            f"weight_decay={args.tcn_weight_decay}, paired seed/loader order"
         ),
         "roles": {str(key): value for key, value in ROLES.items()},
         "threshold": "roles 2/3 balanced accuracy; ties FoG F1 then higher threshold",
@@ -1641,6 +1656,10 @@ def sealed_job(args: argparse.Namespace) -> dict[str, Any]:
         raise AssertionError("requested NBM backbone differs from the sealed experiment")
     if int(matches[0].get("batch_size", 128)) != args.batch_size:
         raise AssertionError("requested TCN batch size differs from sealed experiment")
+    if float(matches[0].get("learning_rate", 1e-3)) != args.tcn_learning_rate:
+        raise AssertionError("requested TCN learning rate differs from sealed experiment")
+    if float(matches[0].get("weight_decay", 1e-4)) != args.tcn_weight_decay:
+        raise AssertionError("requested TCN weight decay differs from sealed experiment")
     sealed = dict(matches[0])
     sealed["barrier_schema"] = barrier.get("barrier_schema", "legacy.v1")
     sealed["barrier_id"] = barrier.get("barrier_id", sha256_file(barrier_path))
