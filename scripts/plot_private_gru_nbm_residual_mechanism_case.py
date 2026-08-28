@@ -66,6 +66,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--context-before-sec", type=float, default=4.5)
     parser.add_argument("--context-after-sec", type=float, default=4.5)
     parser.add_argument("--dpi", type=int, default=600)
+    parser.add_argument(
+        "--subject-selection",
+        choices=("median-ap", "highest-ap"),
+        default="median-ap",
+        help="Participant selection rule; highest-ap is intended for a best-performing mechanism case.",
+    )
     return parser.parse_args()
 
 
@@ -86,7 +92,9 @@ def write_csv(path: Path, fieldnames: Iterable[str], rows: Iterable[dict[str, An
         writer.writerows(rows)
 
 
-def select_subject(summary: dict[str, Any]) -> tuple[dict[str, Any], float, list[dict[str, Any]]]:
+def select_subject(
+    summary: dict[str, Any], selection: str = "median-ap"
+) -> tuple[dict[str, Any], float, list[dict[str, Any]]]:
     candidates = [
         {
             "subject": str(row["subject"]),
@@ -97,10 +105,15 @@ def select_subject(summary: dict[str, Any]) -> tuple[dict[str, Any], float, list
     median_ap = float(np.median([row["ap"] for row in candidates]))
     for row in candidates:
         row["absolute_distance_to_median_ap"] = abs(row["ap"] - median_ap)
-    ordered = sorted(
-        candidates,
-        key=lambda row: (row["absolute_distance_to_median_ap"], row["subject"]),
-    )
+    if selection == "median-ap":
+        ordered = sorted(
+            candidates,
+            key=lambda row: (row["absolute_distance_to_median_ap"], row["subject"]),
+        )
+    elif selection == "highest-ap":
+        ordered = sorted(candidates, key=lambda row: (-row["ap"], row["subject"]))
+    else:
+        raise ValueError(f"unknown participant selection rule: {selection}")
     return ordered[0], median_ap, ordered
 
 
@@ -632,7 +645,9 @@ def main() -> None:
             raise FileNotFoundError(required)
 
     summary = read_json(experiment_root / "summary.json")
-    selected_subject, median_subject_ap, subject_candidates = select_subject(summary)
+    selected_subject, median_subject_ap, subject_candidates = select_subject(
+        summary, args.subject_selection
+    )
     selected_run, run_candidates = select_representative_run(
         read_csv(experiment_root / "run_metrics.csv"),
         selected_subject["subject"],
@@ -785,13 +800,16 @@ def main() -> None:
 
     schema = read_json(data_dir / "schema.json")
     channel_units = [str(row["unit"]) for row in schema["channels"]]
+    highest_ap_case = args.subject_selection == "highest-ap"
     metadata = {
         "schema": "private_gru_nbm_residual_mechanism_case.v1",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "selection_is_visual_signal_independent": True,
         "selection_rule": {
             "subject": (
-                "smallest absolute distance between participant mean test AP and "
+                "highest participant mean test AP; lexical subject ID breaks exact ties"
+                if highest_ap_case
+                else "smallest absolute distance between participant mean test AP and "
                 "the median across participants; lexical subject ID breaks exact ties"
             ),
             "representative_run": (
@@ -810,6 +828,17 @@ def main() -> None:
             ),
         },
         "participant_median_ap": median_subject_ap,
+        "subject_selection_mode": args.subject_selection,
+        "figure_title": (
+            "Best-performing GRU-NBM residual mechanism case"
+            if highest_ap_case
+            else "Representative GRU-NBM residual mechanism case"
+        ),
+        "figure_stem": (
+            "processed_NBM_Exp_step_augmented_best_ap_residual_mechanism_case"
+            if highest_ap_case
+            else "private_gru_nbm_residual_mechanism_case"
+        ),
         "selected_subject": subject,
         "selected_subject_ap": selected_subject["ap"],
         "selected_fold": fold,
@@ -956,10 +985,15 @@ def main() -> None:
         prediction_strip=prediction_strip.astype(np.int8),
         channel_names=np.asarray(dataset.channel_names),
     )
+    subject_caption = (
+        f"{subject} had the highest participant-mean test AP"
+        if highest_ap_case
+        else f"{subject} had mean test AP closest to the participant median"
+    )
     caption = (
-        "**Fig. Y. Representative residual mechanism of the GRU-NBM framework.** "
-        f"The case was selected without visual inspection: {subject} had mean test AP "
-        f"closest to the participant median, and fold {fold}/seed {seed} had run AP "
+        "**Fig. Y. Residual mechanism of the GRU-NBM framework.** "
+        f"The case was selected without visual inspection: {subject_caption}, "
+        f"and fold {fold}/seed {seed} had run AP "
         "closest to that participant's mean. Among correctly detected evaluable test "
         "events, the event duration was closest to the participant median. (a) Fixed "
         "lumbar and bilateral-ankle channels show the observed signal and frozen NBM "
