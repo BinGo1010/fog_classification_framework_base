@@ -41,6 +41,7 @@ REQUIRED_SEEDS = (0, 52, 161, 5216, 52161)
 SEED_TEXT = "0,52,161,5216,52161"
 TCN_MAX_EPOCHS = 20
 TCN_PATIENCE = 5
+CLASSIFIER_BATCH_SIZE = 128
 DEFAULT_EXPERIMENT = (
     "daphnet_64Hz_raw_tcn_ep20pat5_seedset_0_52_161_5216_52161"
 )
@@ -57,6 +58,7 @@ def parse_args(
     *,
     tcn_max_epochs: int = TCN_MAX_EPOCHS,
     tcn_patience: int = TCN_PATIENCE,
+    classifier_batch_size: int = CLASSIFIER_BATCH_SIZE,
     default_experiment: str = DEFAULT_EXPERIMENT,
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -100,6 +102,7 @@ def parse_args(
     parser.add_argument("--gpu-ids", default="0,1,2,3,4,5,6")
     parser.add_argument("--seeds", default=SEED_TEXT)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=classifier_batch_size)
     parser.add_argument("--tcn-max-epochs", type=int, default=tcn_max_epochs)
     parser.add_argument("--tcn-patience", type=int, default=tcn_patience)
     parser.add_argument("--python", default=sys.executable)
@@ -113,6 +116,7 @@ def parse_args(
     args = parser.parse_args()
     args.required_tcn_max_epochs = int(tcn_max_epochs)
     args.required_tcn_patience = int(tcn_patience)
+    args.required_classifier_batch_size = int(classifier_batch_size)
     return args
 
 
@@ -128,6 +132,11 @@ def validate_contract(args: argparse.Namespace) -> tuple[int, ...]:
             "this experiment requires TCN "
             f"max_epoch={args.required_tcn_max_epochs} and "
             f"patience={args.required_tcn_patience}"
+        )
+    if args.batch_size != args.required_classifier_batch_size:
+        raise ValueError(
+            "this experiment requires classifier batch_size="
+            f"{args.required_classifier_batch_size}"
         )
     return seeds
 
@@ -181,6 +190,8 @@ def common_worker_args(args: argparse.Namespace, source: Path) -> list[str]:
         "64",
         "--num-workers",
         str(args.num_workers),
+        "--batch-size",
+        str(args.batch_size),
         "--tcn-max-epochs",
         str(args.tcn_max_epochs),
         "--tcn-patience",
@@ -251,11 +262,13 @@ def main(
     *,
     tcn_max_epochs: int = TCN_MAX_EPOCHS,
     tcn_patience: int = TCN_PATIENCE,
+    classifier_batch_size: int = CLASSIFIER_BATCH_SIZE,
     default_experiment: str = DEFAULT_EXPERIMENT,
 ) -> None:
     args = parse_args(
         tcn_max_epochs=tcn_max_epochs,
         tcn_patience=tcn_patience,
+        classifier_batch_size=classifier_batch_size,
         default_experiment=default_experiment,
     )
     seeds = validate_contract(args)
@@ -310,7 +323,7 @@ def main(
             "architecture": "RepresentationTCNM, input_channels=9",
             "maximum_epochs": args.tcn_max_epochs,
             "early_stopping_patience": args.tcn_patience,
-            "batch_size": 128,
+            "batch_size": args.batch_size,
             "optimizer": "AdamW(lr=1e-3, weight_decay=1e-4)",
             "loss": "BCEWithLogitsLoss(pos_weight=N_role6/N_role7)",
             "checkpoint_rule": "maximum roles2/3 validation PR-AUC",

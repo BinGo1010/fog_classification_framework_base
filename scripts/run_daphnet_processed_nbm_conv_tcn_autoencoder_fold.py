@@ -631,12 +631,15 @@ def validation_classifier_loss(
     y: np.ndarray,
     criterion: nn.Module,
     device: torch.device,
+    batch_size: int = 128,
 ) -> float:
     model.eval()
     total = 0.0
     count = 0
     with torch.no_grad():
-        for batch_x, batch_y in classifier_loader(x, y, False, 0, 0):
+        for batch_x, batch_y in classifier_loader(
+            x, y, False, 0, 0, batch_size=batch_size
+        ):
             batch_x = batch_x.to(device, non_blocking=True)
             batch_y = batch_y.to(device, non_blocking=True)
             loss = criterion(model(batch_x), batch_y)
@@ -659,6 +662,7 @@ def train_representation_tcn(
     patience: int,
     initial_state: dict[str, torch.Tensor],
     reset_seed_after_loading: bool = False,
+    batch_size: int = 128,
 ) -> tuple[nn.Module, dict[str, Any]]:
     set_seed(seed)
     input_channels = representation_channels(representation)
@@ -677,7 +681,9 @@ def train_representation_tcn(
     criterion = nn.BCEWithLogitsLoss(
         pos_weight=torch.tensor(pos_weight, device=device)
     )
-    loader = classifier_loader(train_x, train_y, True, seed, num_workers)
+    loader = classifier_loader(
+        train_x, train_y, True, seed, num_workers, batch_size=batch_size
+    )
     checkpoint = group_dir / "checkpoints" / "tcn.pt"
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     best_pr = -math.inf
@@ -702,10 +708,19 @@ def train_representation_tcn(
             count += len(batch_x)
         train_bce = total / count
         validation_bce = validation_classifier_loss(
-            model, validation_x, validation_y, criterion, device
+            model,
+            validation_x,
+            validation_y,
+            criterion,
+            device,
+            batch_size=batch_size,
         )
         val_true, val_prob = classifier_predict(
-            model, validation_x, validation_y, device
+            model,
+            validation_x,
+            validation_y,
+            device,
+            batch_size=batch_size,
         )
         validation_pr_auc = float(average_precision_score(val_true, val_prob))
         improved = validation_pr_auc > best_pr + 1e-10
@@ -752,6 +767,7 @@ def train_representation_tcn(
         "seed": seed,
         "maximum_epochs": max_epochs,
         "patience": patience,
+        "batch_size": batch_size,
         "epochs_completed": len(history),
         "best_epoch": best_epoch,
         "best_validation_pr_auc": best_pr,

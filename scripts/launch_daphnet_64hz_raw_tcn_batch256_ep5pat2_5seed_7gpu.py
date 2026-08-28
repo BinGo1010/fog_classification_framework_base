@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Run strict 64-Hz Daphnet RAW+TCN256/pat5 on seven GPUs.
-
-This is the epoch-budget variant of the proven RAW-only launcher.  It trains
-15 classifiers (3 folds x 5 paired seeds), seals every validation-selected
-checkpoint and threshold, and only then evaluates permanent roles 0/1.  It
-does not train or infer an NBM; completed role-4 scaler artifacts are reused.
-"""
+"""Run strict 64-Hz Daphnet RAW+TCN with classifier batch size 256."""
 
 from __future__ import annotations
 
@@ -19,10 +13,12 @@ if str(REPO_ROOT) not in sys.path:
 from scripts import launch_daphnet_64hz_raw_tcn_ep20pat5_5seed_7gpu as base
 
 
-TCN_MAX_EPOCHS = 256
-TCN_PATIENCE = 5
+TCN_MAX_EPOCHS = 5
+TCN_PATIENCE = 2
+CLASSIFIER_BATCH_SIZE = 256
 DEFAULT_EXPERIMENT = (
-    "daphnet_64Hz_raw_tcn_ep256pat5_seedset_0_52_161_5216_52161"
+    "daphnet_64Hz_raw_tcn_batch256_ep5pat2_"
+    "seedset_0_52_161_5216_52161"
 )
 
 
@@ -30,6 +26,7 @@ def main() -> None:
     base.main(
         tcn_max_epochs=TCN_MAX_EPOCHS,
         tcn_patience=TCN_PATIENCE,
+        classifier_batch_size=CLASSIFIER_BATCH_SIZE,
         default_experiment=DEFAULT_EXPERIMENT,
     )
 

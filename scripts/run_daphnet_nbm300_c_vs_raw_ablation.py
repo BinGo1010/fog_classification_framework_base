@@ -194,6 +194,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stride-samples", type=int, default=64)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--tcn-max-epochs", type=int, default=10)
     parser.add_argument("--tcn-patience", type=int, default=2)
     parser.add_argument("--required-nbm-max-epochs", type=int, default=300)
@@ -212,6 +213,8 @@ def resolve_device(value: str) -> torch.device:
 
 
 def require_job_args(args: argparse.Namespace) -> None:
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
     if (
         args.fold is None
         or args.method is None
@@ -1426,8 +1429,15 @@ def run_train(args: argparse.Namespace, device: torch.device) -> None:
         args.tcn_patience,
         initial_state,
         reset_seed_after_loading=True,
+        batch_size=args.batch_size,
     )
-    val_true, val_prob = classifier_predict(model, validation_x, role23.label, device)
+    val_true, val_prob = classifier_predict(
+        model,
+        validation_x,
+        role23.label,
+        device,
+        batch_size=args.batch_size,
+    )
     threshold, validation_metrics = choose_document_threshold(val_true, val_prob)
     checkpoint = directory / "checkpoints" / "tcn.pt"
     frozen = {
@@ -1513,6 +1523,7 @@ def run_seal(args: argparse.Namespace) -> None:
             "pos_weight": frozen["training"]["pos_weight"],
             "tcn_max_epochs": frozen["training"]["maximum_epochs"],
             "tcn_patience": frozen["training"]["patience"],
+            "batch_size": frozen["training"]["batch_size"],
         })
     for fold in FOLDS:
         same_fold = [item for item in entries if item["fold"] == fold]
@@ -1539,6 +1550,8 @@ def run_seal(args: argparse.Namespace) -> None:
         raise AssertionError("TCN maximum epoch mismatch")
     if any(item["tcn_patience"] != args.tcn_patience for item in entries):
         raise AssertionError("TCN patience mismatch")
+    if any(item["batch_size"] != args.batch_size for item in entries):
+        raise AssertionError("TCN batch size mismatch")
     rows_by_fold = {fold: load_fold_rows(args.data_dir.resolve(), fold) for fold in FOLDS}
     source_audit = audit_protocol_dynamic(
         args.data_dir.resolve(),
@@ -1591,7 +1604,10 @@ def run_seal(args: argparse.Namespace) -> None:
         "window_samples": args.window_samples,
         "stride_samples": args.stride_samples,
         "seed_policy": "exact seeds; no hidden fold offset",
-        "tcn": f"max_epoch={args.tcn_max_epochs}, patience={args.tcn_patience}, paired seed/loader order",
+        "tcn": (
+            f"max_epoch={args.tcn_max_epochs}, patience={args.tcn_patience}, "
+            f"batch_size={args.batch_size}, paired seed/loader order"
+        ),
         "roles": {str(key): value for key, value in ROLES.items()},
         "threshold": "roles 2/3 balanced accuracy; ties FoG F1 then higher threshold",
         "global_test_barrier_jobs": len(entries),
@@ -1623,6 +1639,8 @@ def sealed_job(args: argparse.Namespace) -> dict[str, Any]:
         raise AssertionError(f"job not sealed: {target}")
     if matches[0]["nbm_kind"] != args.nbm_kind:
         raise AssertionError("requested NBM backbone differs from the sealed experiment")
+    if int(matches[0].get("batch_size", 128)) != args.batch_size:
+        raise AssertionError("requested TCN batch size differs from sealed experiment")
     sealed = dict(matches[0])
     sealed["barrier_schema"] = barrier.get("barrier_schema", "legacy.v1")
     sealed["barrier_id"] = barrier.get("barrier_id", sha256_file(barrier_path))
@@ -1748,7 +1766,13 @@ def run_evaluate(args: argparse.Namespace, device: torch.device) -> None:
     model = RepresentationTCNM(input_channels).to(device)
     payload = torch.load(checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(payload["model_state"])
-    test_true, test_prob = classifier_predict(model, test_x, test_rows.label, device)
+    test_true, test_prob = classifier_predict(
+        model,
+        test_x,
+        test_rows.label,
+        device,
+        batch_size=args.batch_size,
+    )
     threshold = float(sealed["threshold"])
     metrics = binary_metrics(test_true, test_prob, threshold)
     test_pred = (test_prob >= threshold).astype(np.int8)

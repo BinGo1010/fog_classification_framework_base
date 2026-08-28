@@ -1116,6 +1116,7 @@ def classifier_loader(
     shuffle: bool,
     seed: int,
     num_workers: int,
+    batch_size: int = 128,
 ) -> DataLoader:
     generator = torch.Generator().manual_seed(seed)
     return DataLoader(
@@ -1123,7 +1124,7 @@ def classifier_loader(
             torch.from_numpy(np.ascontiguousarray(x.transpose(0, 2, 1))).float(),
             torch.from_numpy(np.asarray(y, dtype=np.float32)),
         ),
-        batch_size=128,
+        batch_size=batch_size,
         shuffle=shuffle,
         generator=generator,
         num_workers=num_workers,
@@ -1138,11 +1139,14 @@ def classifier_predict(
     x: np.ndarray,
     y: np.ndarray,
     device: torch.device,
+    batch_size: int = 128,
 ) -> tuple[np.ndarray, np.ndarray]:
     model.eval()
     probabilities: list[np.ndarray] = []
     labels: list[np.ndarray] = []
-    for batch_x, batch_y in classifier_loader(x, y, False, 0, 0):
+    for batch_x, batch_y in classifier_loader(
+        x, y, False, 0, 0, batch_size=batch_size
+    ):
         logits = model(batch_x.to(device, non_blocking=True))
         probabilities.append(torch.sigmoid(logits).cpu().numpy())
         labels.append(batch_y.numpy())
