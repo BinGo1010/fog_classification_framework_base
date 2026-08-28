@@ -701,6 +701,16 @@ def validate_config(config: dict[str, Any], project_root: Path) -> dict[str, Any
     )
     if merge_scope not in {"record_id", "record_and_allocation_group"}:
         raise ValueError("Unsupported false-alarm merge scope")
+    minimum_alarm_windows = int(
+        evaluation.get("event", {}).get("minimum_consecutive_positive_windows", 1)
+    )
+    consecutive_stride_samples = int(
+        evaluation.get("event", {}).get("consecutive_stride_samples", 64)
+    )
+    if minimum_alarm_windows < 1:
+        raise ValueError("minimum consecutive positive windows must be at least one")
+    if consecutive_stride_samples < 1:
+        raise ValueError("consecutive alarm stride must be positive")
     model = config.get("model", {})
     if model.get("kernel") != "rbf" or model.get("class_weight") != "balanced":
         raise ValueError("Model must be balanced RBF-SVC")
@@ -882,12 +892,60 @@ def _interval_union_seconds(frame: pd.DataFrame) -> float:
     return float(total)
 
 
+def _consecutive_alarm_mask(
+    frame: pd.DataFrame,
+    *,
+    minimum_positive_windows: int,
+    consecutive_stride_samples: int,
+) -> pd.Series:
+    """Mark positive windows that belong to a sufficiently long consecutive run."""
+
+    minimum = int(minimum_positive_windows)
+    stride = int(consecutive_stride_samples)
+    if minimum < 1:
+        raise ValueError("minimum_positive_windows must be at least one")
+    if stride < 1:
+        raise ValueError("consecutive_stride_samples must be positive")
+    if minimum == 1:
+        return frame["y_pred"].astype(int).eq(1)
+    if "start_index" not in frame.columns:
+        raise ValueError("start_index is required for consecutive alarm confirmation")
+
+    confirmed = pd.Series(False, index=frame.index, dtype=bool)
+    for _, group in frame.groupby("record_id", sort=False):
+        ordered = group.sort_values("start_index", kind="stable")
+        run: list[Any] = []
+        previous_start: int | None = None
+
+        def confirm_run() -> None:
+            if len(run) >= minimum:
+                confirmed.loc[run] = True
+
+        for index, row in ordered.iterrows():
+            start = int(row["start_index"])
+            positive = int(row["y_pred"]) == 1
+            if positive:
+                if run and previous_start is not None and start - previous_start == stride:
+                    run.append(index)
+                else:
+                    confirm_run()
+                    run = [index]
+            else:
+                confirm_run()
+                run = []
+            previous_start = start
+        confirm_run()
+    return confirmed
+
+
 def evaluate_events(
     predictions: pd.DataFrame,
     event_manifest: pd.DataFrame,
     *,
     merge_gap_sec: float,
     false_alarm_merge_scope: str = "record_and_allocation_group",
+    minimum_consecutive_positive_windows: int = 1,
+    consecutive_stride_samples: int = 64,
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
     """Evaluate original annotated events and role-0 false-alarm episodes."""
 
@@ -911,7 +969,12 @@ def evaluate_events(
         ]
         if candidates.empty:
             continue
-        detected = bool((candidates["y_pred"] == 1).any())
+        confirmed = _consecutive_alarm_mask(
+            candidates,
+            minimum_positive_windows=minimum_consecutive_positive_windows,
+            consecutive_stride_samples=consecutive_stride_samples,
+        )
+        detected = bool(confirmed.any())
         details.append(
             {
                 "subject_id": subject,
@@ -920,7 +983,8 @@ def evaluate_events(
                 "start_time_sec": float(event.start_time_sec),
                 "end_time_sec": float(event.end_time_sec),
                 "test_window_count": int(len(candidates)),
-                "positive_window_count": int((candidates["y_pred"] == 1).sum()),
+                "raw_positive_window_count": int((candidates["y_pred"] == 1).sum()),
+                "confirmed_positive_window_count": int(confirmed.sum()),
                 "maximum_prob_fog": float(candidates["prob_fog"].max()),
                 "detected": detected,
             }
@@ -930,9 +994,13 @@ def evaluate_events(
     n_detected = int(event_details["detected"].sum()) if n_events else 0
 
     alarm_rows: list[dict[str, Any]] = []
-    positives = predictions.loc[
-        (predictions["role_code"] == 0) & (predictions["y_pred"] == 1)
-    ]
+    nonfog_predictions = predictions.loc[predictions["role_code"] == 0]
+    confirmed_nonfog = _consecutive_alarm_mask(
+        nonfog_predictions,
+        minimum_positive_windows=minimum_consecutive_positive_windows,
+        consecutive_stride_samples=consecutive_stride_samples,
+    )
+    positives = nonfog_predictions.loc[confirmed_nonfog]
     if false_alarm_merge_scope == "record_id":
         grouped_positives = positives.groupby("record_id", sort=False)
     elif false_alarm_merge_scope == "record_and_allocation_group":
@@ -998,13 +1066,19 @@ def evaluate_events(
         "false_alarms_per_hour": (
             float(len(alarms) / nonfog_hours) if nonfog_hours > 0 else float("nan")
         ),
-        "event_detection_rule": "any positive permanent-test pure-FoG window mapped to original annotated event",
+        "event_detection_rule": (
+            "at least the configured number of consecutive positive permanent-test pure-FoG windows within one annotated event"
+        ),
         "false_alarm_rule": (
             "merge positive role-0 windows within record when interval gap <= configured seconds"
             if false_alarm_merge_scope == "record_id"
             else "merge positive role-0 windows within record/allocation group when interval gap <= configured seconds"
         ),
         "false_alarm_merge_scope": false_alarm_merge_scope,
+        "minimum_consecutive_positive_windows": int(
+            minimum_consecutive_positive_windows
+        ),
+        "consecutive_stride_samples": int(consecutive_stride_samples),
         "merge_gap_sec": float(merge_gap_sec),
         "exposure_rule": "union of role-0 window intervals per record",
     }
@@ -1023,7 +1097,12 @@ def _job_fingerprint(
             "false_alarm_merge_scope", "record_and_allocation_group"
         )
     )
-    if feature_schema == "tf330_all5_30ch_v1":
+    minimum_alarm_windows = int(
+        config.get("evaluation", {}).get("event", {}).get(
+            "minimum_consecutive_positive_windows", 1
+        )
+    )
+    if feature_schema == "tf330_all5_30ch_v1" and minimum_alarm_windows == 1:
         implementation_sha256 = LEGACY_TF330_IMPLEMENTATION_SHA256
     elif threshold_rule == "validation_max_fog_f1":
         implementation_sha256 = LEGACY_TF120_F1_IMPLEMENTATION_SHA256
@@ -1045,7 +1124,9 @@ def _job_fingerprint(
     return {
         "format": "private-nbm-tf-svm-all5",
         "version": (
-            6
+            7
+            if minimum_alarm_windows > 1
+            else 6
             if feature_schema == "tf180_all5_30ch_6f_v1"
             else FEATURE_SCHEMA_VERSIONS[feature_schema]
             if threshold_rule == "validation_max_fog_f1"
@@ -1171,6 +1252,14 @@ def run_experiment(
             "false_alarm_merge_scope", "record_and_allocation_group"
         )
     )
+    minimum_consecutive_positive_windows = int(
+        config["evaluation"]["event"].get(
+            "minimum_consecutive_positive_windows", 1
+        )
+    )
+    consecutive_stride_samples = int(
+        config["evaluation"]["event"].get("consecutive_stride_samples", 64)
+    )
     epsilon = float(config["features"].get("epsilon", 1e-12))
 
     rows: list[dict[str, Any]] = []
@@ -1250,6 +1339,10 @@ def run_experiment(
                 event_manifest,
                 merge_gap_sec=merge_gap_sec,
                 false_alarm_merge_scope=false_alarm_merge_scope,
+                minimum_consecutive_positive_windows=(
+                    minimum_consecutive_positive_windows
+                ),
+                consecutive_stride_samples=consecutive_stride_samples,
             )
             test_metrics.update(event_metrics)
             test_metrics.update(
@@ -1394,6 +1487,9 @@ def run_experiment(
         "event_evaluations_across_folds": total_events,
         "detected_event_evaluations_across_folds": total_detected,
         "false_alarm_merge_scope": false_alarm_merge_scope,
+        "minimum_consecutive_positive_windows": (
+            minimum_consecutive_positive_windows
+        ),
         "run_root": str(run_root),
         "report_root": str(report_root),
         "e1_e3_table": str(report_root / "e1_e3_four_metric_main_table.md"),

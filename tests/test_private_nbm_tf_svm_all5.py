@@ -270,6 +270,67 @@ def test_record_merge_configuration_and_split_audit() -> None:
     assert result["job_count"] == 24
 
 
+def test_two_consecutive_positive_windows_confirm_events_and_false_alarms() -> None:
+    predictions = pd.DataFrame(
+        {
+            "subject_id": ["P01"] * 7,
+            "record_id": ["record_a"] * 7,
+            "allocation_group_id": [
+                "normal_a", "normal_a", "normal_b", "normal_b",
+                "fog_a", "fog_a", "fog_b",
+            ],
+            "window_id": ["n0", "n1", "n2", "n3", "f0", "f1", "f2"],
+            "role_code": [0, 0, 0, 0, 1, 1, 1],
+            "y_pred": [1, 0, 1, 1, 1, 1, 1],
+            "prob_fog": [0.8, 0.1, 0.7, 0.9, 0.8, 0.9, 0.8],
+            "start_index": [0, 64, 128, 192, 640, 704, 1280],
+            "start_time_sec": [0.0, 1.0, 2.0, 3.0, 10.0, 11.0, 20.0],
+            "end_time_sec": [2.0, 3.0, 4.0, 5.0, 12.0, 13.0, 22.0],
+        }
+    )
+    manifest = pd.DataFrame(
+        {
+            "subject_id": ["P01", "P01"],
+            "record_id": ["record_a", "record_a"],
+            "event_id": [0, 1],
+            "start_time_sec": [10.0, 20.0],
+            "end_time_sec": [13.0, 22.0],
+            "nbm_status": ["eligible", "eligible"],
+            "nbm_allocation_group_ids": ["fog_a", "fog_b"],
+            "nbm_connector_window_ids": ["", ""],
+        }
+    )
+
+    metrics, details, alarms = MODULE.evaluate_events(
+        predictions,
+        manifest,
+        merge_gap_sec=1.0,
+        false_alarm_merge_scope="record_id",
+        minimum_consecutive_positive_windows=2,
+        consecutive_stride_samples=64,
+    )
+
+    assert metrics["event_sensitivity"] == 0.5
+    assert metrics["n_false_alarm_episodes"] == 1
+    assert metrics["nonfog_exposure_hours"] == 5.0 / 3600.0
+    assert metrics["false_alarms_per_hour"] == 720.0
+    assert details["detected"].tolist() == [True, False]
+    assert alarms.iloc[0]["positive_window_count"] == 2
+
+
+def test_two_window_configuration_and_split_audit() -> None:
+    config, project_root = MODULE.load_config(
+        ROOT
+        / "configs"
+        / "private_nbm_tf_svm_all5_11f_grid_maxf1_recordmerge_2win.yaml"
+    )
+    result = MODULE.audit_dataset(config, project_root)
+
+    assert result["status"] == "PASS"
+    assert config["evaluation"]["event"]["minimum_consecutive_positive_windows"] == 2
+    assert result["job_count"] == 24
+
+
 def test_private_dataset_configuration_and_split_audit() -> None:
     config, project_root = MODULE.load_config(
         ROOT / "configs" / "private_nbm_tf_svm_all5.yaml"

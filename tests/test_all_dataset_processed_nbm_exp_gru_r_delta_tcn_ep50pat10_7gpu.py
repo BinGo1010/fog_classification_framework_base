@@ -37,6 +37,13 @@ def option_value(command: list[str], option: str) -> str:
     return command[command.index(option) + 1]
 
 
+def test_child_environment_uses_gnu_openmp() -> None:
+    environment = launcher.child_environment()
+    assert environment["MKL_THREADING_LAYER"] == "GNU"
+    assert "MKL_SERVICE_FORCE_INTEL" not in environment
+    assert environment["PYTHONPATH"].split(launcher.os.pathsep)[0] == str(REPO_ROOT)
+
+
 def test_fixed_contract_and_complete_job_grid() -> None:
     args = make_args()
     seeds, gpu_ids = launcher.validate_contract(args)

@@ -526,6 +526,77 @@ def _boolean_runs(values: np.ndarray) -> list[tuple[int, int]]:
     return [(int(start), int(end)) for start, end in edges.reshape(-1, 2)]
 
 
+def nonfog_false_alarm_metrics(
+    dataset: Any,
+    rows: RoleRows,
+    y_pred: np.ndarray,
+    merge_gap_seconds: float = 1.0,
+) -> dict[str, Any]:
+    """Count false alarms from positive decisions in true Non-FoG support.
+
+    One detector result is emitted per stride.  Its decision timestamp is the
+    window end.  A single positive role-0 decision starts an alarm; subsequent
+    positive decisions in the same record are merged when their decision-time
+    separation is <= ``merge_gap_seconds``.  Records are never bridged.
+    """
+
+    if len(rows) != len(y_pred):
+        raise ValueError("rows and y_pred length mismatch")
+    maximum_gap = int(round(float(merge_gap_seconds) * dataset.sampling_rate_hz))
+    by_record: dict[int, list[tuple[int, int, int, int]]] = defaultdict(list)
+    for rec_idx, start, end, role, label, prediction in zip(
+        rows.record_index, rows.start, rows.end, rows.role, rows.label, y_pred
+    ):
+        if int(role) not in (0, 1) or int(label) != int(role):
+            raise AssertionError("false-alarm scoring requires pure permanent-test roles0/1")
+        by_record[int(rec_idx)].append(
+            (int(start), int(end), int(role), int(prediction))
+        )
+
+    false_positive_decisions = 0
+    false_alarm_events = 0
+    evaluated_nonfog_samples = 0
+    for rec_idx, record_rows in by_record.items():
+        record = dataset.records[rec_idx]
+        coverage = np.zeros(len(record.y), dtype=bool)
+        positive_decision_samples: list[int] = []
+        for start, end, role, prediction in record_rows:
+            if role != 0:
+                continue
+            coverage[start:end] = True
+            if prediction == 1:
+                positive_decision_samples.append(end)
+        evaluated_nonfog_samples += int(
+            np.sum(coverage & record.valid & (record.y == 0))
+        )
+        decision_times = sorted(set(positive_decision_samples))
+        false_positive_decisions += len(decision_times)
+        previous: int | None = None
+        for decision_sample in decision_times:
+            if previous is None or decision_sample - previous > maximum_gap:
+                false_alarm_events += 1
+            previous = decision_sample
+
+    evaluated_nonfog_hours = evaluated_nonfog_samples / (
+        dataset.sampling_rate_hz * 3600.0
+    )
+    return {
+        "false_alarm_metric_version": "nonfog_positive_decision_FA.v1",
+        "false_alarm_merge_gap_seconds": float(merge_gap_seconds),
+        "false_alarm_minimum_positive_decisions": 1,
+        "false_alarm_decision_timestamp": "window end_index_exclusive",
+        "false_alarm_same_record_only": True,
+        "false_positive_decisions": int(false_positive_decisions),
+        "false_alarm_events": int(false_alarm_events),
+        "false_alarm_events_per_hour": (
+            false_alarm_events / evaluated_nonfog_hours
+            if evaluated_nonfog_hours
+            else None
+        ),
+        "evaluated_nonfog_hours": evaluated_nonfog_hours,
+    }
+
+
 def event_metrics(dataset: Any, rows: RoleRows, y_pred: np.ndarray, minimum_positive_windows: int = 2, merge_gap_seconds: float = 0.5) -> dict[str, Any]:
     by_record: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
     for rec_idx, start, end, pred in zip(rows.record_index, rows.start, rows.end, y_pred):
@@ -580,8 +651,9 @@ def event_metrics(dataset: Any, rows: RoleRows, y_pred: np.ndarray, minimum_posi
             true_detected += 1
             delays.append(max(0.0, (predicted[match][2] - true_start) / dataset.sampling_rate_hz))
         matched_predictions += len(matched)
-    false_alarms = predicted_total - matched_predictions
-    nonfog_hours = nonfog_seconds / 3600.0
+    false_alarm = nonfog_false_alarm_metrics(
+        dataset, rows, y_pred, merge_gap_seconds=1.0
+    )
     return {
         "event_metric_version": EVENT_METRIC_VERSION,
         "minimum_positive_windows": minimum_positive_windows,
@@ -589,12 +661,10 @@ def event_metrics(dataset: Any, rows: RoleRows, y_pred: np.ndarray, minimum_posi
         "evaluable_true_events": true_total,
         "detected_true_events": true_detected,
         "predicted_events": predicted_total,
-        "false_alarm_events": false_alarms,
         "event_sensitivity": true_detected / true_total if true_total else None,
-        "false_alarm_events_per_hour": false_alarms / nonfog_hours if nonfog_hours else None,
-        "evaluated_nonfog_hours": nonfog_hours,
         "median_detection_delay_sec": float(np.median(delays)) if delays else None,
         "mean_detection_delay_sec": float(np.mean(delays)) if delays else None,
+        **false_alarm,
     }
 
 

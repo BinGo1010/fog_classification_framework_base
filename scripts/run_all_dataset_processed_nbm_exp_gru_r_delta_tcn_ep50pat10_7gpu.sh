@@ -4,6 +4,11 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# The server PyTorch build uses GNU OpenMP (libgomp); MKL must use the same
+# threading layer in the launcher and every child process.
+export MKL_THREADING_LAYER=GNU
+unset MKL_SERVICE_FORCE_INTEL || true
+
 DATA_DIR="${1:-dataset/All_dataset/processed_NBM_Exp}"
 if [[ $# -gt 0 ]]; then
   shift

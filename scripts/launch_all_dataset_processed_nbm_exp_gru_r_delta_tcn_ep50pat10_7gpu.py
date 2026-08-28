@@ -5,11 +5,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# PyTorch wheels on the target servers load GNU OpenMP (libgomp).  Force MKL
+# to use that same threading runtime before importing the training worker.
+os.environ["MKL_THREADING_LAYER"] = "GNU"
+os.environ.pop("MKL_SERVICE_FORCE_INTEL", None)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -282,6 +288,18 @@ def single_command(
     return [args.python, str(WORKER), "--stage", stage, *common_args(args, seeds)]
 
 
+def child_environment() -> dict[str, str]:
+    """Return a subprocess environment compatible with PyTorch's libgomp."""
+    environment = os.environ.copy()
+    environment["MKL_THREADING_LAYER"] = "GNU"
+    environment.pop("MKL_SERVICE_FORCE_INTEL", None)
+    existing_pythonpath = environment.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = str(REPO_ROOT) + (
+        os.pathsep + existing_pythonpath if existing_pythonpath else ""
+    )
+    return environment
+
+
 def main() -> None:
     args = parse_args()
     args.data_dir = args.data_dir.resolve()
@@ -306,7 +324,10 @@ def main() -> None:
     if args.phase in ("full", "train"):
         run_pool("train", train_jobs, gpu_ids, args.output_root)
         subprocess.run(
-            single_command(args, seeds, "seal"), cwd=REPO_ROOT, check=True
+            single_command(args, seeds, "seal"),
+            cwd=REPO_ROOT,
+            check=True,
+            env=child_environment(),
         )
     if args.phase in ("full", "evaluate"):
         if not (args.output_root / "TRAINING_BARRIER.json").is_file():
@@ -316,7 +337,10 @@ def main() -> None:
         run_pool("evaluate", evaluate_jobs, gpu_ids, args.output_root)
     if args.phase in ("full", "evaluate", "aggregate"):
         subprocess.run(
-            single_command(args, seeds, "aggregate"), cwd=REPO_ROOT, check=True
+            single_command(args, seeds, "aggregate"),
+            cwd=REPO_ROOT,
+            check=True,
+            env=child_environment(),
         )
 
 

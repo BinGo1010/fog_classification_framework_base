@@ -15,6 +15,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# mkl-service must initialize before PyTorch loads GNU OpenMP on Linux.
+import numpy as np
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

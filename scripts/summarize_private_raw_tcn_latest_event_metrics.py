@@ -3,9 +3,10 @@
 The permanent-test predictions are read only.  Within each record, positive
 window intervals are merged when their temporal supports overlap or their gap
 is at most one second, irrespective of allocation-group boundaries.  Records
-are never merged.  False alarms are constructed exclusively from positive
-predictions on evaluated, truly Non-FoG windows.  An isolated positive window
-is retained as one false-alarm event.
+are never merged.  A merged cluster forms an alarm only when it contains at
+least two positive windows; isolated positive windows are discarded.  False
+alarms are constructed exclusively from alarms on evaluated, truly Non-FoG
+windows.
 """
 
 from __future__ import annotations
@@ -41,12 +42,13 @@ DEFAULT_EXPERIMENT_ROOT = (
 DEFAULT_OUTPUT_DIR = (
     REPO_ROOT
     / "outputs"
-    / "processed_NBM_Exp_raw_tcn_latest_event_metrics_1s"
+    / "processed_NBM_Exp_raw_tcn_latest_event_metrics_1s_min2"
 )
 SUBJECTS = tuple(f"P{index:02d}" for index in range(1, 9))
 FOLDS = (0, 1, 2)
 SEEDS = (0, 52, 161, 5216, 52161)
 MERGE_GAP_SECONDS = 1.0
+MINIMUM_POSITIVE_WINDOWS = 2
 EXPECTED_WINDOW_SECONDS = 2.0
 
 
@@ -243,6 +245,11 @@ def evaluate_run(
         positive_fog_rows = [
             row for row in record_rows if row["y_true"] == 1 and row["y_pred"] == 1
         ]
+        positive_fog_alarms = [
+            event
+            for event in merge_intervals(positive_fog_rows, maximum_gap_samples)
+            if int(event["positive_window_count"]) >= MINIMUM_POSITIVE_WINDOWS
+        ]
         true_events = [
             interval
             for interval in boolean_runs(record.y == 1)
@@ -251,10 +258,23 @@ def evaluate_run(
         ]
         evaluable_true_events += len(true_events)
         for true_start, true_end in true_events:
-            detected = any(
-                max(true_start, row["start"]) < min(true_end, row["end"])
-                for row in positive_fog_rows
-            )
+            matching_alarms = [
+                event
+                for event in positive_fog_alarms
+                if max(true_start, int(event["start"]))
+                < min(true_end, int(event["end"]))
+            ]
+            detected = bool(matching_alarms)
+            matching_window_ids = {
+                window_id
+                for alarm in matching_alarms
+                for window_id in alarm["window_ids"]
+            }
+            matching_groups = {
+                group
+                for alarm in matching_alarms
+                for group in alarm["allocation_groups"]
+            }
             detected_true_events += int(detected)
             event_audit.append(
                 {
@@ -265,18 +285,9 @@ def evaluate_run(
                     "event_type": "reference_fog",
                     "start_index": true_start,
                     "end_index_exclusive": true_end,
-                    "positive_window_count": sum(
-                        max(true_start, row["start"]) < min(true_end, row["end"])
-                        for row in positive_fog_rows
-                    ),
-                    "allocation_group_count": len(
-                        {
-                            row["allocation_group_id"]
-                            for row in positive_fog_rows
-                            if max(true_start, row["start"]) < min(true_end, row["end"])
-                        }
-                    ),
-                    "cross_allocation_group": False,
+                    "positive_window_count": len(matching_window_ids),
+                    "allocation_group_count": len(matching_groups),
+                    "cross_allocation_group": len(matching_groups) > 1,
                     "detected": detected,
                 }
             )
@@ -284,9 +295,19 @@ def evaluate_run(
         positive_nonfog_rows = [
             row for row in record_rows if row["y_true"] == 0 and row["y_pred"] == 1
         ]
-        merged_false_alarms = merge_intervals(
+        nonfog_positive_clusters = merge_intervals(
             positive_nonfog_rows, maximum_gap_samples
         )
+        merged_false_alarms = [
+            event
+            for event in nonfog_positive_clusters
+            if int(event["positive_window_count"]) >= MINIMUM_POSITIVE_WINDOWS
+        ]
+        discarded_isolated = [
+            event
+            for event in nonfog_positive_clusters
+            if int(event["positive_window_count"]) < MINIMUM_POSITIVE_WINDOWS
+        ]
         false_alarm_events += len(merged_false_alarms)
         cross_group_false_alarm_events += sum(
             int(event["cross_allocation_group"]) for event in merged_false_alarms
@@ -299,6 +320,22 @@ def evaluate_run(
                     "seed": seed,
                     "record_id": record_id,
                     "event_type": "false_alarm",
+                    "start_index": event["start"],
+                    "end_index_exclusive": event["end"],
+                    "positive_window_count": event["positive_window_count"],
+                    "allocation_group_count": event["allocation_group_count"],
+                    "cross_allocation_group": event["cross_allocation_group"],
+                    "detected": "",
+                }
+            )
+        for event in discarded_isolated:
+            event_audit.append(
+                {
+                    "subject": subject,
+                    "fold": fold,
+                    "seed": seed,
+                    "record_id": record_id,
+                    "event_type": "discarded_isolated_nonfog_positive",
                     "start_index": event["start"],
                     "end_index_exclusive": event["end"],
                     "positive_window_count": event["positive_window_count"],
@@ -324,6 +361,11 @@ def evaluate_run(
             "false_alarm_events": false_alarm_events,
             "cross_allocation_group_false_alarm_events": cross_group_false_alarm_events,
             "evaluated_nonfog_hours": nonfog_hours,
+            "minimum_positive_windows_per_alarm": MINIMUM_POSITIVE_WINDOWS,
+            "discarded_isolated_nonfog_positive_clusters": sum(
+                row["event_type"] == "discarded_isolated_nonfog_positive"
+                for row in event_audit
+            ),
             "test_windows": len(parsed),
             "test_nonfog_windows": int(np.sum(labels == 0)),
             "test_fog_windows": int(np.sum(labels == 1)),
@@ -442,6 +484,33 @@ def main() -> None:
         output_dir / "raw_tcn_subject_AP_EventSensitivity_FAh_mean_sd_4sig.csv",
         formatted_summary,
     )
+    fah_summary = [
+        {
+            "subject": row["subject"],
+            "false_alarms_per_hour_mean": f"{row['false_alarms_per_hour_mean']:.3f}",
+            "false_alarms_per_hour_sd": f"{row['false_alarms_per_hour_sd']:.3f}",
+        }
+        for row in unrounded_summary
+    ]
+    macro_fah_by_seed = [
+        mean(
+            row["false_alarms_per_hour"]
+            for row in subject_seed_rows
+            if row["seed"] == seed
+        )
+        for seed in SEEDS
+    ]
+    fah_summary.append(
+        {
+            "subject": "MACRO",
+            "false_alarms_per_hour_mean": f"{np.mean(macro_fah_by_seed):.3f}",
+            "false_alarms_per_hour_sd": f"{np.std(macro_fah_by_seed, ddof=0):.3f}",
+        }
+    )
+    write_csv(
+        output_dir / "raw_tcn_subject_FAh_mean_sd_3dec.csv",
+        fah_summary,
+    )
     write_csv(output_dir / "raw_tcn_event_audit.csv", event_rows)
     metadata = {
         "schema": "private_raw_tcn_latest_event_metrics.v1",
@@ -454,15 +523,18 @@ def main() -> None:
         "run_count": len(fold_rows),
         "ap_definition": "sklearn.metrics.average_precision_score on sealed test windows",
         "event_sensitivity_definition": (
-            "number of evaluable contiguous reference FoG events overlapped by at least "
-            "one FoG-positive pure-FoG test window divided by evaluable reference events"
+            "number of evaluable contiguous reference FoG events overlapped by a merged "
+            "alarm containing at least two positive pure-FoG test windows divided by "
+            "evaluable reference events"
         ),
         "false_alarm_definition": (
             "FoG-positive predictions on pure Non-FoG test windows; within each record, "
             "2-s window supports that overlap or have a gap <=1 s are one false alarm; "
-            "an isolated positive is retained; records never merge; allocation-group "
+            "a merged cluster must contain at least two positive windows; isolated "
+            "positive windows are discarded; records never merge; allocation-group "
             "boundaries are ignored"
         ),
+        "minimum_positive_windows_per_alarm": MINIMUM_POSITIVE_WINDOWS,
         "false_alarm_denominator": (
             "union duration of evaluated test-window coverage intersected with valid true "
             "Non-FoG samples, converted to hours"
@@ -485,6 +557,7 @@ def main() -> None:
         "raw_tcn_subject_seed_metrics_unrounded.csv",
         "raw_tcn_subject_summary_unrounded.csv",
         "raw_tcn_subject_AP_EventSensitivity_FAh_mean_sd_4sig.csv",
+        "raw_tcn_subject_FAh_mean_sd_3dec.csv",
         "raw_tcn_event_audit.csv",
     ):
         metadata["output_sha256"][name] = sha256_file(output_dir / name)
