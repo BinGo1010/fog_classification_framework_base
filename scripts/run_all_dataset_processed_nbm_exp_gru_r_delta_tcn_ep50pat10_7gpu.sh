@@ -11,11 +11,12 @@ fi
 
 python scripts/launch_all_dataset_processed_nbm_exp_gru_r_delta_tcn_ep50pat10_7gpu.py \
   --data-dir "$DATA_DIR" \
-  --source-root outputs/all_dataset_processed_NBM_Exp_within_subject_gru_base_mask4_8_C_tcn_nbm300pat20_ep5pat2_seedset_0_52_161_5216_52161 \
-  --output-root outputs/all_dataset_processed_NBM_Exp_within_subject_gru_base_mask4_8_r_delta_tcn_source_nbm300pat20_ep50pat10_seedset_0_52_161_5216_52161 \
+  --output-root outputs/all_dataset_processed_NBM_Exp_within_subject_gru_base_mask4_8_r_delta_tcn_nbm300pat20_ep50pat10_seedset_0_52_161_5216_52161 \
   --gpu-ids 0,1,2,3,4,5,6 \
   --seeds 0,52,161,5216,52161 \
   --batch-size 128 \
+  --nbm-max-epochs 300 \
+  --nbm-patience 20 \
   --tcn-max-epochs 50 \
   --tcn-patience 10 \
   --phase full \
