@@ -25,6 +25,12 @@ DEFAULT_RESULTS = (
     else REPO_ROOT / "outputs" / "private_gru_ngm_robustness_matched_tcn"
 )
 DEFAULT_OUTPUT = REPO_ROOT / "outputs" / "private_gru_ngm_robustness_figures"
+EXPECTED_GAUSSIAN_LEVELS = (0.0, 0.02, 0.04, 0.08, 0.12)
+EXPECTED_MASK_LEVELS = (0.0, 0.025, 0.05, 0.10, 0.15)
+GAUSSIAN_X_TICKS = (0.0, 0.02, 0.04, 0.08, 0.12)
+MASK_X_TICKS = (0.0, 0.025, 0.05, 0.10, 0.15)
+MASK_X_TICK_LABELS = ("0", "2.5", "5", "10", "15")
+SHOW_PANEL_LABELS = False
 
 # ============================================================================
 # USER-EDITABLE PLOT SETTINGS
@@ -55,6 +61,8 @@ PLOT_STYLE = {
     "axis_label_size": 15,
     # 分面标题字体大小；当前标题为空，因此暂不显示。
     "title_size": 9.5,
+    # 合并图左上角分面编号的字体大小。
+    "panel_label_size": 9.5,
     # 分面标题字重，可设为 "normal" 或 "bold"。
     "title_weight": "bold",
     # 横纵坐标刻度数字的字体大小，单位为 pt。
@@ -145,6 +153,21 @@ def numeric(rows: list[dict[str, Any]], name: str) -> np.ndarray:
     return values
 
 
+def validate_levels(
+    rows: list[dict[str, Any]],
+    name: str,
+    expected: tuple[float, ...],
+) -> None:
+    actual = numeric(rows, name)
+    reference = np.asarray(expected, dtype=np.float64)
+    if actual.shape != reference.shape or not np.allclose(
+        actual, reference, rtol=0.0, atol=1e-12
+    ):
+        raise AssertionError(
+            f"unexpected {name} grid: {actual.tolist()} != {reference.tolist()}"
+        )
+
+
 def configure_matplotlib() -> None:
     plt.rcParams.update(
         {
@@ -217,11 +240,18 @@ def plot_curves(
         )
 
 
-def decorate_axes(ax: plt.Axes, show_ylabel: bool = True) -> None:
+def decorate_axes(
+    ax: plt.Axes,
+    show_ylabel: bool = True,
+    y_limits: tuple[float, float] | None = None,
+    y_ticks: np.ndarray | tuple[float, ...] | None = None,
+) -> None:
     if show_ylabel:
         ax.set_ylabel(PLOT_TEXT["ylabel"])
-    ax.set_ylim(*PLOT_STYLE["y_limits"])
-    ax.set_yticks(PLOT_STYLE["y_ticks"])
+    limits = PLOT_STYLE["y_limits"] if y_limits is None else y_limits
+    ticks = PLOT_STYLE["y_ticks"] if y_ticks is None else y_ticks
+    ax.set_ylim(*limits)
+    ax.set_yticks(ticks)
     ax.grid(
         True,
         which="major",
@@ -239,18 +269,20 @@ def save_figure(
     output_dir: Path,
     stem: str,
     dpi: int,
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     png = output_dir / f"{stem}.png"
     pdf = output_dir / f"{stem}.pdf"
+    svg = output_dir / f"{stem}.svg"
     fig.savefig(png, dpi=dpi, bbox_inches="tight", facecolor="white")
     fig.savefig(pdf, bbox_inches="tight", facecolor="white")
-    return png, pdf
+    fig.savefig(svg, bbox_inches="tight", facecolor="white")
+    return png, pdf, svg
 
 
 def plot_gaussian(
     rows: list[dict[str, Any]], output_dir: Path, dpi: int, band: str
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path, Path]:
     fig, ax = plt.subplots(
         figsize=PLOT_STYLE["figure_size"], constrained_layout=True
     )
@@ -262,14 +294,20 @@ def plot_gaussian(
         PLOT_STYLE["gaussian_band_alpha"],
         "gaussian",
     )
-    ax.set_xticks([0.00, 0.02, 0.04, 0.08, 0.12])
+    ax.set_xticks(GAUSSIAN_X_TICKS)
     ax.set_xlim(*PLOT_STYLE["gaussian_x_limits"])
     ax.set_xlabel(PLOT_TEXT["gaussian_xlabel"])
     if PLOT_TEXT["gaussian_title"]:
         ax.set_title(PLOT_TEXT["gaussian_title"])
-    decorate_axes(ax)
+    decorate_axes(
+        ax,
+        y_limits=PLOT_STYLE.get("gaussian_y_limits"),
+        y_ticks=PLOT_STYLE.get("gaussian_y_ticks"),
+    )
     ax.legend(
-        loc=PLOT_STYLE["gaussian_legend_location"],
+        loc="lower left",
+        bbox_to_anchor=(0.0, 1.015),
+        borderaxespad=0.0,
         frameon=PLOT_STYLE["legend_frame"],
         framealpha=PLOT_STYLE["legend_frame_alpha"],
         edgecolor=PLOT_STYLE["legend_edge_color"],
@@ -289,7 +327,7 @@ def plot_gaussian(
 
 def plot_mask(
     rows: list[dict[str, Any]], output_dir: Path, dpi: int, band: str
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path, Path]:
     fig, ax = plt.subplots(
         figsize=PLOT_STYLE["figure_size"], constrained_layout=True
     )
@@ -301,15 +339,20 @@ def plot_mask(
         PLOT_STYLE["mask_band_alpha"],
         "mask",
     )
-    positions = np.asarray([0.00, 0.025, 0.05, 0.10, 0.15])
-    ax.set_xticks(positions, ["0", "2.5", "5", "10", "15"])
+    ax.set_xticks(MASK_X_TICKS, MASK_X_TICK_LABELS)
     ax.set_xlim(*PLOT_STYLE["mask_x_limits"])
     ax.set_xlabel(PLOT_TEXT["mask_xlabel"])
     if PLOT_TEXT["mask_title"]:
         ax.set_title(PLOT_TEXT["mask_title"])
-    decorate_axes(ax)
+    decorate_axes(
+        ax,
+        y_limits=PLOT_STYLE.get("mask_y_limits"),
+        y_ticks=PLOT_STYLE.get("mask_y_ticks"),
+    )
     ax.legend(
-        loc=PLOT_STYLE["mask_legend_location"],
+        loc="lower left",
+        bbox_to_anchor=(0.0, 1.015),
+        borderaxespad=0.0,
         frameon=PLOT_STYLE["legend_frame"],
         framealpha=PLOT_STYLE["legend_frame_alpha"],
         edgecolor=PLOT_STYLE["legend_edge_color"],
@@ -333,7 +376,7 @@ def plot_combined(
     output_dir: Path,
     dpi: int,
     band: str,
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path, Path]:
     fig, axes = plt.subplots(
         2,
         1,
@@ -349,7 +392,7 @@ def plot_combined(
         PLOT_STYLE["gaussian_band_alpha"],
         "gaussian",
     )
-    gaussian_ax.set_xticks([0.00, 0.02, 0.04, 0.08, 0.12])
+    gaussian_ax.set_xticks(GAUSSIAN_X_TICKS)
     gaussian_ax.set_xlim(*PLOT_STYLE["gaussian_x_limits"])
     gaussian_ax.set_xlabel(PLOT_TEXT["gaussian_xlabel"])
     decorate_axes(gaussian_ax, show_ylabel=False)
@@ -362,8 +405,7 @@ def plot_combined(
         PLOT_STYLE["mask_band_alpha"],
         "mask",
     )
-    mask_positions = np.asarray([0.00, 0.025, 0.05, 0.10, 0.15])
-    mask_ax.set_xticks(mask_positions, ["0", "2.5", "5", "10", "15"])
+    mask_ax.set_xticks(MASK_X_TICKS, MASK_X_TICK_LABELS)
     mask_ax.set_xlim(*PLOT_STYLE["mask_x_limits"])
     mask_ax.set_xlabel(PLOT_TEXT["mask_xlabel"])
     decorate_axes(mask_ax, show_ylabel=False)
@@ -372,18 +414,34 @@ def plot_combined(
         x=0.025,
         fontsize=PLOT_STYLE["axis_label_size"],
     )
-    gaussian_ax.legend(
+    handles, labels = gaussian_ax.get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
         loc="upper left",
+        bbox_to_anchor=(0.15, 0.995),
         ncol=1,
         frameon=PLOT_STYLE["legend_frame"],
         framealpha=PLOT_STYLE["legend_frame_alpha"],
         edgecolor=PLOT_STYLE["legend_edge_color"],
         fontsize=PLOT_STYLE["legend_font_size"],
     )
+    if SHOW_PANEL_LABELS:
+        for ax, label in zip(axes, ("a", "b")):
+            ax.text(
+                0.0,
+                1.015,
+                label,
+                transform=ax.transAxes,
+                fontsize=PLOT_STYLE["panel_label_size"],
+                fontweight="bold",
+                ha="left",
+                va="bottom",
+            )
     fig.subplots_adjust(
         left=0.15,
         right=0.985,
-        top=0.99,
+        top=0.88,
         bottom=0.09,
         hspace=0.27,
     )
@@ -401,8 +459,10 @@ def main() -> None:
     configure_matplotlib()
     gaussian_rows = read_csv(results_dir / "FIG1_GAUSSIAN_NOISE_AP.csv")
     mask_rows = read_csv(results_dir / "FIG2_TEMPORAL_MASK_AP.csv")
-    if len(gaussian_rows) != 5 or len(mask_rows) != 5:
-        raise AssertionError("each robustness figure requires exactly five x levels")
+    validate_levels(
+        gaussian_rows, "sigma_test", EXPECTED_GAUSSIAN_LEVELS
+    )
+    validate_levels(mask_rows, "rho_mask", EXPECTED_MASK_LEVELS)
     gaussian_paths = plot_gaussian(
         gaussian_rows, output_dir, args.dpi, args.band
     )
