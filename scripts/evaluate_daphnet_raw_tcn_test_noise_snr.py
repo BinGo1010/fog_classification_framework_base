@@ -65,7 +65,8 @@ from scripts.run_daphnet_processed_nbm_centered_residual_tcn import (
 from scripts.run_daphnet_s01_nonfog_gru_reconstruction_tcnm import save_npz
 
 REQUIRED_SEEDS = (0, 52, 161, 5216, 52161)
-SNR_LEVELS = (30, 20, 10, 0)
+SUPPORTED_SNR_LEVELS = (30, 20, 15, 12, 10, 0)
+DEFAULT_SNR_LEVELS = (30, 20, 10, 0)
 PRIMARY_METRICS = (
     "accuracy",
     "balanced_accuracy",
@@ -123,7 +124,7 @@ def resolve_device(value: str) -> torch.device:
 
 def noise_seed(fold: int, snr_db: int) -> int:
     """Intentionally independent of the frozen model seed."""
-    if fold not in FOLDS or snr_db not in SNR_LEVELS:
+    if fold not in FOLDS or snr_db not in SUPPORTED_SNR_LEVELS:
         raise ValueError(f"unsupported fold/SNR: {fold}/{snr_db}")
     return 7_310_000 + fold * 100 + snr_db
 
@@ -260,8 +261,10 @@ def subject_metrics(
 def run_evaluate(args: argparse.Namespace) -> None:
     if args.fold not in FOLDS or args.seed not in REQUIRED_SEEDS:
         raise ValueError("evaluate requires a valid --fold and one of the five seeds")
-    if args.snr_db not in SNR_LEVELS:
-        raise ValueError(f"evaluate requires --snr-db in {SNR_LEVELS}")
+    if args.snr_db not in SUPPORTED_SNR_LEVELS:
+        raise ValueError(
+            f"evaluate requires --snr-db in {SUPPORTED_SNR_LEVELS}"
+        )
     if args.batch_size != SOURCE_BATCH_SIZE:
         raise ValueError(f"this evaluation requires batch_size={SOURCE_BATCH_SIZE}")
 
@@ -418,8 +421,17 @@ def clean_result(source_root: Path, fold: int, seed: int) -> dict[str, Any]:
 def run_aggregate(args: argparse.Namespace) -> None:
     seeds = parse_csv_ints(args.seeds)
     snr_levels = parse_csv_ints(args.snr_levels)
-    if seeds != REQUIRED_SEEDS or snr_levels != SNR_LEVELS:
-        raise ValueError("aggregate requires exact five seeds and SNR 30,20,10,0")
+    if seeds != REQUIRED_SEEDS:
+        raise ValueError("aggregate requires exact five model seeds")
+    if (
+        not snr_levels
+        or len(snr_levels) != len(set(snr_levels))
+        or any(value not in SUPPORTED_SNR_LEVELS for value in snr_levels)
+    ):
+        raise ValueError(
+            "SNR levels must be a non-empty unique subset of "
+            f"{SUPPORTED_SNR_LEVELS}"
+        )
     root = args.output_root.resolve()
     source_root = args.source_root.resolve()
     run_rows: list[dict[str, Any]] = []
@@ -516,7 +528,7 @@ def run_aggregate(args: argparse.Namespace) -> None:
                 row[f"{metric}_std"] = value["std"]
             subject_rows.append(row)
 
-    write_csv(root / "run_metrics_75.csv", run_rows)
+    write_csv(root / "run_metrics.csv", run_rows)
     write_csv(root / "seed_macro_over_3folds.csv", seed_rows)
     write_csv(root / "subject_summary.csv", subject_rows)
     payload = {
@@ -537,7 +549,7 @@ def run_aggregate(args: argparse.Namespace) -> None:
         {
             "status": "complete",
             "completed_utc": payload["completed_utc"],
-            "noise_run_count": 60,
+            "noise_run_count": len(snr_levels) * len(FOLDS) * len(seeds),
             "clean_reference_run_count": 15,
             "summary_sha256": sha256_file(root / "summary.json"),
         },

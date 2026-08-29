@@ -26,7 +26,8 @@ if str(REPO_ROOT) not in sys.path:
 WORKER = REPO_ROOT / "scripts" / "evaluate_daphnet_raw_tcn_test_noise_snr.py"
 FOLDS = (0, 1, 2)
 SEEDS = (0, 52, 161, 5216, 52161)
-SNR_LEVELS = (30, 20, 10, 0)
+SUPPORTED_SNR_LEVELS = (30, 20, 15, 12, 10, 0)
+DEFAULT_SNR_LEVELS = (30, 20, 10, 0)
 DEFAULT_SOURCE = (
     REPO_ROOT
     / "outputs"
@@ -76,6 +77,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument(
+        "--snr-levels",
+        default=",".join(str(value) for value in DEFAULT_SNR_LEVELS),
+        help=(
+            "Comma-separated unique subset of 30,20,15,12,10,0. "
+            "For the additional experiment use --snr-levels 15,12."
+        ),
+    )
+    parser.add_argument(
         "--phase", choices=("full", "evaluate", "aggregate"), default="full"
     )
     parser.add_argument("--overwrite", action="store_true")
@@ -94,6 +103,22 @@ def gpu_ids(value: str, check_hardware: bool) -> list[str]:
         if any(int(item) >= count for item in ids):
             raise ValueError(f"requested GPUs {ids}, but only {count} are visible")
     return ids
+
+
+def selected_snr_levels(args: argparse.Namespace) -> tuple[int, ...]:
+    values = tuple(
+        int(item.strip()) for item in args.snr_levels.split(",") if item.strip()
+    )
+    if (
+        not values
+        or len(values) != len(set(values))
+        or any(value not in SUPPORTED_SNR_LEVELS for value in values)
+    ):
+        raise ValueError(
+            "--snr-levels must be a non-empty unique subset of "
+            f"{SUPPORTED_SNR_LEVELS}"
+        )
+    return values
 
 
 def source_artifact_manifest(args: argparse.Namespace) -> dict[str, Any]:
@@ -137,6 +162,7 @@ def plan_payload(
     args: argparse.Namespace,
     source_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    snr_levels = selected_snr_levels(args)
     return {
         "schema": "daphnet_raw_tcn_test_noise_plan.v1",
         "data_dir": str(args.data_dir.resolve()),
@@ -144,8 +170,8 @@ def plan_payload(
         "scaler_source_root": str(args.scaler_source_root.resolve()),
         "folds": list(FOLDS),
         "model_seeds": list(SEEDS),
-        "snr_db": list(SNR_LEVELS),
-        "evaluation_job_count": len(FOLDS) * len(SEEDS) * len(SNR_LEVELS),
+        "snr_db": list(snr_levels),
+        "evaluation_job_count": len(FOLDS) * len(SEEDS) * len(snr_levels),
         "training_job_count": 0,
         "batch_size": int(args.batch_size),
         "threshold_policy": "reuse each frozen clean-validation threshold",
@@ -176,6 +202,7 @@ def ensure_plan(args: argparse.Namespace, *, validate_source: bool) -> dict[str,
 
 
 def common_args(args: argparse.Namespace) -> list[str]:
+    snr_levels = selected_snr_levels(args)
     values = [
         "--data-dir", str(args.data_dir.resolve()),
         "--source-root", str(args.source_root.resolve()),
@@ -183,7 +210,7 @@ def common_args(args: argparse.Namespace) -> list[str]:
         "--output-root", str(args.output_root.resolve()),
         "--batch-size", str(args.batch_size),
         "--seeds", ",".join(str(value) for value in SEEDS),
-        "--snr-levels", ",".join(str(value) for value in SNR_LEVELS),
+        "--snr-levels", ",".join(str(value) for value in snr_levels),
     ]
     if args.overwrite:
         values.append("--overwrite")
@@ -215,12 +242,13 @@ def aggregate_command(args: argparse.Namespace) -> list[str]:
 
 
 def evaluation_jobs(args: argparse.Namespace) -> list[dict[str, Any]]:
+    snr_levels = selected_snr_levels(args)
     return [
         {
             "id": f"snr{snr_db}_fold{fold}_seed{seed}",
             "command": evaluate_command(args, fold, seed, snr_db),
         }
-        for snr_db in SNR_LEVELS
+        for snr_db in snr_levels
         for fold in FOLDS
         for seed in SEEDS
     ]

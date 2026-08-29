@@ -35,7 +35,7 @@ def test_noise_is_deterministic_and_model_seed_independent() -> None:
 
 def test_noise_realized_snr_is_close_to_requested_level() -> None:
     raw = synthetic_raw(512)
-    for snr_db in worker.SNR_LEVELS:
+    for snr_db in worker.SUPPORTED_SNR_LEVELS:
         noisy, contract = worker.add_gaussian_noise_at_snr(raw, snr_db, 1)
         assert noisy.shape == raw.shape
         assert noisy.dtype == np.float32
@@ -81,6 +81,7 @@ def test_launcher_pool_jobs_use_scheduler_dictionary_contract() -> None:
             "scaler_source_root": REPO_ROOT / "scalers",
             "output_root": REPO_ROOT / "output",
             "batch_size": 128,
+            "snr_levels": "30,20,10,0",
             "overwrite": False,
         },
     )()
@@ -102,6 +103,7 @@ def test_launcher_commands_freeze_expected_source_and_threshold_policy() -> None
             "scaler_source_root": REPO_ROOT / "scalers",
             "output_root": REPO_ROOT / "output",
             "batch_size": 128,
+            "snr_levels": "30,20,10,0",
             "overwrite": False,
         },
     )()
@@ -119,6 +121,26 @@ def test_noise_seed_changes_by_fold_and_snr() -> None:
     values = {
         worker.noise_seed(fold, snr)
         for fold in worker.FOLDS
-        for snr in worker.SNR_LEVELS
+        for snr in worker.SUPPORTED_SNR_LEVELS
     }
-    assert len(values) == 12
+    assert len(values) == 18
+
+
+def test_additional_snr15_snr12_grid_has_thirty_jobs() -> None:
+    parser_args = type(
+        "Args",
+        (),
+        {
+            "python": sys.executable,
+            "data_dir": REPO_ROOT / "data",
+            "source_root": REPO_ROOT / "source",
+            "scaler_source_root": REPO_ROOT / "scalers",
+            "output_root": REPO_ROOT / "output",
+            "batch_size": 128,
+            "snr_levels": "15,12",
+            "overwrite": False,
+        },
+    )()
+    jobs = launcher.evaluation_jobs(parser_args)
+    assert len(jobs) == 30
+    assert {job["id"].split("_", 1)[0] for job in jobs} == {"snr15", "snr12"}
