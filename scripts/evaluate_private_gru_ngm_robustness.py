@@ -35,6 +35,7 @@ EVALUATION_BATCH_SIZE = 128
 METRICS_NAME = "robustness_metrics.csv"
 METADATA_NAME = "ROBUSTNESS_EVALUATION.json"
 DONE_NAME = "DONE_ROBUSTNESS_EVALUATION.json"
+RESULT_DIR_NAME = "robustness_test"
 
 
 def evaluation_contract() -> dict[str, Any]:
@@ -260,7 +261,7 @@ def completed_evaluation_is_valid(
     destination: Path,
     barrier: dict[str, Any],
 ) -> bool:
-    result_dir = destination / "robustness_test"
+    result_dir = destination / RESULT_DIR_NAME
     done_path = result_dir / DONE_NAME
     if not done_path.is_file():
         return False
@@ -536,7 +537,7 @@ def run_evaluate(args: argparse.Namespace) -> None:
     if len(clean_ap) != 2 or clean_ap[0] != clean_ap[1]:
         raise AssertionError("clean AP differs between the two figure baselines")
 
-    result_dir = destination / "robustness_test"
+    result_dir = destination / RESULT_DIR_NAME
     metrics_path = result_dir / METRICS_NAME
     metadata_path = result_dir / METADATA_NAME
     write_csv(metrics_path, result_rows)

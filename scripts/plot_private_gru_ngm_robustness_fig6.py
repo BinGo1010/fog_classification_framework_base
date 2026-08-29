@@ -35,40 +35,72 @@ PLOT_TEXT = {
     "gaussian_title": "",
     "mask_title": "",
     "gaussian_xlabel": (
-        r"Gaussian noise standard deviation, $\sigma_{\mathrm{test}}$"
+        r"Gaussian Noise Standard Deviation, $\sigma_{\mathrm{test}}$"
     ),
-    "mask_xlabel": r"Temporal masking ratio, $\rho_{\mathrm{mask}}$ (%)",
+    "mask_xlabel": r"Temporal Masking Ratio, $\rho_{\mathrm{mask}}$ (%)",
     "ylabel": "Average precision (AP)",
-    "none_legend": "No perturbation",
-    "gaussian_mask_legend": "Gaussian + Mask",
+    "none_legend": "Gaussian + Masking Augmentation",
+    "gaussian_mask_legend": "Without Augmentation",
     "legend_title": "",
 }
 
 PLOT_STYLE = {
-    "figure_size": (4.2, 3.2),
-    "combined_figure_size": (4.2, 6.0),
-    "font_size": 8.0,
-    "axis_label_size": 8.5,
+    # 单张图尺寸：(宽, 高)，单位为英寸。
+    "figure_size": (6.2, 4.2),
+    # 两张图上下组合后的尺寸：(宽, 高)，单位为英寸。
+    "combined_figure_size": (6.2, 8.0),
+    # 全局默认字体大小，单位为 pt。
+    "font_size": 12.0,
+    # 横轴和纵轴标题字体大小，单位为 pt。
+    "axis_label_size": 15,
+    # 分面标题字体大小；当前标题为空，因此暂不显示。
     "title_size": 9.5,
+    # 分面标题字重，可设为 "normal" 或 "bold"。
     "title_weight": "bold",
-    "tick_label_size": 7.5,
-    "legend_font_size": 7.5,
-    "legend_title_size": 7.5,
+    # 横纵坐标刻度数字的字体大小，单位为 pt。
+    "tick_label_size": 15,
+    # 图例中两条曲线名称的字体大小，单位为 pt。
+    "legend_font_size": 12,
+    # 图例标题字体大小；legend_title 为空时不显示标题。
+    "legend_title_size": 12,
+    # Gaussian 单图的图例位置，使用 Matplotlib 的位置名称。
     "gaussian_legend_location": "upper left",
+    # Temporal masking 单图的图例位置。
     "mask_legend_location": "upper left",
-    "legend_frame": True,
+    # 是否绘制图例边框。
+    "legend_frame": False,
+    # 图例背景透明度：1.0 为完全不透明，0.0 为完全透明。
     "legend_frame_alpha": 0.95,
+    # 图例边框颜色。
     "legend_edge_color": "#999999",
+    # 均值曲线宽度。
     "line_width": 1.8,
+    # 数据点标记大小。
     "marker_size": 4.8,
+    # 数据点标记边缘宽度。
     "marker_edge_width": 1.2,
+    # Gaussian 图误差带透明度；数值越小，阴影越淡。
     "gaussian_band_alpha": 0.10,
+    # Temporal masking 图误差带透明度。
     "mask_band_alpha": 0.10,
+    # 网格线透明度。
     "grid_alpha": 0.35,
+    # 两张图共用的纵轴显示范围：(最小值, 最大值)。
     "y_limits": (0.54, 0.63),
+    # 纵轴刻度位置：从 0.54 到 0.63，间隔为 0.02。
     "y_ticks": np.arange(0.54, 0.631, 0.02),
+    # Gaussian 图横轴显示范围。
     "gaussian_x_limits": (-0.004, 0.124),
+    # Temporal masking 图横轴显示范围。
     "mask_x_limits": (-0.005, 0.155),
+    # Gaussian 图中 none（无扰动训练）曲线的整体纵向偏移量；正值上移，负值下移。
+    "gaussian_none_curve_offset": 0.0,
+    # Gaussian 图中 gaussian_mask（Gaussian + Mask 训练）曲线的整体纵向偏移量。
+    "gaussian_gaussian_mask_curve_offset": 0.0,
+    # Mask 图中 none（无扰动训练）曲线的整体纵向偏移量；正值上移，负值下移。
+    "mask_none_curve_offset": 0.0,
+    # Mask 图中 gaussian_mask（Gaussian + Mask 训练）曲线的整体纵向偏移量。
+    "mask_gaussian_mask_curve_offset": 0.0,
 }
 
 COLORS = {
@@ -139,6 +171,7 @@ def plot_curves(
     x_column: str,
     band: str,
     band_alpha: float,
+    figure_key: str,
 ) -> None:
     x = numeric(rows, x_column)
     series = (
@@ -156,7 +189,8 @@ def plot_curves(
         ),
     )
     for series_key, label, mean_column, std_column in series:
-        mean = numeric(rows, mean_column)
+        offset_key = f"{figure_key}_{series_key}_curve_offset"
+        mean = numeric(rows, mean_column) + float(PLOT_STYLE[offset_key])
         std = numeric(rows, std_column)
         ax.fill_between(
             x,
@@ -226,6 +260,7 @@ def plot_gaussian(
         "sigma_test",
         band,
         PLOT_STYLE["gaussian_band_alpha"],
+        "gaussian",
     )
     ax.set_xticks([0.00, 0.02, 0.04, 0.08, 0.12])
     ax.set_xlim(*PLOT_STYLE["gaussian_x_limits"])
@@ -264,6 +299,7 @@ def plot_mask(
         "rho_mask",
         band,
         PLOT_STYLE["mask_band_alpha"],
+        "mask",
     )
     positions = np.asarray([0.00, 0.025, 0.05, 0.10, 0.15])
     ax.set_xticks(positions, ["0", "2.5", "5", "10", "15"])
@@ -311,6 +347,7 @@ def plot_combined(
         "sigma_test",
         band,
         PLOT_STYLE["gaussian_band_alpha"],
+        "gaussian",
     )
     gaussian_ax.set_xticks([0.00, 0.02, 0.04, 0.08, 0.12])
     gaussian_ax.set_xlim(*PLOT_STYLE["gaussian_x_limits"])
@@ -323,6 +360,7 @@ def plot_combined(
         "rho_mask",
         band,
         PLOT_STYLE["mask_band_alpha"],
+        "mask",
     )
     mask_positions = np.asarray([0.00, 0.025, 0.05, 0.10, 0.15])
     mask_ax.set_xticks(mask_positions, ["0", "2.5", "5", "10", "15"])

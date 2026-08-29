@@ -41,6 +41,12 @@ OVERALL_SEED_CSV = "ROBUSTNESS_OVERALL_SEED.csv"
 CURVE_LONG_CSV = "ROBUSTNESS_CURVE_SUMMARY_LONG.csv"
 FIG1_CSV = "FIG1_GAUSSIAN_NOISE_AP.csv"
 FIG2_CSV = "FIG2_TEMPORAL_MASK_AP.csv"
+AGGREGATE_DIR_NAME: str | None = None
+POOL_STAGE = "robustness_eval"
+
+
+def conditions_per_job() -> int:
+    return len(worker.GAUSSIAN_SIGMAS) + len(worker.MASK_RHOS)
 
 
 def parse_csv_values(text: str) -> tuple[str, ...]:
@@ -198,12 +204,13 @@ def collect_per_fold_rows(
                             f"robustness evaluation incomplete: {destination}"
                         )
                     metrics_path = (
-                        destination / "robustness_test" / worker.METRICS_NAME
+                        destination / worker.RESULT_DIR_NAME / worker.METRICS_NAME
                     )
                     selected = read_metric_rows(metrics_path)
-                    if len(selected) != 10:
+                    expected_rows = conditions_per_job()
+                    if len(selected) != expected_rows:
                         raise AssertionError(
-                            f"expected 10 robustness rows: {metrics_path}"
+                            f"expected {expected_rows} robustness rows: {metrics_path}"
                         )
                     for row in selected:
                         identity = (
@@ -227,7 +234,7 @@ def collect_per_fold_rows(
                                 f"condition grid mismatch: {metrics_path}"
                             )
                     rows.extend(selected)
-    expected_count = int(plan["job_count"]) * 10
+    expected_count = int(plan["job_count"]) * conditions_per_job()
     if len(rows) != expected_count:
         raise AssertionError(
             f"per-fold robustness row count mismatch: {len(rows)} != {expected_count}"
@@ -540,6 +547,9 @@ def aggregate_results(
     plan: dict[str, Any],
     barrier: dict[str, Any],
 ) -> dict[str, Path]:
+    aggregate_root = (
+        root if AGGREGATE_DIR_NAME is None else root / AGGREGATE_DIR_NAME
+    )
     per_fold_rows = collect_per_fold_rows(root, plan, barrier)
     subject_seed_rows = build_subject_seed_rows(per_fold_rows, plan)
     subject_summary_rows = build_subject_summary_rows(subject_seed_rows, plan)
@@ -552,13 +562,13 @@ def aggregate_results(
         curve_rows, overall_seed_rows, "temporal_mask", plan
     )
     paths = {
-        "per_fold": root / PER_FOLD_CSV,
-        "subject_seed": root / SUBJECT_SEED_CSV,
-        "subject_summary": root / SUBJECT_SUMMARY_CSV,
-        "overall_seed": root / OVERALL_SEED_CSV,
-        "curve_long": root / CURVE_LONG_CSV,
-        "fig1": root / FIG1_CSV,
-        "fig2": root / FIG2_CSV,
+        "per_fold": aggregate_root / PER_FOLD_CSV,
+        "subject_seed": aggregate_root / SUBJECT_SEED_CSV,
+        "subject_summary": aggregate_root / SUBJECT_SUMMARY_CSV,
+        "overall_seed": aggregate_root / OVERALL_SEED_CSV,
+        "curve_long": aggregate_root / CURVE_LONG_CSV,
+        "fig1": aggregate_root / FIG1_CSV,
+        "fig2": aggregate_root / FIG2_CSV,
     }
     for path, rows in (
         (paths["per_fold"], per_fold_rows),
@@ -592,7 +602,7 @@ def aggregate_results(
     summary["summary_id"] = canonical_fingerprint(
         {key: value for key, value in summary.items() if key != "created_utc"}
     )
-    summary_path = root / "ROBUSTNESS_EVALUATION_SUMMARY.json"
+    summary_path = aggregate_root / "ROBUSTNESS_EVALUATION_SUMMARY.json"
     atomic_json_dump(summary, summary_path)
     atomic_json_dump(
         {
@@ -603,7 +613,7 @@ def aggregate_results(
             "fig1_sha256": sha256_file(paths["fig1"]),
             "fig2_sha256": sha256_file(paths["fig2"]),
         },
-        root / "DONE_ROBUSTNESS_EVALUATION.json",
+        aggregate_root / "DONE_ROBUSTNESS_EVALUATION.json",
     )
     return paths
 
@@ -625,7 +635,7 @@ def main() -> None:
     evaluation_jobs = jobs(args, plan)
     print(
         f"EVALUATION PLAN jobs={len(evaluation_jobs)} "
-        f"conditions_per_job=10 gpus={','.join(gpu_ids)} "
+        f"conditions_per_job={conditions_per_job()} gpus={','.join(gpu_ids)} "
         f"contract={worker.evaluation_contract_id()}",
         flush=True,
     )
@@ -646,7 +656,7 @@ def main() -> None:
         )
         return
 
-    run_pool("robustness_eval", evaluation_jobs, gpu_ids, args.trained_root)
+    run_pool(POOL_STAGE, evaluation_jobs, gpu_ids, args.trained_root)
     paths = aggregate_results(args.trained_root, plan, barrier)
     print(
         f"ROBUSTNESS EVALUATION COMPLETE jobs={len(evaluation_jobs)}",
