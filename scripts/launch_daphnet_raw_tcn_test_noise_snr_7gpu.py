@@ -214,25 +214,29 @@ def aggregate_command(args: argparse.Namespace) -> list[str]:
     ]
 
 
-def main() -> None:
-    args = parse_args()
-    ids = gpu_ids(args.gpu_ids, check_hardware=not args.dry_run)
-    plan = ensure_plan(args, validate_source=not args.dry_run)
-    jobs = [
-        (
-            f"snr{snr_db}_fold{fold}_seed{seed}",
-            evaluate_command(args, fold, seed, snr_db),
-        )
+def evaluation_jobs(args: argparse.Namespace) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": f"snr{snr_db}_fold{fold}_seed{seed}",
+            "command": evaluate_command(args, fold, seed, snr_db),
+        }
         for snr_db in SNR_LEVELS
         for fold in FOLDS
         for seed in SEEDS
     ]
+
+
+def main() -> None:
+    args = parse_args()
+    ids = gpu_ids(args.gpu_ids, check_hardware=not args.dry_run)
+    plan = ensure_plan(args, validate_source=not args.dry_run)
+    jobs = evaluation_jobs(args)
     aggregate = aggregate_command(args)
     if args.dry_run:
         print(json.dumps(plan, ensure_ascii=False, indent=2))
         print(f"evaluation_jobs={len(jobs)} training_jobs=0 gpu_ids={ids}")
-        for name, command in jobs:
-            print(f"[{name}] {command_text(command)}")
+        for job in jobs:
+            print(f"[{job['id']}] {command_text(job['command'])}")
         print(f"[aggregate] {command_text(aggregate)}")
         return
 

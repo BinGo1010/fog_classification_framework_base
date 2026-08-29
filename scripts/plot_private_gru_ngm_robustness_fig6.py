@@ -25,6 +25,7 @@ DEFAULT_RESULTS = (
     else REPO_ROOT / "outputs" / "private_gru_ngm_robustness_matched_tcn"
 )
 DEFAULT_OUTPUT = REPO_ROOT / "outputs" / "private_gru_ngm_robustness_figures"
+DEFAULT_BAND = "sem"
 EXPECTED_GAUSSIAN_LEVELS = (0.0, 0.02, 0.04, 0.08, 0.12)
 EXPECTED_MASK_LEVELS = (0.0, 0.025, 0.05, 0.10, 0.15)
 GAUSSIAN_X_TICKS = (0.0, 0.02, 0.04, 0.08, 0.12)
@@ -133,7 +134,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--band",
         choices=("sem", "std"),
-        default="sem",
+        default=DEFAULT_BAND,
         help="uncertainty band shown around the mean curve",
     )
     return parser.parse_args()

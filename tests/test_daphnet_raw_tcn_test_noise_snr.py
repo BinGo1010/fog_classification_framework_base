@@ -70,6 +70,27 @@ def test_launcher_builds_sixty_evaluation_jobs_and_no_training_jobs() -> None:
     assert result.stdout.count("--stage aggregate") == 1
 
 
+def test_launcher_pool_jobs_use_scheduler_dictionary_contract() -> None:
+    parser_args = type(
+        "Args",
+        (),
+        {
+            "python": sys.executable,
+            "data_dir": REPO_ROOT / "data",
+            "source_root": REPO_ROOT / "source",
+            "scaler_source_root": REPO_ROOT / "scalers",
+            "output_root": REPO_ROOT / "output",
+            "batch_size": 128,
+            "overwrite": False,
+        },
+    )()
+    jobs = launcher.evaluation_jobs(parser_args)
+    assert len(jobs) == 60
+    assert all(set(job) == {"id", "command"} for job in jobs)
+    assert len({job["id"] for job in jobs}) == 60
+    assert all(isinstance(job["command"], list) for job in jobs)
+
+
 def test_launcher_commands_freeze_expected_source_and_threshold_policy() -> None:
     parser_args = type(
         "Args",
